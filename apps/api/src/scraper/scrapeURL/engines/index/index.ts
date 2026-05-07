@@ -404,7 +404,7 @@ export async function scrapeURLWithIndex(
 
     postprocessorsUsed: doc.postprocessorsUsed,
 
-    proxyUsed: doc.proxyUsed ?? "basic",
+    proxyUsed: meta.featureFlags.has("stealthProxy") ? "stealth" : "basic",
   };
 }
 
