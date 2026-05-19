@@ -362,6 +362,14 @@ const changeTrackingFormatWithOptions = z.strictObject({
     }),
   modes: z.enum(["json", "git-diff"]).array().optional().prefault([]),
   tag: z.string().or(z.null()).prefault(null),
+  // Plain-English description of what the caller actually wants to be
+  // alerted about. Distinct from `prompt`, which tells the extraction LLM
+  // what to capture. When set, an AI judge runs on changeStatus="changed"
+  // rows and classifies whether the diff matches this goal. Result appears
+  // at `document.changeTracking.judgment`; changeStatus is never overridden.
+  // Presence of `goal` is the opt-in — leave it unset and behavior is
+  // identical to before.
+  goal: z.string().max(2000).optional(),
 });
 
 type ChangeTrackingFormatWithOptions = z.output<
@@ -1162,6 +1170,16 @@ export type Document = {
       };
     };
     json?: any;
+    // AI judge result — present only when caller provided a `goal` AND
+    // changeStatus === "changed". Backwards compatible: callers that didn't
+    // set goal never see this field. Consumers can route on it to filter
+    // noise (judgment.meaningful === false) without changing changeStatus.
+    judgment?: {
+      meaningful: boolean;
+      confidence: "high" | "medium" | "low";
+      reason: string;
+      fields: string[];
+    };
   };
   metadata: {
     title?: string;
@@ -1660,6 +1678,7 @@ export function fromV1ScrapeOptions(
               tag: opts?.tag ?? null,
               schema: opts?.schema,
               prompt: opts?.prompt,
+              goal: undefined,
             };
             return fmt;
           } else if (x === "screenshot@fullPage") {

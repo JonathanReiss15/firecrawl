@@ -4,6 +4,7 @@ import { Meta } from "../index";
 import gitDiff from "git-diff";
 import parseDiff from "parse-diff";
 import { generateCompletions } from "./llmExtract";
+import { judgeChange } from "./judgeChange";
 import { hasFormatOfType } from "../../../lib/format-utils";
 import { getJobFromGCS } from "../../../lib/gcs-jobs";
 
@@ -263,6 +264,43 @@ export async function deriveDiff(
           document.warning =
             "Structured diff generation failed." +
             (document.warning ? ` ${document.warning}` : "");
+        }
+      }
+
+      // AI judge: runs when caller provided a `goal` AND the page actually
+      // changed. `goal` is the user's intent ("tell me when X"), distinct
+      // from `prompt` which is the extraction instruction. Markdown is the
+      // primary signal (source of truth); json diff is appended as
+      // supplementary signal when available. changeStatus is never
+      // overridden — judgment is purely advisory.
+      if (changeTrackingFormat?.goal && changeStatus === "changed") {
+        const jsonDiffPayload =
+          document.changeTracking.json &&
+          typeof document.changeTracking.json === "object" &&
+          Object.keys(document.changeTracking.json).length > 0
+            ? (document.changeTracking.json as Record<
+                string,
+                { previous: unknown; current: unknown }
+              >)
+            : undefined;
+
+        const markdownDiffPayload = {
+          previous: previousMarkdown,
+          current: currentMarkdown,
+          diffText: document.changeTracking.diff?.text,
+        };
+
+        try {
+          const judgment = await judgeChange({
+            meta,
+            goal: changeTrackingFormat.goal,
+            extractionPrompt: changeTrackingFormat.prompt,
+            jsonDiff: jsonDiffPayload,
+            markdownDiff: markdownDiffPayload,
+          });
+          document.changeTracking.judgment = judgment;
+        } catch (error) {
+          meta.logger.error("Change-tracking judge failed", { error });
         }
       }
     } else if (!res.error) {
