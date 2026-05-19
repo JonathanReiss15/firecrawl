@@ -38,6 +38,7 @@ import { initializeEngineForcing } from "./scraper/WebScraper/utils/engine-forci
 import responseTime from "response-time";
 import { shutdownWebhookQueue } from "./services/webhook";
 import { shutdownIndexerQueue } from "./services/indexing/indexer-queue";
+import { shutdownPostHog, trackApiRequestFailed } from "./lib/posthog";
 
 const { createBullBoard } = require("@bull-board/api");
 const { BullMQAdapter } = require("@bull-board/api/bullMQAdapter");
@@ -141,8 +142,10 @@ async function startServer(port = DEFAULT_PORT) {
       nuqShutdown().finally(() => {
         shutdownWebhookQueue().finally(() => {
           shutdownIndexerQueue().finally(() => {
-            logger.info("NUQ shutdown complete");
-            process.exit(0);
+            shutdownPostHog().finally(() => {
+              logger.info("NUQ shutdown complete");
+              process.exit(0);
+            });
           });
         });
       });
@@ -175,6 +178,18 @@ app.use(
     next: NextFunction,
   ) => {
     if (err instanceof QueueFullError) {
+      const teamId = (req as any).auth?.team_id ?? (req as any).acuc?.team_id;
+      if (teamId) {
+        trackApiRequestFailed(
+          { teamId, acuc: (req as any).acuc },
+          {
+            endpoint: req.path,
+            status_code: 429,
+            error_type: "QUEUE_FULL",
+            error_message: err.message,
+          },
+        );
+      }
       res.status(429).json({
         success: false,
         error: err.message,

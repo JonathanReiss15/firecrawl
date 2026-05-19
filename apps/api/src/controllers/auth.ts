@@ -17,6 +17,11 @@ import {
   isAutumnCheckEnabled,
   AUTUMN_BYPASS_ORG_IDS,
 } from "../services/autumn/autumn.service";
+import {
+  trackApiAuthError,
+  trackApiRateLimitHit,
+  trackApiKeyFirstUsed,
+} from "../lib/posthog";
 
 function normalizedApiIsUuid(potentialUuid: string): boolean {
   // Check if the string is a valid UUID
@@ -532,10 +537,18 @@ async function supaAuthenticateUser(
       ? `Bearer ${req.headers["sec-websocket-protocol"]}`
       : null);
   if (!authHeader) {
+    trackApiAuthError(
+      { teamId: "unknown" },
+      { error_type: "missing", endpoint: req.path },
+    );
     return { success: false, error: "Unauthorized", status: 401 };
   }
   const token = authHeader.split(" ")[1]; // Extract the token from "Bearer <token>"
   if (!token) {
+    trackApiAuthError(
+      { teamId: "unknown" },
+      { error_type: "missing", endpoint: req.path },
+    );
     return {
       success: false,
       error: "Unauthorized: Token missing",
@@ -606,6 +619,10 @@ async function supaAuthenticateUser(
   } else {
     normalizedApi = parseApi(token);
     if (!normalizedApiIsUuid(normalizedApi)) {
+      trackApiAuthError(
+        { teamId: "unknown" },
+        { error_type: "invalid_key", endpoint: req.path },
+      );
       return {
         success: false,
         error: "Unauthorized: Invalid token",
@@ -617,6 +634,10 @@ async function supaAuthenticateUser(
     chunk = await ensureChunkOrgId(normalizedApi, chunk);
 
     if (chunk === null) {
+      trackApiAuthError(
+        { teamId: "unknown" },
+        { error_type: "invalid_key", endpoint: req.path },
+      );
       return {
         success: false,
         error: "Unauthorized: Invalid token",
@@ -641,13 +662,13 @@ async function supaAuthenticateUser(
   try {
     await rateLimiter.consume(team_endpoint_token);
   } catch (rateLimiterRes) {
-    // logger.error(`Rate limit exceeded: ${rateLimiterRes}`, {
-    //   teamId,
-    //   priceId,
-    //   mode,
-    //   rateLimits: chunk?.rate_limits,
-    //   rateLimiterRes,
-    // });
+    trackApiRateLimitHit(
+      { teamId: teamId ?? "unknown", acuc: chunk },
+      {
+        endpoint: req.path,
+        limit_type: "requests",
+      },
+    );
 
     const secs = Math.round(rateLimiterRes.msBeforeNext / 1000) || 1;
     const retryDate = new Date(Date.now() + rateLimiterRes.msBeforeNext);
@@ -713,6 +734,19 @@ async function supaAuthenticateUser(
         api_key_id: chunk.api_key_id,
       });
     }
+  }
+
+  // Track first-use of an API key (fire-and-forget, 24h dedup via Redis)
+  if (chunk && chunk.api_key_id && teamId) {
+    const firstUseKey = `posthog_first_use:${chunk.api_key_id}`;
+    getValue(firstUseKey)
+      .then(async val => {
+        if (val === null) {
+          await setValue(firstUseKey, "1", 86_400, true);
+          trackApiKeyFirstUsed({ teamId, acuc: chunk }, { endpoint: req.path });
+        }
+      })
+      .catch(() => {});
   }
 
   return {

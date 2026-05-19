@@ -64,7 +64,11 @@ const configSchema = z.object({
   SEARCH_PREVIEW_TOKEN: z.string().optional(),
   SEARCH_SERVICE_API_SECRET: z.string().optional(),
   SEARCH_FEEDBACK_MAX_AGE_SEC: z.coerce.number().int().positive().default(120),
-  SEARCH_FEEDBACK_DAILY_CAP_CREDITS: z.coerce.number().int().nonnegative().default(100),
+  SEARCH_FEEDBACK_DAILY_CAP_CREDITS: z.coerce
+    .number()
+    .int()
+    .nonnegative()
+    .default(100),
 
   // OAuth token introspection
   OAUTH_INTROSPECT_URL: z.string().optional(),
@@ -98,6 +102,10 @@ const configSchema = z.object({
   GCS_FIRE_ENGINE_BUCKET_NAME: z.string().optional(),
   GCS_INDEX_BUCKET_NAME: z.string().optional(),
   GCS_MEDIA_BUCKET_NAME: z.string().optional(),
+
+  // PostHog (Product Analytics)
+  POSTHOG_API_KEY: z.string().optional(),
+  POSTHOG_HOST: z.string().optional(),
 
   // ClickHouse (Search Analytics)
   CLICKHOUSE_ANALYTICS_URL: z.string().optional(),

@@ -24,6 +24,7 @@ import { getErrorContactMessage } from "../../lib/deployment";
 import { captureExceptionWithZdrCheck } from "../../services/sentry";
 import type { BillingMetadata } from "../../services/billing/types";
 import { getScrapeZDR } from "../../lib/zdr-helpers";
+import { trackApiRequestFailed, trackApiTimeout } from "../../lib/posthog";
 
 const AGENT_INTEROP_CONCURRENCY_BOOST = 3;
 
@@ -287,6 +288,22 @@ export async function scrapeController(
         });
 
         if (e instanceof TransportableError) {
+          const teamCtx = { teamId: req.auth.team_id, acuc: req.acuc };
+
+          if (timeoutErr) {
+            trackApiTimeout(teamCtx, {
+              endpoint: "/v2/scrape",
+              timeout_ms: timeout ? timeout * 1000 : 0,
+            });
+          }
+
+          trackApiRequestFailed(teamCtx, {
+            endpoint: "/v2/scrape",
+            status_code: e.code === "SCRAPE_TIMEOUT" ? 408 : 500,
+            error_type: e.code,
+            error_message: e.message,
+          });
+
           if (!timeoutErr) {
             logger.error(`Error in scrapeController`, {
               version: "v2",

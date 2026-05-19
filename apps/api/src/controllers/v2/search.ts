@@ -20,6 +20,7 @@ import {
 import { executeSearch } from "../../search/execute";
 import type { BillingMetadata } from "../../services/billing/types";
 import { getSearchZDR } from "../../lib/zdr-helpers";
+import { trackApiRequestFailed, trackApiTimeout } from "../../lib/posthog";
 
 export async function searchController(
   req: RequestWithAuth<{}, SearchResponse, SearchRequest>,
@@ -210,6 +211,8 @@ export async function searchController(
       id: jobId,
     });
   } catch (error) {
+    const teamCtx = { teamId: req.auth.team_id, acuc: req.acuc };
+
     if (error instanceof z.ZodError) {
       logger.warn("Invalid request body", { error: error.issues });
       return res.status(400).json({
@@ -220,12 +223,29 @@ export async function searchController(
     }
 
     if (error instanceof ScrapeJobTimeoutError) {
+      trackApiTimeout(teamCtx, {
+        endpoint: "/v2/search",
+        timeout_ms: req.body.timeout ? req.body.timeout * 1000 : 0,
+      });
+      trackApiRequestFailed(teamCtx, {
+        endpoint: "/v2/search",
+        status_code: 408,
+        error_type: error.code,
+        error_message: error.message,
+      });
       return res.status(408).json({
         success: false,
         code: error.code,
         error: error.message,
       });
     }
+
+    trackApiRequestFailed(teamCtx, {
+      endpoint: "/v2/search",
+      status_code: 500,
+      error_type: "UNKNOWN_ERROR",
+      error_message: error.message,
+    });
 
     captureExceptionWithZdrCheck(error, {
       extra: { zeroDataRetention },

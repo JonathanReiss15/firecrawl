@@ -5,6 +5,11 @@ import { queueBillingOperation } from "./batch_billing";
 import { autumnService } from "../autumn/autumn.service";
 import { toAutumnBillingProperties, type BillingMetadata } from "./types";
 import type { Logger } from "winston";
+import {
+  trackApiQuotaExceeded,
+  trackCreditsDepleted,
+  trackCreditsLowThresholdReached,
+} from "../../lib/posthog";
 
 /**
  * If you do not know the subscription_id in the current context, pass subscription_id as undefined.
@@ -202,8 +207,36 @@ async function supaCheckTeamCredits(
   //   }
   // }
 
+  // Track credit threshold events
+  if (creditUsagePercentage >= 0.9 && creditUsagePercentage < 1.0) {
+    trackCreditsLowThresholdReached(
+      { teamId: team_id, acuc: chunk },
+      {
+        threshold_pct: 90,
+        credits_remaining: remainingCredits,
+      },
+    );
+  }
+
   // Compare the adjusted total credits used with the credits allowed by the plan (and graceful)
   if (!success) {
+    trackApiQuotaExceeded(
+      { teamId: team_id, acuc: chunk },
+      {
+        quota_type: "credits",
+        credits_remaining: remainingCredits,
+      },
+    );
+
+    if (remainingCredits <= 0) {
+      trackCreditsDepleted(
+        { teamId: team_id, acuc: chunk },
+        {
+          credits_used: chunk.adjusted_credits_used,
+        },
+      );
+    }
+
     logger.warn("Credit check failed - insufficient credits", {
       team_id,
       teamId: team_id,
