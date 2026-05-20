@@ -129,7 +129,10 @@ export async function recordMonitorScrapeSuccess(
           }
         : null,
       formats: targetFormats,
-      goal: monitorForRun?.goal ?? null,
+      goal:
+        monitorForRun?.judge_enabled && monitorForRun?.goal
+          ? monitorForRun.goal
+          : null,
       extractionPrompt: targetCtFormat?.prompt ?? null,
     });
 

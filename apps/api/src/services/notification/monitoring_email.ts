@@ -177,11 +177,11 @@ export async function sendMonitoringEmailSummary(params: {
     return { attempted: false, success: true, recipients: [] };
   }
 
-  // When the monitor has a goal set, the AI judge has classified each
-  // changed page as meaningful or noise. Only fire the email if at least
-  // one changed page was judged meaningful (or has new/removed/error
-  // status, which always count regardless of judgment).
-  if (params.monitor.goal) {
+  // When the monitor has the AI judge enabled, each changed page has been
+  // classified as meaningful or noise. Only fire the email if at least one
+  // changed page was judged meaningful (or has new/removed/error status,
+  // which always count regardless of judgment).
+  if (params.monitor.judge_enabled && params.monitor.goal) {
     const changedPages = params.pages.filter(p => p.status === "changed");
     const nonChangedActivity = params.pages.some(
       p => p.status === "new" || p.status === "removed" || p.status === "error",

@@ -79,6 +79,7 @@ describe("monitoring email", () => {
           team_id: "team-1",
           name: "Test",
           goal: opts.goal ?? null,
+          judge_enabled: Boolean(opts.goal),
           notification: opts.emailEnabled
             ? { email: { enabled: true, recipients: ["a@b.com"] } }
             : null,

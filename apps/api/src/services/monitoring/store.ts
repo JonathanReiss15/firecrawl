@@ -98,6 +98,9 @@ export async function createMonitor(params: {
   if (params.input.goal !== undefined) {
     insert.goal = normalizeGoal(params.input.goal);
   }
+  if (params.input.judgeEnabled !== undefined) {
+    insert.judge_enabled = params.input.judgeEnabled;
+  }
   const { data, error } = await supabase_service
     .from("monitors")
     .insert(insert)
@@ -180,6 +183,9 @@ export async function updateMonitor(params: {
   }
   if (params.input.goal !== undefined) {
     patch.goal = normalizeGoal(params.input.goal);
+  }
+  if (params.input.judgeEnabled !== undefined) {
+    patch.judge_enabled = params.input.judgeEnabled;
   }
   if (params.input.targets !== undefined) {
     const targets = ensureTargetIds(params.input.targets);

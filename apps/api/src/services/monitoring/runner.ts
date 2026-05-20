@@ -237,7 +237,7 @@ async function diffAndPersistPage(params: {
           }
         : null,
       formats: params.target.scrapeOptions?.formats,
-      goal: params.monitor.goal,
+      goal: params.monitor.judge_enabled ? params.monitor.goal : null,
       extractionPrompt: ctFormat?.prompt ?? null,
     });
 

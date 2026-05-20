@@ -103,6 +103,7 @@ export const createMonitorSchema = z.strictObject({
   targets: z.array(monitorTargetSchema).min(1).max(50),
   retentionDays: z.number().int().positive().max(365).optional().default(30),
   goal: z.string().max(2000).optional(),
+  judgeEnabled: z.boolean().optional(),
 });
 
 export const updateMonitorSchema = createMonitorSchema
@@ -164,6 +165,7 @@ export type MonitorRow = {
   notification: MonitorNotification | null;
   last_check_summary: MonitorSummary | null;
   goal: string | null;
+  judge_enabled: boolean;
   created_at: string;
   updated_at: string;
   deleted_at: string | null;
