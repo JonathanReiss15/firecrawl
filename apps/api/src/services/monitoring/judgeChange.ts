@@ -4,6 +4,8 @@ import type { Logger } from "winston";
 
 const SYSTEM_PROMPT = `You decide whether a change to a monitored web page is MEANINGFUL to the user, given their GOAL.
 
+You are part of a long-running monitor that scrapes a web page on a schedule and compares consecutive scrapes. You see ONLY the unified diff between two scrapes — the full page content is not available to you. The surrounding context lines in the diff are your only window into where on the page the change sits.
+
 Inputs:
 - MONITOR GOAL — the user's plain-English description of what they want to be alerted about. Read it the way a smart human would; the user did not write it knowing the rules of this prompt.
 - (Optional) EXTRACTION PROMPT — secondary context about what the scraper was set up to capture.
