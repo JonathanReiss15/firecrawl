@@ -1,4 +1,13 @@
 {
     "$schema": "https://github.com/IBM/audit-ci/raw/main/docs/schema.json",
-    "low": true
+    "low": true,
+    "allowlist": [
+        // GHSA-w5hq-g745-h8pq (uuid):
+        // Patch-level upstream updates reduced the affected paths, but one
+        // remaining upstream package has no same-major patched path available.
+        // Do not override uuid 8.x to 11.x without explicit compatibility approval.
+        // Owner: team-engineering-reviewers. Tracking: create internal ticket.
+        // Expires: 2026-06-22.
+        "GHSA-w5hq-g745-h8pq"
+    ]
 }

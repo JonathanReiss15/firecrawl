@@ -9,6 +9,13 @@
         // Blocked until geoip-country ships a dependency on ip-address>=10.1.1.
         // Owner: team-engineering-reviewers. Tracking: create internal ticket.
         // Expires: 2026-06-15.
-        "GHSA-v2v4-37r5-5v8g"
+        "GHSA-v2v4-37r5-5v8g",
+        // GHSA-w5hq-g745-h8pq (uuid):
+        // No patch/minor direct dependency update currently removes all affected
+        // transitive copies. The safe fix needs an upstream update or explicit
+        // approval for direct major-version upgrades.
+        // Owner: team-engineering-reviewers. Tracking: create internal ticket.
+        // Expires: 2026-06-22.
+        "GHSA-w5hq-g745-h8pq"
     ]
 }
