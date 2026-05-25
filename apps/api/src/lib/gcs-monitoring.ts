@@ -1,5 +1,8 @@
+import { Storage } from "@google-cloud/storage";
+import crypto from "crypto";
 import { config } from "../config";
 import { storage } from "./gcs-jobs";
+import { logger } from "./logger";
 
 type MonitorDiffArtifactBase = {
   url: string;
@@ -33,6 +36,25 @@ export type MonitorDiffArtifact =
     });
 
 const contentType = "application/json";
+const BACKOFF_PARAMS = [0, 250, 1000];
+
+const credentials = config.GCS_CREDENTIALS
+  ? JSON.parse(atob(config.GCS_CREDENTIALS))
+  : undefined;
+
+const storageManualRetries = new Storage({
+  credentials,
+  retryOptions: {
+    autoRetry: false,
+    maxRetries: 0,
+  },
+});
+
+type GCSOperationAttempt = {
+  error: any;
+  timeMs: number;
+  backoffMs: number;
+};
 
 export function monitorDiffGcsKey(params: {
   teamId: string;
@@ -40,7 +62,19 @@ export function monitorDiffGcsKey(params: {
   checkId: string;
   pageId: string;
 }): string {
-  return `monitors/${params.teamId}/${params.monitorId}/${params.checkId}/${params.pageId}.diff.json`;
+  const id = [
+    params.teamId,
+    params.monitorId,
+    params.checkId,
+    params.pageId,
+  ].join("-");
+  return `monitors/diffs/v2/${monitorDiffIdToFilename(id)}`;
+}
+
+function monitorDiffIdToFilename(id: string): string {
+  // Match the gcs-jobs filename pattern: put the random-looking hash before
+  // the stable identifier so writes spread across GCS object-name key ranges.
+  return `${crypto.createHash("sha256").update(id).digest("hex")}-${id}.json`;
 }
 
 function artifactBytes(artifact: MonitorDiffArtifact): {
@@ -59,6 +93,47 @@ function artifactBytes(artifact: MonitorDiffArtifact): {
   return { textBytes, jsonBytes };
 }
 
+async function saveMonitorJsonWithRetries(
+  bucketName: string,
+  key: string,
+  payload: string,
+  attempts: GCSOperationAttempt[],
+): Promise<GCSOperationAttempt[]> {
+  const bucket = storageManualRetries.bucket(bucketName);
+  const blob = bucket.file(key);
+
+  for (let i = 0; i < BACKOFF_PARAMS.length; i++) {
+    const backoffMs = BACKOFF_PARAMS[i];
+    if (backoffMs > 0) {
+      await new Promise(resolve => setTimeout(resolve, backoffMs));
+    }
+
+    const saveStart = Date.now();
+    try {
+      await blob.save(payload, {
+        contentType,
+        resumable: false,
+      });
+      attempts.push({
+        error: null,
+        timeMs: Date.now() - saveStart,
+        backoffMs,
+      });
+      return attempts;
+    } catch (error) {
+      // Mirrors the GCS jobs retry shape, but stays local to monitoring to keep
+      // monitor artifact storage isolated from scrape/job storage semantics.
+      attempts.push({ error, timeMs: Date.now() - saveStart, backoffMs });
+
+      if (i === BACKOFF_PARAMS.length - 1) {
+        throw error;
+      }
+    }
+  }
+
+  return attempts;
+}
+
 export async function saveMonitorDiffArtifact(
   key: string,
   artifact: MonitorDiffArtifact,
@@ -68,11 +143,39 @@ export async function saveMonitorDiffArtifact(
     return artifactBytes(artifact);
   }
 
-  const bucket = storage.bucket(config.GCS_BUCKET_NAME);
-  await bucket.file(key).save(payload, {
-    contentType,
-    resumable: false,
-  });
+  let attempts: GCSOperationAttempt[] = [];
+  try {
+    attempts = await saveMonitorJsonWithRetries(
+      config.GCS_BUCKET_NAME,
+      key,
+      payload,
+      attempts,
+    );
+    if (attempts.length === 1) {
+      logger.debug("Monitor diff artifact saved to GCS", {
+        canonicalLog: "gcs-monitoring/save",
+        key,
+        attempts,
+        success: true,
+      });
+    } else {
+      logger.warn("Monitor diff artifact saved to GCS with retries", {
+        canonicalLog: "gcs-monitoring/save",
+        key,
+        attempts,
+        success: true,
+      });
+    }
+  } catch (error) {
+    logger.error("Monitor diff artifact save to GCS failed", {
+      canonicalLog: "gcs-monitoring/save",
+      key,
+      attempts,
+      success: false,
+      error,
+    });
+    throw error;
+  }
 
   return artifactBytes(artifact);
 }
