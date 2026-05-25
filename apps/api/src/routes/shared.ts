@@ -27,7 +27,6 @@ import { supabase_service } from "../services/supabase";
 import {
   autumnService,
   isAutumnCheckEnabled,
-  isAutumnCheckDryRun,
 } from "../services/autumn/autumn.service";
 
 export function checkCreditsMiddleware(
@@ -144,18 +143,8 @@ export function checkCreditsMiddleware(
       let { success, remainingCredits, chunk } = legacyCheck;
 
       if (autumnResult !== null) {
-        if (isAutumnCheckDryRun()) {
-          logger.info("Autumn check dry-run result (not enforced)", {
-            teamId: req.auth.team_id,
-            path: req.path,
-            requestedCredits,
-            autumnAllowed: autumnResult.allowed,
-            autumnRemaining: autumnResult.remaining,
-          });
-        } else {
-          success = autumnResult.allowed;
-          remainingCredits = autumnResult.remaining;
-        }
+        success = autumnResult.allowed;
+        remainingCredits = autumnResult.remaining;
       }
 
       if (chunk) {
