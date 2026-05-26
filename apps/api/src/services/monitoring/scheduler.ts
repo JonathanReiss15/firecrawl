@@ -150,12 +150,15 @@ async function deferForJitter(monitor: MonitorRow): Promise<boolean> {
     new Date(monitor.next_run_at).getTime() +
     monitorJitterOffsetMs(monitor.id, intervalMs);
   if (Date.now() >= dueAt) return false;
-  await deferMonitorClaim(monitor.id, new Date(dueAt)).catch(error =>
+  try {
+    await deferMonitorClaim(monitor.id, new Date(dueAt));
+  } catch (error) {
     logger.warn("Failed to defer monitor claim for jitter", {
       error,
       monitorId: monitor.id,
-    }),
-  );
+    });
+    return false;
+  }
   return true;
 }
 
