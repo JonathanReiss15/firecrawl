@@ -452,8 +452,8 @@ export class AutumnService {
     action,
     overrideValue,
     properties,
-  }: FinalizeCreditsLockParams): Promise<void> {
-    if (!autumnClient) return;
+  }: FinalizeCreditsLockParams): Promise<boolean> {
+    if (!autumnClient) return false;
 
     try {
       await autumnClient.balances.finalize({
@@ -467,6 +467,7 @@ export class AutumnService {
         action,
         overrideValue,
       });
+      return true;
     } catch (error) {
       logger.error(
         "Autumn finalizeCreditsLock failed — billing API may be unavailable",
@@ -477,6 +478,7 @@ export class AutumnService {
           error,
         },
       );
+      return false;
     }
   }
 

@@ -451,12 +451,13 @@ describe("trackCredits", () => {
 describe("finalizeCreditsLock", () => {
   it("calls balances.finalize with confirm", async () => {
     const svc = makeService();
-    await svc.finalizeCreditsLock({
+    const result = await svc.finalizeCreditsLock({
       lockId: "lock-123",
       action: "confirm",
       properties: { source: "test" },
     });
 
+    expect(result).toBe(true);
     expect(mockFinalize).toHaveBeenCalledWith({
       lockId: "lock-123",
       action: "confirm",
@@ -468,8 +469,24 @@ describe("finalizeCreditsLock", () => {
   it("is a no-op when autumnClient is null", async () => {
     autumnClientRef = null;
     const svc = makeService();
-    await svc.finalizeCreditsLock({ lockId: "lock-123", action: "release" });
+    const result = await svc.finalizeCreditsLock({
+      lockId: "lock-123",
+      action: "release",
+    });
+    expect(result).toBe(false);
     expect(mockFinalize).not.toHaveBeenCalled();
+  });
+
+  it("returns false when finalize fails", async () => {
+    mockFinalize.mockRejectedValueOnce(new Error("finalize failed"));
+    const svc = makeService();
+
+    const result = await svc.finalizeCreditsLock({
+      lockId: "lock-123",
+      action: "confirm",
+    });
+
+    expect(result).toBe(false);
   });
 });
 
