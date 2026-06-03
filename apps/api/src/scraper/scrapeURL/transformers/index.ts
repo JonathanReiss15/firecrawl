@@ -10,6 +10,7 @@ import {
   performSummary,
   performCleanContent,
 } from "./llmExtract";
+import { performDeterministicJson } from "./deterministicJson";
 import { performQuery } from "./query";
 import { uploadScreenshot } from "./uploadScreenshot";
 import { removeBase64Images } from "./removeBase64Images";
@@ -578,6 +579,7 @@ const transformerStack: Transformer[] = [
   ...(useIndex ? [sendDocumentToIndex] : []),
   ...(useSearchIndex ? [sendDocumentToSearchIndex] : []), // Add to search index for real-time search
   performLLMExtract,
+  performDeterministicJson,
   performSummary,
   performQuery,
   performAttributes,

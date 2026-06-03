@@ -216,6 +216,10 @@ function estimateActualCredits(doc: any, options: any): number {
     return doc.metadata.creditsUsed;
   }
   const formats = Array.isArray(options?.formats) ? options.formats : [];
+  const hasDeterministicJson = formats.some(
+    (format: any) => format?.type === "deterministicJson",
+  );
+  if (hasDeterministicJson) return 7;
   const hasJson = formats.some((format: any) =>
     typeof format === "string" ? format === "json" : format?.type === "json",
   );

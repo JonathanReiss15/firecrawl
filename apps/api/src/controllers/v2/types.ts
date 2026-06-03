@@ -350,6 +350,25 @@ const jsonFormatWithOptions = z.strictObject({
 
 export type JsonFormatWithOptions = z.output<typeof jsonFormatWithOptions>;
 
+// "Deterministic JSON" — same shape as json mode, but extraction is performed by
+// reusable-json-mode (a cached, reusable JS extractor run in the code-sandbox)
+// rather than a per-request LLM call. Populates document.json like json mode.
+const deterministicJsonFormatWithOptions = z.strictObject({
+  type: z.literal("deterministicJson"),
+  schema: z
+    .any()
+    .optional()
+    .transform(val => normalizeSchemaForOpenAI(val))
+    .refine(val => validateSchemaForOpenAI(val), {
+      message: OPENAI_SCHEMA_ERROR_MESSAGE,
+    }),
+  prompt: z.string().max(10000).optional(),
+});
+
+export type DeterministicJsonFormatWithOptions = z.output<
+  typeof deterministicJsonFormatWithOptions
+>;
+
 const changeTrackingFormatWithOptions = z.strictObject({
   type: z.literal("changeTracking"),
   prompt: z.string().optional(),
@@ -431,6 +450,7 @@ export type FormatObject =
   | { type: "images" }
   | { type: "summary" }
   | JsonFormatWithOptions
+  | DeterministicJsonFormatWithOptions
   | ChangeTrackingFormatWithOptions
   | ScreenshotFormatWithOptions
   | AttributesFormatWithOptions
@@ -605,6 +625,7 @@ const baseScrapeOptions = z.strictObject({
           z.strictObject({ type: z.literal("images") }),
           z.strictObject({ type: z.literal("summary") }),
           jsonFormatWithOptions,
+          deterministicJsonFormatWithOptions,
           changeTrackingFormatWithOptions,
           screenshotFormatWithOptions,
           attributesFormatWithOptions,
