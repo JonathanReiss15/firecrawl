@@ -423,12 +423,25 @@ const queryFormatWithOptions = z.strictObject({
 
 type QueryFormatWithOptions = z.output<typeof queryFormatWithOptions>;
 
+const mediaFormatWithOptions = z.strictObject({
+  type: z.literal("media"),
+  types: z
+    .enum(["video", "audio"])
+    .array()
+    .optional()
+    .prefault(["video", "audio"]),
+  limit: z.int().positive().finite().max(100).optional().prefault(25),
+});
+
+type MediaFormatWithOptions = z.output<typeof mediaFormatWithOptions>;
+
 export type FormatObject =
   | { type: "markdown" }
   | { type: "html" }
   | { type: "rawHtml" }
   | { type: "links" }
   | { type: "images" }
+  | MediaFormatWithOptions
   | { type: "summary" }
   | JsonFormatWithOptions
   | ChangeTrackingFormatWithOptions
@@ -603,6 +616,7 @@ const baseScrapeOptions = z.strictObject({
           z.strictObject({ type: z.literal("rawHtml") }),
           z.strictObject({ type: z.literal("links") }),
           z.strictObject({ type: z.literal("images") }),
+          mediaFormatWithOptions,
           z.strictObject({ type: z.literal("summary") }),
           jsonFormatWithOptions,
           changeTrackingFormatWithOptions,
@@ -1211,6 +1225,32 @@ export type PIIBlock = {
   counts: Partial<Record<RedactPIIEntity, number>>;
 };
 
+type MediaItem = {
+  type: "video" | "audio";
+  present: true;
+  presence: "html" | "embed" | "metadata" | "jsonLd" | "text";
+  sourceURL: string;
+  url?: string;
+  title?: string;
+  thumbnail?: string;
+  description?: string;
+  provider?: string;
+  mimeType?: string;
+  duration?: string;
+  count?: number;
+};
+
+type MediaBlock = {
+  summary: {
+    total: number;
+    audio: number;
+    video: number;
+    hasAudio: boolean;
+    hasVideo: boolean;
+  };
+  items: MediaItem[];
+};
+
 export type Document = {
   title?: string;
   description?: string;
@@ -1220,6 +1260,7 @@ export type Document = {
   rawHtml?: string;
   links?: string[];
   images?: string[];
+  media?: MediaBlock;
   screenshot?: string;
   audio?: string;
   video?: string;
@@ -1930,6 +1971,7 @@ export const searchRequestSchema = z
                 z.strictObject({ type: z.literal("rawHtml") }),
                 z.strictObject({ type: z.literal("links") }),
                 z.strictObject({ type: z.literal("images") }),
+                mediaFormatWithOptions,
                 z.strictObject({ type: z.literal("summary") }),
                 jsonFormatWithOptions,
                 questionFormatWithOptions,

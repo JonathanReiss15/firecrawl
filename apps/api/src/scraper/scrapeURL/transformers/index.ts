@@ -4,6 +4,7 @@ import { Document } from "../../../controllers/v2/types";
 import { htmlTransform } from "../lib/removeUnwantedElements";
 import { extractLinks } from "../lib/extractLinks";
 import { extractImages } from "../lib/extractImages";
+import { extractMedia } from "../lib/extractMedia";
 import { extractMetadata } from "../lib/extractMetadata";
 import {
   performLLMExtract,
@@ -271,6 +272,36 @@ async function deriveImagesFromHTML(
   return document;
 }
 
+async function deriveMediaFromHTML(
+  meta: Meta,
+  document: Document,
+): Promise<Document> {
+  const mediaFormat = hasFormatOfType(meta.options.formats, "media");
+  if (!mediaFormat) {
+    return document;
+  }
+
+  if (document.html === undefined) {
+    throw new Error(
+      "html is undefined -- this transformer is being called out of order",
+    );
+  }
+
+  document.media = await extractMedia(
+    document.html,
+    document.metadata.url ??
+      document.metadata.sourceURL ??
+      meta.rewrittenUrl ??
+      meta.url,
+    {
+      types: mediaFormat.types,
+      limit: mediaFormat.limit,
+    },
+  );
+
+  return document;
+}
+
 async function deriveBrandingFromActions(
   meta: Meta,
   document: Document,
@@ -311,12 +342,16 @@ async function deriveBrandingFromActions(
   return document;
 }
 
-function coerceFieldsToFormats(meta: Meta, document: Document): Document {
+export function coerceFieldsToFormats(
+  meta: Meta,
+  document: Document,
+): Document {
   const hasMarkdown = hasFormatOfType(meta.options.formats, "markdown");
   const hasRawHtml = hasFormatOfType(meta.options.formats, "rawHtml");
   const hasHtml = hasFormatOfType(meta.options.formats, "html");
   const hasLinks = hasFormatOfType(meta.options.formats, "links");
   const hasImages = hasFormatOfType(meta.options.formats, "images");
+  const hasMedia = hasFormatOfType(meta.options.formats, "media");
   const hasChangeTracking = hasFormatOfType(
     meta.options.formats,
     "changeTracking",
@@ -389,6 +424,19 @@ function coerceFieldsToFormats(meta: Meta, document: Document): Document {
     meta.logger.warn(
       "Request had format: images, but there was no images field in the result.",
       { hasImages, hasImagesField: document.images !== undefined },
+    );
+  }
+
+  if (!hasMedia && document.media !== undefined) {
+    meta.logger.warn(
+      "Removed media from Document because it wasn't in formats -- this is wasteful and indicates a bug.",
+      { hasMedia, hasMediaField: document.media !== undefined },
+    );
+    delete document.media;
+  } else if (hasMedia && document.media === undefined) {
+    meta.logger.warn(
+      "Request had format: media, but there was no media field in the result.",
+      { hasMedia, hasMediaField: document.media !== undefined },
     );
   }
 
@@ -571,6 +619,7 @@ const transformerStack: Transformer[] = [
   performRedactPII,
   deriveLinksFromHTML,
   deriveImagesFromHTML,
+  deriveMediaFromHTML,
   deriveBrandingFromActions,
   deriveMetadataFromRawHTML,
   ...(useIndex ? [sendDocumentToIndex] : []),

@@ -12,6 +12,9 @@ from .v2.types import (
     # Document types
     Document,
     DocumentMetadata,
+    MediaBlock,
+    MediaItem,
+    MediaSummary,
     
     # Scrape types
     ScrapeFormats,
@@ -46,6 +49,7 @@ from .v2.types import (
     SourceOption,
     Format,
     JsonFormat,
+    MediaFormat,
     QuestionFormat,
     HighlightsFormat,
     QueryFormat,
@@ -95,6 +99,9 @@ __all__ = [
     # Document types
     'Document',
     'DocumentMetadata',
+    'MediaBlock',
+    'MediaItem',
+    'MediaSummary',
     
     # Scrape types
     'ScrapeFormats',
@@ -130,6 +137,7 @@ __all__ = [
     'SourceOption',
     'Format',
     'JsonFormat',
+    'MediaFormat',
     'QuestionFormat',
     'HighlightsFormat',
     'QueryFormat',
@@ -170,4 +178,4 @@ __all__ = [
     # Configuration types
     'ClientConfig',
     'AgentOptions',
-]  
+]

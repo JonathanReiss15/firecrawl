@@ -7,6 +7,7 @@ export type FormatString =
   | "rawHtml"
   | "links"
   | "images"
+  | "media"
   | "screenshot"
   | "summary"
   | "changeTracking"
@@ -69,6 +70,14 @@ export interface HighlightsFormat {
   query: string;
 }
 
+export type MediaType = "video" | "audio";
+
+export interface MediaFormat {
+  type: "media";
+  types?: MediaType[];
+  limit?: number;
+}
+
 /** @deprecated Use QuestionFormat or HighlightsFormat instead. */
 export interface QueryFormat {
   type: "query";
@@ -85,6 +94,7 @@ export type FormatOption =
   | AttributesFormat
   | QuestionFormat
   | HighlightsFormat
+  | MediaFormat
   | QueryFormat;
 
 export type ParseFormatString = Exclude<
@@ -535,6 +545,29 @@ export interface Document {
   metadata?: DocumentMetadata;
   links?: string[];
   images?: string[];
+  media?: {
+    summary: {
+      total: number;
+      audio: number;
+      video: number;
+      hasAudio: boolean;
+      hasVideo: boolean;
+    };
+    items: Array<{
+      type: MediaType;
+      present: true;
+      presence: "html" | "embed" | "metadata" | "jsonLd" | "text";
+      sourceURL: string;
+      url?: string;
+      title?: string;
+      thumbnail?: string;
+      description?: string;
+      provider?: string;
+      mimeType?: string;
+      duration?: string;
+      count?: number;
+    }>;
+  };
   screenshot?: string;
   audio?: string;
   video?: string;

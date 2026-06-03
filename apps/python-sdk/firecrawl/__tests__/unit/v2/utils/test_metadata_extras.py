@@ -88,6 +88,36 @@ class TestDocumentMetadataExtras:
         md = doc.metadata_dict
         assert md["x-list"] == [1, "a", 3]
 
+    def test_media_response_is_typed(self):
+        raw = {
+            "media": {
+                "summary": {
+                    "total": 1,
+                    "audio": 0,
+                    "video": 1,
+                    "hasAudio": False,
+                    "hasVideo": True,
+                },
+                "items": [
+                    {
+                        "type": "video",
+                        "present": True,
+                        "presence": "metadata",
+                        "sourceURL": "https://example.com/product",
+                        "url": "https://cdn.example.com/video.mp4",
+                        "mimeType": "video/mp4",
+                    }
+                ],
+            }
+        }
+
+        doc = Document(**normalize_document_input(raw))
+
+        assert doc.media is not None
+        assert doc.media.summary.has_video is True
+        assert doc.media.items[0].source_url == "https://example.com/product"
+        assert doc.media.items[0].mime_type == "video/mp4"
+
     def test_metadata_typed_extras_property(self):
         md = DocumentMetadata(title="T", **{"x-foo": "bar"})
         # extras accessor should expose unknown keys

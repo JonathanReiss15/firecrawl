@@ -58,6 +58,20 @@ doc = firecrawl.scrape('https://www.youtube.com/watch?v=dQw4w9WgXcQ', formats=['
 print(doc.video)
 ```
 
+### Media discovery
+
+Use the `media` format to discover audio and video references on a page without downloading the media file. The returned `media` field includes presence, source URL, title, thumbnail, provider, and counts when available.
+
+```python
+doc = firecrawl.scrape(
+  'https://example.com/product',
+  formats=[{'type': 'media', 'types': ['video', 'audio'], 'limit': 10}]
+)
+
+print(doc.media.summary)
+print(doc.media.items)
+```
+
 ### Parsing uploaded files
 
 Use `parse` to upload local bytes/files (`html`, `pdf`, `docx`, etc.) as multipart form data and return the parsed document.

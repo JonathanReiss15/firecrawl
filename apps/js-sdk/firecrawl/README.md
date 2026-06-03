@@ -58,6 +58,19 @@ const doc = await app.scrape('https://www.youtube.com/watch?v=dQw4w9WgXcQ', {
 console.log(doc.video);
 ```
 
+### Media discovery
+
+Use the `media` format to discover audio and video references on a page without downloading the media file. The returned `media` field includes presence, source URL, title, thumbnail, provider, and counts when available.
+
+```js
+const doc = await app.scrape('https://example.com/product', {
+  formats: [{ type: 'media', types: ['video', 'audio'], limit: 10 }],
+});
+
+console.log(doc.media?.summary);
+console.log(doc.media?.items);
+```
+
 ### Parsing uploaded files
 
 Use `parse` to upload a file (`html`, `pdf`, `docx`, etc.) as multipart form data and process it through the same parsing pipeline.

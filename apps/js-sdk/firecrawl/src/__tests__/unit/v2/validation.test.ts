@@ -14,6 +14,22 @@ describe("v2 utils: validation", () => {
     expect(() => ensureValidFormats(formats)).not.toThrow();
   });
 
+  test("ensureValidFormats: accepts media discovery format", () => {
+    const formats: FormatOption[] = [
+      { type: "media", types: ["video", "audio"], limit: 10 },
+    ];
+    expect(() => ensureValidFormats(formats)).not.toThrow();
+  });
+
+  test("ensureValidFormats: validates media discovery options", () => {
+    expect(() =>
+      ensureValidFormats([{ type: "media", types: ["image"] } as any]),
+    ).toThrow(/media format types/i);
+    expect(() =>
+      ensureValidFormats([{ type: "media", limit: 0 } as any]),
+    ).toThrow(/media format limit/i);
+  });
+
   test("ensureValidFormats: json format requires prompt or schema", () => {
     // Valid cases - should not throw
     const valid1: FormatOption[] = [{ type: "json", prompt: "p" } as any];
@@ -107,4 +123,3 @@ describe("v2 utils: validation", () => {
     expect(() => ensureValidFormats(formats)).toThrow(/\.shape property/i);
   });
 });
-

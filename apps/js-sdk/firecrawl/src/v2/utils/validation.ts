@@ -7,6 +7,7 @@ import {
   type QuestionFormat,
   type HighlightsFormat,
   type QueryFormat,
+  type MediaFormat,
   type ScrapeOptions,
   type ScreenshotFormat,
 } from "../types";
@@ -76,6 +77,23 @@ export function ensureValidFormats(formats?: FormatOption[]): void {
       }
       continue;
     }
+    if ((fmt as MediaFormat).type === "media") {
+      const m = fmt as MediaFormat;
+      if (
+        m.types != null &&
+        (!Array.isArray(m.types) ||
+          m.types.some(type => type !== "video" && type !== "audio"))
+      ) {
+        throw new Error("media format types must be 'video' or 'audio'");
+      }
+      if (
+        m.limit != null &&
+        (!Number.isInteger(m.limit) || m.limit <= 0 || m.limit > 100)
+      ) {
+        throw new Error("media format limit must be an integer between 1 and 100");
+      }
+      continue;
+    }
     if ((fmt as ScreenshotFormat).type === "screenshot") {
       // no-op; already camelCase; validate numeric fields if present
       const s = fmt as ScreenshotFormat;
@@ -102,20 +120,21 @@ export function ensureValidParseFormats(formats?: ParseFormatOption[]): void {
 
   for (const fmt of formats) {
     if (typeof fmt === "string") {
-      if (fmt === "json") {
+      const fmtString: string = fmt;
+      if (fmtString === "json") {
         throw new Error("json format must be an object with { type: 'json', prompt, schema }");
       }
-      if (fmt === "screenshot") {
+      if (fmtString === "screenshot") {
         throw new Error("parse does not support screenshot format");
       }
-      if (fmt === "changeTracking") {
+      if (fmtString === "changeTracking") {
         throw new Error("parse does not support changeTracking format");
       }
-      if (fmt === "branding") {
+      if (fmtString === "branding") {
         throw new Error("parse does not support branding format");
       }
-      if (fmt === "audio" || fmt === "video") {
-        throw new Error(`parse does not support ${fmt} format`);
+      if (fmtString === "audio" || fmtString === "video") {
+        throw new Error(`parse does not support ${fmtString} format`);
       }
       continue;
     }
@@ -211,4 +230,3 @@ export function ensureValidParseOptions(options?: ParseOptions): void {
 
   ensureValidParseFormats(options.formats);
 }
-

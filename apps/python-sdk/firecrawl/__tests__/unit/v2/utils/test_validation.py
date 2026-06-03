@@ -2,6 +2,7 @@ import pytest
 from firecrawl.v2.types import (
     HighlightsFormat,
     JsonFormat,
+    MediaFormat,
     QueryFormat,
     QuestionFormat,
     ScrapeOptions,
@@ -115,6 +116,28 @@ class TestPrepareScrapeOptions:
         assert result["formats"] == ["markdown", "video"]
         assert result["timeout"] == 30000
         assert result["waitFor"] == 2000
+
+    def test_prepare_media_format(self):
+        """Test media discovery format preparation."""
+        options = ScrapeOptions(
+            formats=[{"type": "media", "types": ["video", "audio"], "limit": 10}]
+        )
+        result = prepare_scrape_options(options)
+
+        assert result["formats"] == [
+            {"type": "media", "types": ["video", "audio"], "limit": 10}
+        ]
+
+    def test_prepare_media_format_model(self):
+        """Test typed media discovery format preparation."""
+        options = ScrapeOptions(
+            formats=[MediaFormat(types=["video"], limit=5)]
+        )
+        result = prepare_scrape_options(options)
+
+        assert result["formats"] == [
+            {"type": "media", "types": ["video"], "limit": 5}
+        ]
 
     def test_prepare_snake_case_conversion(self):
         """Test snake_case to camelCase conversion."""

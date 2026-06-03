@@ -641,6 +641,8 @@ def prepare_scrape_options(options: Optional[ScrapeOptions]) -> Optional[Dict[st
                                     converted_formats.append(_validate_question_format(fmt.model_dump(exclude_none=True)))
                                 elif fmt.type == 'highlights':
                                     converted_formats.append(_validate_highlights_format(fmt.model_dump(exclude_none=True)))
+                                elif fmt.type == 'media':
+                                    converted_formats.append(fmt.model_dump(exclude_none=True))
                                 elif fmt.type == 'query':
                                     converted_formats.append(_validate_query_format(fmt.model_dump(exclude_none=True)))
                                 elif fmt.type in ('changeTracking', 'change_tracking'):
@@ -663,6 +665,8 @@ def prepare_scrape_options(options: Optional[ScrapeOptions]) -> Optional[Dict[st
                         converted_formats.append("summary")
                     if original_formats.links:
                         converted_formats.append("links")
+                    if original_formats.media:
+                        converted_formats.append("media")
                     if original_formats.screenshot:
                         converted_formats.append("screenshot")
                     if original_formats.change_tracking:
@@ -728,6 +732,8 @@ def prepare_scrape_options(options: Optional[ScrapeOptions]) -> Optional[Dict[st
                                 data = fmt.model_dump(exclude_none=True)
                                 data['type'] = _convert_format_string(data.get('type', fmt.type))
                                 converted_formats.append(data)
+                            elif fmt.type == 'media':
+                                converted_formats.append(fmt.model_dump(exclude_none=True))
                             else:
                                 converted_formats.append(_convert_format_string(fmt.type))
                         else:
@@ -803,5 +809,5 @@ def prepare_scrape_options(options: Optional[ScrapeOptions]) -> Optional[Dict[st
             else:
                 # For fields that don't need conversion, use as-is
                 scrape_data[key] = value
-    
-    return scrape_data  
+
+    return scrape_data

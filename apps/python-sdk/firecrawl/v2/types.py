@@ -322,6 +322,46 @@ class PIIBlock(BaseModel):
     model_config = {"populate_by_name": True}
 
 
+class MediaSummary(BaseModel):
+    """Summary counts for discovered page media."""
+
+    total: int = 0
+    audio: int = 0
+    video: int = 0
+    has_audio: bool = Field(default=False, alias="hasAudio")
+    has_video: bool = Field(default=False, alias="hasVideo")
+
+    model_config = {"populate_by_name": True}
+
+
+class MediaItem(BaseModel):
+    """A discovered audio or video reference on a page."""
+
+    type: Literal["video", "audio"]
+    present: bool = True
+    presence: Literal["html", "embed", "metadata", "jsonLd", "text"]
+    source_url: str = Field(alias="sourceURL")
+    url: Optional[str] = None
+    title: Optional[str] = None
+    thumbnail: Optional[str] = None
+    description: Optional[str] = None
+    provider: Optional[str] = None
+    mime_type: Optional[str] = Field(default=None, alias="mimeType")
+    duration: Optional[str] = None
+    count: Optional[int] = None
+
+    model_config = {"populate_by_name": True}
+
+
+class MediaBlock(BaseModel):
+    """Discovered page media."""
+
+    summary: MediaSummary
+    items: List[MediaItem] = []
+
+    model_config = {"populate_by_name": True}
+
+
 class Document(BaseModel):
     """A scraped document."""
 
@@ -333,6 +373,7 @@ class Document(BaseModel):
     metadata: Optional[DocumentMetadata] = None
     links: Optional[List[str]] = None
     images: Optional[List[str]] = None
+    media: Optional[MediaBlock] = None
     screenshot: Optional[str] = None
     audio: Optional[str] = None
     video: Optional[str] = None
@@ -460,6 +501,7 @@ FormatString = Literal[
     "rawHtml",
     "links",
     "images",
+    "media",
     "screenshot",
     "summary",
     "changeTracking",
@@ -544,6 +586,14 @@ class HighlightsFormat(Format):
     query: str
 
 
+class MediaFormat(Format):
+    """Configuration for media discovery."""
+
+    type: Literal["media"] = "media"
+    types: Optional[List[Literal["video", "audio"]]] = None
+    limit: Optional[int] = None
+
+
 class QueryFormat(Format):
     """Deprecated query format. Use QuestionFormat or HighlightsFormat instead."""
 
@@ -561,6 +611,7 @@ FormatOption = Union[
     AttributesFormat,
     QuestionFormat,
     HighlightsFormat,
+    MediaFormat,
     QueryFormat,
     Format,
 ]
@@ -577,6 +628,7 @@ class ScrapeFormats(BaseModel):
     summary: bool = False
     links: bool = False
     images: bool = False
+    media: bool = False
     screenshot: bool = False
     change_tracking: bool = False
     json: bool = False
