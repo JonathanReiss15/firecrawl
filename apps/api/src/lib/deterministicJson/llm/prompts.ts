@@ -94,7 +94,7 @@ if (!text) throw new Error("Missing Balance value");
 const balance = Number(text.replace(/[^0-9.-]/g, ""));
 
 List item scoping:
-const cards = [...doc.querySelectorAll("[data-testid='product-card']");
+const cards = [...doc.querySelectorAll("[data-testid='product-card']")];
 if (!cards.length) throw new Error("Missing product cards");
 const products = cards.map(card => {
   const name = card.querySelector("h2")?.textContent?.trim();
