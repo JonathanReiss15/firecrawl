@@ -442,7 +442,7 @@ function buildPostMarkdown(post: XTwitterPostData): string {
     lines.push(metrics.join(" | "));
   }
 
-  lines.push("", "## Post", "", post.text.trim());
+  lines.push("", "## Post", "", escapeMarkdownBlock(post.text.trim()));
 
   const thread = (post.thread ?? []).filter(item => item.text?.trim());
   if (thread.length > 0) {
