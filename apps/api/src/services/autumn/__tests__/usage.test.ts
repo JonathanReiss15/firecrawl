@@ -704,9 +704,9 @@ describe("getTeamBalance", () => {
     expect(result!.usage).toBe(12345);
   });
 
-  // Autumn caps `balance.remaining` at 0 when overage isn't allowed, so the
-  // raw field can't show negative balances for teams in overage. We derive
-  // the signed value from granted - usage instead.
+  // Autumn caps `balance.remaining` at 0, so the raw field can't show
+  // negative balances for teams in overage. We derive the signed value from
+  // granted - usage instead.
   it("returns a negative remaining when usage exceeds granted (overage)", async () => {
     mockEntitiesGet.mockResolvedValue({
       balances: {
