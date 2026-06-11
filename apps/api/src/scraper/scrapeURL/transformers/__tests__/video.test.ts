@@ -1,4 +1,4 @@
-import { fetchVideo } from "../video";
+import { fetchVideo, resetVideoTransformerCacheForTests } from "../video";
 import { config } from "../../../../config";
 
 describe("fetchVideo", () => {
@@ -8,6 +8,7 @@ describe("fetchVideo", () => {
   afterEach(() => {
     global.fetch = originalFetch;
     config.AVGRAB_SERVICE_URL = originalAvgrabServiceUrl;
+    resetVideoTransformerCacheForTests();
     jest.clearAllMocks();
   });
 
@@ -30,6 +31,57 @@ describe("fetchVideo", () => {
     config.AVGRAB_SERVICE_URL = "https://avgrab.example";
     return fetchSpy;
   }
+
+  it("returns generic videos without downloading or requiring a supported provider URL", async () => {
+    const video = {
+      url: "https://cdn.example.com/product.mp4",
+      sourceURL: "https://example.com/product",
+      source: "metadata",
+      kind: "file",
+      provider: "example.com",
+      title: "Product clip",
+      thumbnail: "https://cdn.example.com/poster.jpg",
+      mimeType: "video/mp4",
+    };
+    const fetchSpy = jest.fn(async (url: string) => {
+      if (url.endsWith("/videos")) {
+        return {
+          ok: true,
+          json: async () => ({ videos: [video] }),
+        };
+      }
+
+      throw new Error(`Unexpected request: ${url}`);
+    });
+    global.fetch = fetchSpy as any;
+    config.AVGRAB_SERVICE_URL = "https://avgrab.example";
+
+    const meta: any = {
+      url: "https://example.com/product",
+      options: {
+        lockdown: false,
+        formats: [{ type: "video" }],
+      },
+      logger: { warn: jest.fn(), info: jest.fn(), debug: jest.fn() },
+    };
+    const document: any = { rawHtml: "<html></html>" };
+
+    await fetchVideo(meta, document);
+
+    expect(fetchSpy).toHaveBeenCalledTimes(1);
+    expect(fetchSpy).toHaveBeenCalledWith(
+      "https://avgrab.example/videos",
+      expect.objectContaining({
+        method: "POST",
+        body: JSON.stringify({
+          url: "https://example.com/product",
+          html: "<html></html>",
+        }),
+      }),
+    );
+    expect(document.videos).toEqual([video]);
+    expect(document.video).toBeUndefined();
+  });
 
   it("does not issue any fetch when lockdown is true, even if video format is requested", async () => {
     const fetchSpy = jest.fn();
@@ -134,6 +186,53 @@ describe("fetchVideo", () => {
     expect(document.video).toBe("https://storage.example/video.mp4");
   });
 
+  it("keeps generic provider entries and still populates legacy video for supported provider URLs", async () => {
+    const providerVideo = {
+      url: "https://www.youtube.com/watch?v=abc123",
+      sourceURL: "https://www.youtube.com/watch?v=abc123",
+      source: "provider",
+      kind: "page",
+      provider: "youtube",
+      title: "Video page",
+    };
+    const fetchSpy = jest.fn(async (url: string, _init?: RequestInit) => {
+      if (url.endsWith("/videos")) {
+        return {
+          ok: true,
+          json: async () => ({ videos: [providerVideo] }),
+        };
+      }
+      if (url.endsWith("/supported-urls")) {
+        return {
+          ok: true,
+          json: async () => ({ regex: "https://www\\.youtube\\.com/watch" }),
+        };
+      }
+
+      return {
+        ok: true,
+        json: async () => ({ public_url: "https://storage.example/video.mp4" }),
+      };
+    });
+    global.fetch = fetchSpy as any;
+    config.AVGRAB_SERVICE_URL = "https://avgrab.example";
+
+    const meta: any = {
+      url: "https://www.youtube.com/watch?v=abc123",
+      options: {
+        lockdown: false,
+        formats: [{ type: "video" }],
+      },
+      logger: { warn: jest.fn(), info: jest.fn(), debug: jest.fn() },
+    };
+    const document: any = {};
+
+    await fetchVideo(meta, document);
+
+    expect(document.videos).toEqual([providerVideo]);
+    expect(document.video).toBe("https://storage.example/video.mp4");
+  });
+
   it("omits cookies from the avgrab request when no video cookies are available", async () => {
     const fetchSpy = mockSuccessfulAvgrab();
 
@@ -160,7 +259,7 @@ describe("fetchVideo", () => {
     });
   });
 
-  it("rejects unsupported URLs", async () => {
+  it("leaves video fields empty when no generic videos are found and the URL is not supported by legacy download", async () => {
     mockSuccessfulAvgrab();
 
     const meta: any = {
@@ -173,6 +272,8 @@ describe("fetchVideo", () => {
     };
     const document: any = {};
 
-    await expect(fetchVideo(meta, document)).rejects.toThrow(/video/i);
+    await expect(fetchVideo(meta, document)).resolves.toBe(document);
+    expect(document.video).toBeUndefined();
+    expect(document.videos).toBeUndefined();
   });
 });

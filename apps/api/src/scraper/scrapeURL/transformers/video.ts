@@ -1,12 +1,16 @@
 import { Meta } from "..";
-import { Document } from "../../../controllers/v2/types";
+import { Document, VideoItem } from "../../../controllers/v2/types";
 import { config } from "../../../config";
 import { hasFormatOfType } from "../../../lib/format-utils";
-import { VideoUnsupportedUrlError } from "../error";
 
 let cachedUrlRegex: RegExp | null = null;
 let cacheTimestamp = 0;
 const CACHE_TTL_MS = 5 * 60 * 1000;
+
+export function resetVideoTransformerCacheForTests() {
+  cachedUrlRegex = null;
+  cacheTimestamp = 0;
+}
 
 async function getSupportedUrlRegex(): Promise<RegExp> {
   if (cachedUrlRegex && Date.now() - cacheTimestamp < CACHE_TTL_MS) {
@@ -34,6 +38,99 @@ async function getSupportedUrlRegex(): Promise<RegExp> {
   return cachedUrlRegex;
 }
 
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return value !== null && typeof value === "object" && !Array.isArray(value);
+}
+
+function optionalString(value: unknown): string | undefined {
+  return typeof value === "string" && value.length > 0 ? value : undefined;
+}
+
+function optionalNumber(value: unknown): number | undefined {
+  return typeof value === "number" && Number.isFinite(value)
+    ? value
+    : undefined;
+}
+
+function normalizeVideoItem(value: unknown): VideoItem | null {
+  if (!isRecord(value)) {
+    return null;
+  }
+
+  const url = optionalString(value.url);
+  const sourceURL = optionalString(value.sourceURL);
+  const source = optionalString(value.source);
+  if (!url || !sourceURL || !source) {
+    return null;
+  }
+
+  return {
+    url,
+    sourceURL,
+    source,
+    kind: optionalString(value.kind),
+    provider: optionalString(value.provider),
+    title: optionalString(value.title),
+    thumbnail: optionalString(value.thumbnail),
+    description: optionalString(value.description),
+    duration: optionalString(value.duration),
+    mimeType: optionalString(value.mimeType),
+    width: optionalNumber(value.width),
+    height: optionalNumber(value.height),
+    metadata: isRecord(value.metadata) ? value.metadata : undefined,
+  };
+}
+
+async function fetchGenericVideos(
+  meta: Meta,
+  document: Document,
+): Promise<VideoItem[]> {
+  const requestBody = {
+    url: meta.rewrittenUrl ?? meta.url,
+    ...(document.rawHtml || document.html
+      ? { html: document.rawHtml ?? document.html }
+      : {}),
+  };
+
+  const response = await fetch(`${config.AVGRAB_SERVICE_URL}/videos`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(requestBody),
+  });
+
+  if (response.status === 404) {
+    meta.logger.debug("avgrab /videos endpoint is unavailable");
+    return [];
+  }
+
+  if (!response.ok) {
+    const error = await response
+      .json()
+      .catch(() => ({ detail: "Unknown error" }));
+    meta.logger.warn("Generic video discovery failed", {
+      detail: isRecord(error) ? error.detail : undefined,
+    });
+    return [];
+  }
+
+  const data = await response.json().catch(() => null);
+  if (!isRecord(data) || !Array.isArray(data.videos)) {
+    meta.logger.warn("Generic video discovery returned an invalid response");
+    return [];
+  }
+
+  return data.videos.flatMap(item => {
+    const normalized = normalizeVideoItem(item);
+    return normalized ? [normalized] : [];
+  });
+}
+
+function shouldTryLegacyDownload(videos: VideoItem[]): boolean {
+  return !videos.some(
+    video => video.kind !== "page" || video.source !== "provider",
+  );
+}
+
 export async function fetchVideo(
   meta: Meta,
   document: Document,
@@ -56,9 +153,28 @@ export async function fetchVideo(
     return document;
   }
 
-  const urlRegex = await getSupportedUrlRegex();
+  const videos = await fetchGenericVideos(meta, document);
+  if (videos.length > 0) {
+    document.videos = videos;
+  }
+
+  if (!shouldTryLegacyDownload(videos)) {
+    return document;
+  }
+
+  let urlRegex: RegExp | null = null;
+  try {
+    urlRegex = await getSupportedUrlRegex();
+  } catch (error) {
+    if (videos.length > 0) {
+      meta.logger.warn("Skipping legacy video download", { error });
+      return document;
+    }
+    throw error;
+  }
+
   if (!urlRegex.test(meta.url)) {
-    throw new VideoUnsupportedUrlError();
+    return document;
   }
 
   const requestBody = {
