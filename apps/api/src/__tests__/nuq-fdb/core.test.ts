@@ -517,7 +517,7 @@ describeIf("NuQ FDB core", () => {
     expect(await queue.getJob(pendingId)).toBeNull();
     expect(await queue.getTeamPendingCount(owner)).toBe(0);
     await db.doTn(async tn => {
-      expect(await tn.get(queue.ks.taskGroupCancel(gid))).toBeNull();
+      expect(await tn.get(queue.ks.taskGroupCancel(gid))).toBeFalsy();
     });
   });
 
