@@ -64,6 +64,13 @@ const ENQUEUE_MAX_JOBS_PER_TRANSACTION = 250;
 
 export { QueueFullError };
 
+type FdbKeySelector = {
+  key: Buffer;
+  orEqual: boolean;
+  offset: number;
+  _isKeySelector: true;
+};
+
 export type NuQJobStatusCompat =
   | "queued"
   | "active"
@@ -1166,8 +1173,7 @@ export class NuQFdbQueue<JobData = any, JobReturnValue = any> {
     const owner = normalizeOwnerId(ownerId);
     const candidateId = await this.db.doTn(async tn => {
       const r = ks.groupJobRange(groupId);
-      let begin: Buffer | { key: Buffer; orEqual: boolean; offset: number } =
-        r.begin;
+      let begin: Buffer | FdbKeySelector = r.begin;
       // scan for the first countable (single_urls) member
       for (let scanned = 0; scanned < 2000; ) {
         const batch = await tn
@@ -1180,7 +1186,12 @@ export class NuQFdbQueue<JobData = any, JobReturnValue = any> {
         }
         scanned += batch.length;
         const lastKey = batch[batch.length - 1][0] as Buffer;
-        begin = { key: lastKey, orEqual: false, offset: 1 } as any;
+        begin = {
+          key: lastKey,
+          orEqual: true,
+          offset: 1,
+          _isKeySelector: true,
+        };
       }
       return null;
     });
