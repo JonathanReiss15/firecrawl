@@ -148,6 +148,20 @@ function startHeartbeat(
   mirrorState: MirrorState,
 ) {
   let stopped = false;
+  let wake: (() => void) | null = null;
+
+  const sleep = (ms: number) =>
+    new Promise<void>(resolve => {
+      const timer = setTimeout(() => {
+        wake = null;
+        resolve();
+      }, ms);
+      wake = () => {
+        clearTimeout(timer);
+        wake = null;
+        resolve();
+      };
+    });
 
   const promise = (async () => {
     try {
@@ -158,15 +172,18 @@ function startHeartbeat(
             jobId: holderId,
           });
         });
+        if (stopped) break;
 
         const ok = await heartbeat(teamId, holderId);
         if (!ok) {
           throw new TransportableError("SCRAPE_TIMEOUT", "heartbeat_failed");
         }
-        await new Promise(r => setTimeout(r, intervalMs));
+        await sleep(intervalMs);
       }
     } catch (error) {
-      _logger.error("Error in semaphore heartbeat loop", { error });
+      if (!stopped) {
+        _logger.error("Error in semaphore heartbeat loop", { error });
+      }
     }
 
     return Promise.reject(
@@ -176,8 +193,10 @@ function startHeartbeat(
 
   return {
     promise,
-    stop() {
+    async stop() {
       stopped = true;
+      wake?.();
+      await promise.catch(() => {});
     },
   };
 }
@@ -276,6 +295,8 @@ async function withSemaphore<T>(
     const result = await Promise.race([func(limited), hb.promise]);
     return result;
   } finally {
+    await hb?.stop();
+
     await mirrorSlotRelease(teamId, holderId, mirrorState).catch(() => {
       _logger.warn("Failed to remove concurrency limit active job", {
         teamId,
@@ -284,7 +305,6 @@ async function withSemaphore<T>(
     });
 
     activeSemaphores.dec();
-    hb?.stop();
     endTimer();
 
     await release(teamId, holderId).catch(() => {});
