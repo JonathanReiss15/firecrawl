@@ -178,6 +178,7 @@ function startHeartbeat(
         if (!ok) {
           throw new TransportableError("SCRAPE_TIMEOUT", "heartbeat_failed");
         }
+        if (stopped) break;
         await sleep(intervalMs);
       }
     } catch (error) {
