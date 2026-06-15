@@ -44,7 +44,7 @@ async function currentKeylessIp(): Promise<string> {
   return keys[0].slice("keyless_requests:".length);
 }
 
-describeIf(KEYLESS_ENABLED)("Keyless free tier (MCP/CLI/SDK)", () => {
+describeIf(KEYLESS_ENABLED)("Keyless free tier", () => {
   beforeAll(() => {
     config.USE_DB_AUTHENTICATION = true;
   });
@@ -58,15 +58,35 @@ describeIf(KEYLESS_ENABLED)("Keyless free tier (MCP/CLI/SDK)", () => {
     await flushKeylessBuckets();
   });
 
-  it("rejects keyless requests whose origin is not mcp/cli/sdk (401)", async () => {
-    const response = await request(TEST_API_URL)
-      .post("/v2/scrape")
-      .set("Content-Type", "application/json")
-      .send({ url: "https://example.com", origin: "api" });
+  it(
+    "allows keyless scrape from a raw API caller (no origin gate) (200)",
+    async () => {
+      // origin "api" (and no origin at all) is now eligible — the API itself is
+      // free without a key on the allowlisted endpoints.
+      const response = await request(TEST_API_URL)
+        .post("/v2/scrape")
+        .set("Content-Type", "application/json")
+        .send({ url: TEST_SUITE_WEBSITE, origin: "api", formats: ["markdown"] });
 
-    expect(response.statusCode).toBe(401);
-    expect(response.body.success).toBe(false);
-  });
+      expect(response.statusCode).toBe(200);
+      expect(response.body.success).toBe(true);
+    },
+    scrapeTimeout,
+  );
+
+  it(
+    "allows keyless scrape with no origin field at all (200)",
+    async () => {
+      const response = await request(TEST_API_URL)
+        .post("/v2/scrape")
+        .set("Content-Type", "application/json")
+        .send({ url: TEST_SUITE_WEBSITE, formats: ["markdown"] });
+
+      expect(response.statusCode).toBe(200);
+      expect(response.body.success).toBe(true);
+    },
+    scrapeTimeout,
+  );
 
   it("does not grant keyless access on non-allowlisted endpoints (401)", async () => {
     // batch/scrape shares RateLimiterMode.Scrape but is NOT allowKeyless.
@@ -98,6 +118,8 @@ describeIf(KEYLESS_ENABLED)("Keyless free tier (MCP/CLI/SDK)", () => {
 
     expect(blocked.statusCode).toBe(429);
     expect(blocked.body.error).toContain("unauthenticated requests");
+    // Out of quota → emit the OAuth-discovery header so agents find the key flow.
+    expect(blocked.headers["www-authenticate"]).toContain("resource_metadata");
   });
 
   it("enforces the daily credit cap with the credit signup message (429)", async () => {
@@ -163,6 +185,39 @@ describeIf(KEYLESS_ENABLED)("Keyless free tier (MCP/CLI/SDK)", () => {
 
       // IPv6 is not eligible → falls through to the normal unauthorized path.
       expect(response.statusCode).toBe(401);
+    },
+  );
+
+  itIf(!!process.env.KEYLESS_PROXY_SECRET)(
+    "keyless eligibility endpoint reflects cap state (hosted MCP probe)",
+    async () => {
+      const ip = "203.0.113.40";
+
+      // Fresh IP under cap → eligible.
+      const ok = await request(TEST_API_URL)
+        .get("/v2/keyless/eligibility")
+        .set("x-firecrawl-keyless-secret", process.env.KEYLESS_PROXY_SECRET!)
+        .set("x-firecrawl-keyless-ip", ip);
+      expect(ok.statusCode).toBe(200);
+      expect(ok.body.eligible).toBe(true);
+
+      // Seed over the credit cap → ineligible (so the MCP would issue an OAuth
+      // challenge instead of serving keyless).
+      await redisRateLimitClient.set(
+        `keyless_credits:${ip}`,
+        String(KEYLESS_CREDITS_PER_DAY),
+      );
+      const capped = await request(TEST_API_URL)
+        .get("/v2/keyless/eligibility")
+        .set("x-firecrawl-keyless-secret", process.env.KEYLESS_PROXY_SECRET!)
+        .set("x-firecrawl-keyless-ip", ip);
+      expect(capped.body.eligible).toBe(false);
+
+      // Without the secret → rejected (no leaking eligibility to untrusted callers).
+      const noSecret = await request(TEST_API_URL)
+        .get("/v2/keyless/eligibility")
+        .set("x-firecrawl-keyless-ip", ip);
+      expect(noSecret.statusCode).toBe(401);
     },
   );
 

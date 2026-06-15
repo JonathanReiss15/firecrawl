@@ -221,7 +221,9 @@ export function authMiddleware(
 
       if (!auth.success) {
         if (!res.headersSent) {
-          if (auth.status === 401) applyAgentAuthDiscoveryHeader(res);
+          if (auth.status === 401 || auth.agentAuthDiscovery) {
+            applyAgentAuthDiscoveryHeader(res);
+          }
           return res
             .status(auth.status)
             .json({ success: false, error: auth.error });

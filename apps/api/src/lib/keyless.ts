@@ -1,6 +1,5 @@
 import { isIPv4, isIPv6 } from "node:net";
 import { config } from "../config";
-import { originToSurface } from "../services/posthog";
 import { redisRateLimitClient } from "../services/rate-limiter";
 
 // Keyless free tier: scrape, search, and interact can be used without an API key
@@ -55,25 +54,6 @@ export function isKeylessIpEligible(ip: string): boolean {
   return !isIPv6(ip);
 }
 
-export type KeylessSurface = "mcp" | "cli" | "sdk";
-
-/**
- * Decide whether a keyless request is eligible, and which surface it came from.
- * - MCP sends `origin` like "mcp-fastmcp".
- * - The CLI sends `integration: "cli"`.
- * - SDKs send `origin` like "js-sdk@x.y.z" / "python-sdk@x.y.z".
- * Raw API callers (origin "api"/unset) are excluded so they keep getting 401.
- */
-export function keylessSurface(
-  origin: unknown,
-  integration: unknown,
-): KeylessSurface | null {
-  const surface = originToSurface(typeof origin === "string" ? origin : null);
-  if (surface === "mcp" || surface === "sdk") return surface;
-  if (surface === "cli" || integration === "cli") return "cli";
-  return null;
-}
-
 const requestsKey = (ip: string) => `keyless_requests:${ip}`;
 const creditsKey = (ip: string) => `keyless_credits:${ip}`;
 
@@ -113,6 +93,35 @@ export async function consumeKeylessRequest(
     return { ok: false, reason: "credits", requestsUsed, creditsUsed };
   }
   return { ok: true, requestsUsed, creditsUsed };
+}
+
+/**
+ * Read-only check of whether an IP could currently use the keyless tier (no
+ * consumption). Used by the hosted MCP to decide, at connect time, whether to
+ * serve keyless (eligible) or throw so FastMCP emits the OAuth challenge (not).
+ */
+export async function checkKeylessEligibility(
+  ip: string,
+): Promise<{ eligible: boolean; reason?: string }> {
+  if (!isKeylessConfigured()) return { eligible: false, reason: "disabled" };
+  if (!ip || !isKeylessIpEligible(ip)) {
+    return { eligible: false, reason: "ineligible_ip" };
+  }
+  const requestsUsed = parseInt(
+    (await redisRateLimitClient.get(requestsKey(ip))) ?? "0",
+    10,
+  );
+  if (requestsUsed >= (KEYLESS_REQUESTS_PER_DAY ?? 0)) {
+    return { eligible: false, reason: "requests" };
+  }
+  const creditsUsed = parseInt(
+    (await redisRateLimitClient.get(creditsKey(ip))) ?? "0",
+    10,
+  );
+  if (creditsUsed >= (KEYLESS_CREDITS_PER_DAY ?? 0)) {
+    return { eligible: false, reason: "credits" };
+  }
+  return { eligible: true };
 }
 
 /**

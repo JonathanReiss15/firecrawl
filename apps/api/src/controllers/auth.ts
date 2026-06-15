@@ -12,7 +12,6 @@ import {
   consumeKeylessRequest,
   isKeylessConfigured,
   isKeylessIpEligible,
-  keylessSurface,
   keylessTeamId,
 } from "../lib/keyless";
 import { deleteKey, getValue, setValue } from "../services/redis";
@@ -510,8 +509,9 @@ async function handleKeylessAuth(
 
   const origin = req.body?.origin;
   const integration = req.body?.integration;
-  const surface = keylessSurface(origin, integration);
-  if (!surface) return unauthorized;
+  // No origin/surface gate: any request without an API key may use the free
+  // tier on the allowlisted endpoints (the API itself is free). origin and
+  // integration are still recorded below for abuse monitoring.
 
   // Key on the real client IP. A trusted proxy (e.g. the hosted MCP) may
   // forward the end-user's IP via x-firecrawl-keyless-ip, authenticated with a
@@ -546,7 +546,6 @@ async function handleKeylessAuth(
     ip,
     origin,
     integration,
-    surface,
     mode: modeLabel,
     teamId,
     requestsUsed: result.requestsUsed,
@@ -566,6 +565,9 @@ async function handleKeylessAuth(
           ? KEYLESS_CREDITS_MESSAGE
           : KEYLESS_REQUESTS_MESSAGE,
       status: 429,
+      // Out of free quota — emit the OAuth-discovery header so agents can find
+      // the key/signup flow at the moment they actually need a key.
+      agentAuthDiscovery: true,
     };
   }
 

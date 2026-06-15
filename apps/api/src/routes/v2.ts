@@ -8,6 +8,7 @@ import { searchController } from "../controllers/v2/search";
 import { searchFeedbackController } from "../controllers/v2/search-feedback";
 import { x402SearchController } from "../controllers/v2/x402-search";
 import { scrapeController } from "../controllers/v2/scrape";
+import { keylessEligibilityController } from "../controllers/v2/keyless-eligibility";
 import {
   parseController,
   parseMultipartPayloadMiddleware,
@@ -233,6 +234,10 @@ v2Router.use(requestTimingMiddleware("v2"));
 //     facilitator,
 //   ),
 // );
+
+// Internal: trusted-proxy (hosted MCP) keyless eligibility probe. Secret-gated
+// inside the controller; no auth middleware.
+v2Router.get("/keyless/eligibility", wrap(keylessEligibilityController));
 
 v2Router.post(
   "/search",
