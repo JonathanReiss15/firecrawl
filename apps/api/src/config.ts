@@ -50,9 +50,10 @@ const configSchema = z.object({
   // Express
   EXPRESS_TRUST_PROXY: z.coerce.number().optional(),
 
-  // Keyless free tier (scrape/search/interact without an API key, per-IP/day)
-  KEYLESS_CREDITS_PER_DAY: z.coerce.number().optional(),
-  KEYLESS_REQUESTS_PER_DAY: z.coerce.number().optional(),
+  // Keyless free tier (scrape/search/interact without an API key, per-IP/day).
+  // Non-negative integers; 0 means "enabled but no budget", unset means "off".
+  KEYLESS_CREDITS_PER_DAY: z.coerce.number().int().nonnegative().optional(),
+  KEYLESS_REQUESTS_PER_DAY: z.coerce.number().int().nonnegative().optional(),
   // Shared secret that lets a trusted proxy (e.g. the hosted MCP server)
   // forward the real client IP for keyless rate-limiting via the
   // `x-firecrawl-keyless-ip` header. Untrusted callers can't override their IP.

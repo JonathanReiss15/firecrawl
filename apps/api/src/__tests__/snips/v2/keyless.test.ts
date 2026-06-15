@@ -189,6 +189,21 @@ describeIf(KEYLESS_ENABLED)("Keyless free tier", () => {
   );
 
   itIf(!!process.env.KEYLESS_PROXY_SECRET)(
+    "denies keyless for a malformed forwarded IP (401)",
+    async () => {
+      // A non-IP forwarded value must not be usable as a limiter bucket.
+      const response = await request(TEST_API_URL)
+        .post("/v2/scrape")
+        .set("Content-Type", "application/json")
+        .set("x-firecrawl-keyless-secret", process.env.KEYLESS_PROXY_SECRET!)
+        .set("x-firecrawl-keyless-ip", "not-an-ip")
+        .send({ url: TEST_SUITE_WEBSITE, origin: "mcp" });
+
+      expect(response.statusCode).toBe(401);
+    },
+  );
+
+  itIf(!!process.env.KEYLESS_PROXY_SECRET)(
     "keyless eligibility endpoint reflects cap state (hosted MCP probe)",
     async () => {
       const ip = "203.0.113.40";

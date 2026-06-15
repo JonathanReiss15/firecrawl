@@ -528,8 +528,9 @@ async function handleKeylessAuth(
     }
   }
 
-  // Deny keyless to IPv6 clients — addresses are too cheap to rotate for a
-  // per-IP cap to mean anything. They fall through to the normal 401.
+  // Only a valid IPv4 identity gets keyless: IPv6 is too cheap to rotate for a
+  // per-IP cap to mean anything, and malformed/forwarded values must not be
+  // usable as arbitrary limiter buckets. Anything else falls through to 401.
   if (!isKeylessIpEligible(ip)) return unauthorized;
 
   const teamId = keylessTeamId(ip);
@@ -540,7 +541,22 @@ async function handleKeylessAuth(
         ? "interact"
         : "scrape";
 
-  const result = await consumeKeylessRequest(ip);
+  let result: Awaited<ReturnType<typeof consumeKeylessRequest>>;
+  try {
+    result = await consumeKeylessRequest(ip);
+  } catch (error) {
+    // Limiter store (Redis) unavailable — fail closed with a controlled auth
+    // response instead of surfacing a 500, and shed the free traffic while the
+    // limiter can't enforce quotas.
+    logger.warn("Keyless quota check failed", {
+      canonicalLog: "keyless/consume",
+      ip,
+      mode: modeLabel,
+      teamId,
+      error,
+    });
+    return unauthorized;
+  }
   const baseLog = {
     canonicalLog: "keyless/consume",
     ip,

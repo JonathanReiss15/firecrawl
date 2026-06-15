@@ -1,4 +1,4 @@
-import { isIPv4, isIPv6 } from "node:net";
+import { isIPv4 } from "node:net";
 import { v5 as uuidv5 } from "uuid";
 import { config } from "../config";
 import { db } from "../db/connection";
@@ -62,17 +62,20 @@ export function keylessTeamUuid(
 }
 
 /**
- * IPv6 clients are denied the keyless tier: a single client typically controls a
- * huge IPv6 block (a /64 is ~18 quintillion addresses), so per-IP caps are
- * trivially bypassed by rotating addresses. IPv4-mapped IPv6 (e.g.
- * "::ffff:1.2.3.4", how dual-stack sockets surface IPv4) counts as IPv4.
+ * Keyless is allowed only for a *valid IPv4* client identity. This both:
+ *  - denies IPv6 (a single client controls a huge block — a /64 is ~18
+ *    quintillion addresses — so a per-IP cap is trivially bypassed), and
+ *  - rejects malformed/unknown values (e.g. a forwarded `x-firecrawl-keyless-ip`
+ *    that isn't a real IP), so they can't be used to mint arbitrary buckets and
+ *    weaken per-IP quota enforcement.
+ * IPv4-mapped IPv6 (e.g. "::ffff:1.2.3.4", how dual-stack sockets surface IPv4)
+ * is treated as IPv4.
  */
 export function isKeylessIpEligible(ip: string): boolean {
   const normalized = ip.startsWith("::ffff:")
     ? ip.slice("::ffff:".length)
     : ip;
-  if (isIPv4(normalized)) return true;
-  return !isIPv6(ip);
+  return isIPv4(normalized);
 }
 
 const requestsKey = (ip: string) => `keyless_requests:${ip}`;
@@ -128,21 +131,27 @@ export async function checkKeylessEligibility(
   if (!ip || !isKeylessIpEligible(ip)) {
     return { eligible: false, reason: "ineligible_ip" };
   }
-  const requestsUsed = parseInt(
-    (await redisRateLimitClient.get(requestsKey(ip))) ?? "0",
-    10,
-  );
-  if (requestsUsed >= (KEYLESS_REQUESTS_PER_DAY ?? 0)) {
-    return { eligible: false, reason: "requests" };
+  try {
+    const requestsUsed = parseInt(
+      (await redisRateLimitClient.get(requestsKey(ip))) ?? "0",
+      10,
+    );
+    if (requestsUsed >= (KEYLESS_REQUESTS_PER_DAY ?? 0)) {
+      return { eligible: false, reason: "requests" };
+    }
+    const creditsUsed = parseInt(
+      (await redisRateLimitClient.get(creditsKey(ip))) ?? "0",
+      10,
+    );
+    if (creditsUsed >= (KEYLESS_CREDITS_PER_DAY ?? 0)) {
+      return { eligible: false, reason: "credits" };
+    }
+    return { eligible: true };
+  } catch {
+    // Limiter store unavailable — fail closed so the MCP issues an OAuth
+    // challenge rather than granting unbounded keyless.
+    return { eligible: false, reason: "error" };
   }
-  const creditsUsed = parseInt(
-    (await redisRateLimitClient.get(creditsKey(ip))) ?? "0",
-    10,
-  );
-  if (creditsUsed >= (KEYLESS_CREDITS_PER_DAY ?? 0)) {
-    return { eligible: false, reason: "credits" };
-  }
-  return { eligible: true };
 }
 
 /**
