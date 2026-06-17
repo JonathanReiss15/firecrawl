@@ -15,6 +15,7 @@ import { performQuery } from "./query";
 import { removeBase64Images } from "./removeBase64Images";
 import { performAgent } from "./agent";
 import { performAttributes } from "./performAttributes";
+import { repairPdfTables } from "./repairPdfTables";
 
 import { deriveDiff } from "./diff";
 import { fetchAudio } from "./audio";
@@ -571,6 +572,7 @@ function coerceFieldsToFormats(meta: Meta, document: Document): Document {
 const transformerStack: Transformer[] = [
   deriveHTMLFromRawHTML,
   deriveMarkdownFromHTML,
+  repairPdfTables,
   performCleanContent,
   performRedactPII,
   deriveLinksFromHTML,
