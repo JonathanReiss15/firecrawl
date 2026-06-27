@@ -1,12 +1,11 @@
 import { fetch } from "undici";
-import { eq, sql } from "drizzle-orm";
+import { sql } from "drizzle-orm";
 import { validate as isUuid } from "uuid";
 import { z } from "zod";
 
 import { config } from "../config";
 import type { FormatObject } from "../controllers/v2/types";
 import { dbRr } from "../db/connection";
-import * as schema from "../db/schema";
 import { logger as rootLogger } from "./logger";
 
 type RouteInput = {
@@ -305,15 +304,20 @@ async function hasAcceptedThirdPartyDataTerms(
   }
 
   try {
-    const [team] = await dbRr
-      .select({
-        data_source_terms: sql<unknown>`data_source_terms`,
-      })
-      .from(schema.teams)
-      .where(eq(schema.teams.id, teamId))
-      .limit(1);
+    const result = await dbRr.execute(
+      sql`
+        select o.data_source_terms
+        from teams t
+        join organizations o on o.id = t.org_id
+        where t.id = ${teamId}
+        limit 1
+      `,
+    );
+    const organization = result.rows?.[0] as
+      | { data_source_terms?: unknown }
+      | undefined;
     const accepted = isCurrentThirdPartyDataTermsAccepted(
-      team?.data_source_terms,
+      organization?.data_source_terms,
     );
 
     cachedTermsAcceptance.set(teamId, {
