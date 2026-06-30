@@ -261,11 +261,13 @@ export function authMiddleware(
       req.auth = { team_id, org_id };
       req.acuc = chunk ?? undefined;
       if (chunk) {
-        req.account = {
-          remainingCredits: chunk.price_should_be_graceful
-            ? chunk.remaining_credits + chunk.price_credits
-            : chunk.remaining_credits,
-        };
+        // Autumn is the source of truth for credit balances now; the ACUC
+        // remaining_credits / price_credits fields are zeroed out.
+        // checkCreditsMiddleware sets the real remaining balance from Autumn
+        // for credit-gated routes. Here we only guarantee req.account is
+        // defined (crawl reads req.account!.remainingCredits) without
+        // clamping on the vestigial ACUC credit fields.
+        req.account = { remainingCredits: Infinity };
       }
       next();
     })().catch(err => next(err));
