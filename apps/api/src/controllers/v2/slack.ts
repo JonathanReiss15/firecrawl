@@ -243,12 +243,25 @@ export async function slackEventsController(req: Request, res: Response) {
   }
 
   if (body.type === "event_callback" && body.event?.type) {
-    const eventType = body.event.type as string;
+    const event = body.event as {
+      type?: string;
+      tokens?: { bot?: unknown[]; oauth?: unknown[] };
+    };
+    const eventType = event.type;
     const slackTeamId = (body.team_id as string) || undefined;
-    if (
-      (eventType === "app_uninstalled" || eventType === "tokens_revoked") &&
-      slackTeamId
-    ) {
+
+    // Only tear down the installation on a full uninstall, or when the BOT
+    // token itself is revoked. `tokens_revoked` also fires for user-token-only
+    // revocations (`event.tokens.oauth`), which leave the bot token — the one
+    // the integration actually uses — valid, so those must be ignored.
+    const botTokenRevoked =
+      eventType === "tokens_revoked" &&
+      Array.isArray(event.tokens?.bot) &&
+      event.tokens.bot.length > 0;
+    const shouldDisconnect =
+      eventType === "app_uninstalled" || botTokenRevoked;
+
+    if (shouldDisconnect && slackTeamId) {
       try {
         await deleteSlackInstallationsBySlackTeam(slackTeamId);
         logger.info("Removed Slack installation after lifecycle event", {

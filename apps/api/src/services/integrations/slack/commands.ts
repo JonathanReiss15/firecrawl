@@ -1,3 +1,4 @@
+import { z } from "zod";
 import { config } from "../../../config";
 import { logger as _logger } from "../../../lib/logger";
 import {
@@ -182,9 +183,19 @@ async function cancelResponse(
   monitorId: string,
 ): Promise<SlackCommandResponse> {
   const trimmed = monitorId.trim();
-  const existing = await getMonitorForUpdate(installation.team_id, trimmed).catch(
-    () => null,
-  );
+
+  // Validate the id shape first: a non-UUID arg gets a friendly message and
+  // avoids hitting the DB with an invalid uuid cast (which would throw).
+  if (!z.uuid().safeParse(trimmed).success) {
+    return ephemeral(
+      `\`${escapeSlackText(trimmed)}\` isn't a valid monitor id. Use \`/monitor list\` to find it.`,
+    );
+  }
+
+  // No catch here on purpose: a valid-but-missing id returns null, while real
+  // backend errors propagate to the command handler's try/catch so we don't
+  // disguise a failure as "not found".
+  const existing = await getMonitorForUpdate(installation.team_id, trimmed);
   if (!existing) {
     return ephemeral(
       `I couldn't find a monitor with id \`${escapeSlackText(trimmed)}\` on your team.`,

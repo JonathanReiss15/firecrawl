@@ -1,14 +1,12 @@
 import crypto from "crypto";
 import { config } from "../../../config";
-import { logger as _logger } from "../../../lib/logger";
-
-const logger = _logger.child({ module: "slack-crypto" });
 
 const PLAINTEXT_PREFIX = "plain:";
 const GCM_PREFIX = "gcm:";
 
-// Accepts a 32-byte key as hex (64 chars) or base64. Returns null when unset so
-// callers can fall back to plaintext storage on self-hosted setups.
+// Accepts a 32-byte key as hex (64 chars) or base64. Returns null ONLY when the
+// key is unset (self-hosted plaintext fallback). A key that is set but malformed
+// throws, so a misconfiguration never silently downgrades to plaintext storage.
 function getKey(): Buffer | null {
   const raw = config.SLACK_TOKEN_ENCRYPTION_KEY?.trim();
   if (!raw) return null;
@@ -26,10 +24,11 @@ function getKey(): Buffer | null {
   }
 
   if (!key || key.length !== 32) {
-    logger.error(
-      "SLACK_TOKEN_ENCRYPTION_KEY is set but is not a 32-byte hex/base64 value; refusing to use it",
+    // A configured-but-invalid key is operator error. Fail loudly rather than
+    // silently downgrading to plaintext token storage.
+    throw new Error(
+      "SLACK_TOKEN_ENCRYPTION_KEY is set but is not a valid 32-byte hex or base64 value",
     );
-    return null;
   }
   return key;
 }

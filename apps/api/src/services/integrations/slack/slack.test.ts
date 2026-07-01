@@ -4,6 +4,7 @@ import { config } from "../../../config";
 import { encryptSlackToken, decryptSlackToken } from "./crypto";
 import { verifySlackSignature } from "./signature";
 import { buildMonitorAlertMessage, escapeSlackText } from "./messages";
+import { sanitizeRedirectPath } from "./redirect";
 
 const ORIGINAL_ENCRYPTION_KEY = config.SLACK_TOKEN_ENCRYPTION_KEY;
 const ORIGINAL_SIGNING_SECRET = config.SLACK_SIGNING_SECRET;
@@ -42,6 +43,11 @@ describe("slack token crypto", () => {
     const stored = encryptSlackToken("bot-token-placeholder");
     config.SLACK_TOKEN_ENCRYPTION_KEY = undefined;
     expect(() => decryptSlackToken(stored)).toThrow();
+  });
+
+  it("throws on a configured-but-invalid key instead of storing plaintext", () => {
+    config.SLACK_TOKEN_ENCRYPTION_KEY = "invalid-key";
+    expect(() => encryptSlackToken("bot-token-placeholder")).toThrow();
   });
 });
 
@@ -140,5 +146,63 @@ describe("slack message builder", () => {
     // Header text is plain_text; the monitor name is not escaped there but the
     // fallback text keeps it readable.
     expect(serialized).toContain("meaningful");
+  });
+
+  it("bounds long page URLs so section blocks stay within Slack's 3000-char limit", () => {
+    const longUrl = "https://example.com/" + "a".repeat(6000);
+    const { blocks } = buildMonitorAlertMessage({
+      monitorName: "m",
+      dashboardUrl: "https://www.firecrawl.dev/app/monitoring/m1?checkId=c1",
+      checkId: "c1",
+      summary: { changed: 1, new: 0, removed: 0, error: 0, totalPages: 1 },
+      pages: [
+        {
+          url: longUrl,
+          status: "changed",
+          judgment: { meaningful: true, reason: "r".repeat(500) },
+        },
+      ],
+      creditsUsed: 1,
+    });
+
+    const sections = (blocks as Array<Record<string, any>>).filter(
+      b => b.type === "section" && b.text?.type === "mrkdwn",
+    );
+    expect(sections.length).toBeGreaterThan(0);
+    for (const section of sections) {
+      expect(section.text.text.length).toBeLessThanOrEqual(3000);
+    }
+  });
+});
+
+describe("slack redirect sanitization", () => {
+  it("allows same-origin dashboard paths", () => {
+    expect(sanitizeRedirectPath("/app/monitoring/123")).toBe(
+      "/app/monitoring/123",
+    );
+    expect(sanitizeRedirectPath("/app/monitoring?tab=slack")).toBe(
+      "/app/monitoring?tab=slack",
+    );
+  });
+
+  it("falls back for missing or non-absolute input", () => {
+    expect(sanitizeRedirectPath(undefined)).toBe("/app/monitoring");
+    expect(sanitizeRedirectPath(null)).toBe("/app/monitoring");
+    expect(sanitizeRedirectPath("")).toBe("/app/monitoring");
+    expect(sanitizeRedirectPath("app/monitoring")).toBe("/app/monitoring");
+  });
+
+  it("blocks open-redirect vectors", () => {
+    const vectors = [
+      "//evil.com",
+      "/\\evil.com", // "/\evil.com" — URL parser rewrites \ to / for http(s)
+      "/\\/evil.com",
+      "https://evil.com",
+      "/\t/evil.com",
+      "/\n//evil.com",
+    ];
+    for (const vector of vectors) {
+      expect(sanitizeRedirectPath(vector)).toBe("/app/monitoring");
+    }
   });
 });

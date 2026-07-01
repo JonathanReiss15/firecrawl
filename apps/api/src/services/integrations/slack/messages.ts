@@ -23,6 +23,11 @@ type MonitorSlackPayload = {
 };
 
 const MAX_PAGE_BLOCKS = 8;
+// Slack caps a section block's `text` at 3000 chars; exceeding it makes the whole
+// chat.postMessage fail (invalid_blocks), dropping the alert. URLs are the only
+// unbounded input we render, so bound them and clamp the assembled line.
+const SECTION_TEXT_LIMIT = 3000;
+const MAX_LINK_URL_LEN = 2000;
 
 // Slack mrkdwn requires these three characters escaped in text spans.
 export function escapeSlackText(input: string): string {
@@ -33,6 +38,14 @@ export function slackLink(url: string, label?: string): string {
   const safeUrl = url.replace(/[<>]/g, "");
   if (!label) return `<${safeUrl}>`;
   return `<${safeUrl}|${escapeSlackText(label)}>`;
+}
+
+// Renders a page URL for a section: clickable when short enough, otherwise a
+// truncated, non-clickable, escaped string so a pathological URL can't blow past
+// Slack's section text limit and drop the whole alert.
+function boundedPageLink(url: string): string {
+  if (url.length <= MAX_LINK_URL_LEN) return slackLink(url);
+  return escapeSlackText(truncate(url, MAX_LINK_URL_LEN));
 }
 
 // Builds the change-detection alert posted to a channel. Returns both a
@@ -86,7 +99,7 @@ export function buildMonitorAlertMessage(payload: MonitorSlackPayload): {
   if (shownPages.length > 0) {
     blocks.push({ type: "divider" });
     for (const page of shownPages) {
-      let line = `*${escapeSlackText(page.status)}* ${slackLink(page.url)}`;
+      let line = `*${escapeSlackText(page.status)}* ${boundedPageLink(page.url)}`;
       if (page.judgment) {
         line += page.judgment.meaningful
           ? "  :large_orange_diamond: _meaningful_"
@@ -97,7 +110,8 @@ export function buildMonitorAlertMessage(payload: MonitorSlackPayload): {
       }
       blocks.push({
         type: "section",
-        text: { type: "mrkdwn", text: line },
+        // Final safety net: never emit a section over Slack's hard limit.
+        text: { type: "mrkdwn", text: truncate(line, SECTION_TEXT_LIMIT) },
       });
     }
     const remaining = sortedPages.length - shownPages.length;

@@ -31,16 +31,18 @@ type SlackSummaryResult = {
 // Mirrors the email judge gate: only suppress when the changed-page list is
 // complete and every changed page is judged noise (a missed alert is worse than
 // a noisy one).
-function shouldSuppressForNoise(
+export function shouldSuppressForNoise(
   monitor: MonitorRow,
   check: MonitorCheckRow,
   pages: SlackSummaryPage[],
 ): boolean {
   if (!monitor.judge_enabled || !monitor.goal) return false;
   const changedPages = pages.filter(p => p.status === "changed");
-  const nonChangedActivity = pages.some(
-    p => p.status === "new" || p.status === "removed" || p.status === "error",
-  );
+  // Use the authoritative check counters (aggregated over ALL pages), not the
+  // page list — the runner caps `pages` at 100, so scanning it can miss
+  // new/removed/error activity beyond the cap and wrongly suppress a real alert.
+  const nonChangedActivity =
+    check.new_count > 0 || check.removed_count > 0 || check.error_count > 0;
   const changedListComplete = changedPages.length >= check.changed_count;
   if (changedPages.length > 0 && !nonChangedActivity && changedListComplete) {
     const anyMeaningful = changedPages.some(

@@ -4,6 +4,7 @@ import { logger as _logger } from "../../../lib/logger";
 import { redisEvictConnection } from "../../redis";
 import { exchangeOAuthCode } from "./client";
 import { encryptSlackToken } from "./crypto";
+import { sanitizeRedirectPath } from "./redirect";
 import { upsertSlackInstallation } from "./store";
 import type { SlackInstallationRow } from "./types";
 
@@ -58,13 +59,6 @@ export async function createAuthorizeUrl(params: {
   url.searchParams.set("state", state);
 
   return { url: url.toString(), state };
-}
-
-// Only allow same-origin dashboard paths to avoid open-redirects.
-function sanitizeRedirectPath(path?: string): string {
-  if (!path || typeof path !== "string") return "/app/monitoring";
-  if (!path.startsWith("/") || path.startsWith("//")) return "/app/monitoring";
-  return path;
 }
 
 async function consumeState(
