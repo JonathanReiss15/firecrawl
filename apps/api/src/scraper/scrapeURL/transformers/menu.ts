@@ -48,16 +48,28 @@ export async function fetchMenu(
     | { source: string; items: Record<string, unknown> }
     | undefined;
   if (menuFormat.modifiers) {
-    // Mirror deriveBrandingFromActions: locate our internal action's return, then splice it out of
-    // document.actions so the raw per-item payloads never leak into the user-facing response.
-    const idx = document.actions?.javascriptReturns?.findIndex(
-      r => r.type === "menu-modifiers",
+    // Mirror deriveBrandingFromActions. fire-engine wraps an object return from the capture action
+    // as `{ type: "object", value: <envelope> }`, where <envelope> is our
+    // `{ type: "menu-modifiers", value: { source, items } }`; some engine versions surface the
+    // envelope directly. Handle both, then splice it out so the raw per-item payloads never leak
+    // into the user-facing response.
+    const returns = document.actions?.javascriptReturns ?? [];
+    const idx = returns.findIndex(
+      r =>
+        (r.type === "object" &&
+          (r.value as { type?: unknown } | undefined)?.type ===
+            "menu-modifiers") ||
+        r.type === "menu-modifiers",
     );
-    if (idx !== undefined && idx !== -1) {
-      const captured = document.actions!.javascriptReturns![idx].value as
+    if (idx !== -1) {
+      const entry = returns[idx];
+      const envelope = (
+        entry.type === "object" ? (entry.value as unknown) : entry
+      ) as { value?: unknown } | undefined;
+      const captured = envelope?.value as
         | { source?: unknown; items?: unknown; error?: unknown }
         | undefined;
-      document.actions!.javascriptReturns!.splice(idx, 1);
+      returns.splice(idx, 1);
       if (
         captured &&
         typeof captured.source === "string" &&

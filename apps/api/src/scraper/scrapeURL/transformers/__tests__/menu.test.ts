@@ -161,13 +161,17 @@ describe("fetchMenu", () => {
     const document: any = {
       rawHtml: "<html>store</html>",
       metadata: { url: "https://shop.test/store/x" },
+      // fire-engine wraps an object return as { type: "object", value: <envelope> }.
       actions: {
         javascriptReturns: [
           {
-            type: "menu-modifiers",
+            type: "object",
             value: {
-              source: "ubereats",
-              items: { "10596957461": { data: { itemPage: {} } } },
+              type: "menu-modifiers",
+              value: {
+                source: "ubereats",
+                items: { "10596957461": { data: { itemPage: {} } } },
+              },
             },
           },
         ],
@@ -190,6 +194,38 @@ describe("fetchMenu", () => {
     expect(out.actions!.javascriptReturns).toEqual([]);
   });
 
+  it("also accepts the direct (unwrapped) capture envelope shape", async () => {
+    config.MENU_EXTRACTION_SERVICE_URL = "https://menu.internal";
+    const fetchSpy = vi.fn(async (_url: string, _init?: RequestInit) => ({
+      ok: true,
+      json: async () => ({ menu: null }),
+    }));
+    global.fetch = fetchSpy as any;
+    const document: any = {
+      rawHtml: "<html>store</html>",
+      metadata: { url: "https://shop.test/store/x" },
+      // an engine variant that surfaces the envelope directly (no { type: "object" } wrapper)
+      actions: {
+        javascriptReturns: [
+          {
+            type: "menu-modifiers",
+            value: { source: "ubereats", items: { a: { itemPage: {} } } },
+          },
+        ],
+      },
+    };
+
+    await fetchMenu(baseMeta([{ type: "menu", modifiers: true }]), document);
+
+    const [, init] = fetchSpy.mock.calls[0];
+    const body = JSON.parse(init!.body as string);
+    expect(body.modifierPayloads).toEqual({
+      source: "ubereats",
+      items: { a: { itemPage: {} } },
+    });
+    expect(document.actions.javascriptReturns).toEqual([]);
+  });
+
   it("forwards captured modifier payloads from the second supported source", async () => {
     config.MENU_EXTRACTION_SERVICE_URL = "https://menu.internal";
     const menu = {
@@ -207,13 +243,17 @@ describe("fetchMenu", () => {
     const document: any = {
       rawHtml: "<html>store</html>",
       metadata: { url: "https://shop.test/store/x/1/" },
+      // fire-engine wraps an object return as { type: "object", value: <envelope> }.
       actions: {
         javascriptReturns: [
           {
-            type: "menu-modifiers",
+            type: "object",
             value: {
-              source: "doordash",
-              items: { "7791942784": { itemHeader: {}, optionLists: [] } },
+              type: "menu-modifiers",
+              value: {
+                source: "doordash",
+                items: { "7791942784": { itemHeader: {}, optionLists: [] } },
+              },
             },
           },
         ],
