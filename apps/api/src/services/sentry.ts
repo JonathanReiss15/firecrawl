@@ -141,6 +141,15 @@ if (config.SENTRY_DSN) {
         : config.SENTRY_TRACE_SAMPLE_RATE;
     },
     sampleRate: config.SENTRY_ERROR_SAMPLE_RATE,
+    // Highest-volume spans in the org: pool connects, express plumbing, and
+    // the per-discovered-URL crawl lock. They carry no diagnostic value but
+    // dominate the span quota. Dropped client-side; children are re-parented.
+    ignoreSpans: [
+      /^pg-pool\.connect$/,
+      /^firecrawl-redis-lock-url$/,
+      { op: /^middleware\.express$/ },
+      { op: /^router\.express$/ },
+    ],
     serverName: config.NUQ_POD_NAME,
     environment: config.SENTRY_ENVIRONMENT,
     beforeSend(event, hint) {
