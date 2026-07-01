@@ -50,28 +50,51 @@ export async function captureMenuModifiers(): Promise<CaptureResult> {
   return { type: "menu-modifiers", value: { source: null, items: {} } };
 }
 
-// Runs `task` over each entry of `targets` with bounded concurrency and a hard deadline. The
-// AbortController cancels any in-flight fetch when the budget expires; the deadline guard stops
-// workers from starting new ones, so nothing runs on after the action returns.
-async function runWithBudget<T>(
-  targets: T[],
-  task: (target: T, signal: AbortSignal) => Promise<void>,
-): Promise<void> {
+interface CaptureBudget {
+  // Passed to every fetch so an in-flight request is cancelled when the budget expires.
+  signal: AbortSignal;
+  // True once the deadline has passed, so callers stop starting new work.
+  expired: () => boolean;
+  // Clears the abort timer (call once the work is done).
+  clear: () => void;
+}
+
+// Starts a single time budget for one capture: an AbortController that fires at OVERALL_BUDGET_MS to
+// cancel any in-flight fetch, plus an `expired` guard. Everything in a capture -- a location preflight
+// and the per-item fetches alike -- shares one budget, so the whole action stays bounded rather than
+// each phase getting its own full budget.
+function startBudget(): CaptureBudget {
   const controller = new AbortController();
   const deadlineAt = Date.now() + OVERALL_BUDGET_MS;
-  const budgetTimer = setTimeout(() => {
+  const timer = setTimeout(() => {
     try {
       controller.abort();
     } catch {
       /* ignore */
     }
   }, OVERALL_BUDGET_MS);
+  return {
+    signal: controller.signal,
+    expired: () => Date.now() >= deadlineAt,
+    clear: () => clearTimeout(timer),
+  };
+}
+
+// Runs `task` over each entry of `targets` with bounded concurrency under a time budget. The budget's
+// AbortController cancels any in-flight fetch when it expires; the `expired` guard stops workers from
+// starting new ones. When no budget is passed, one is created and cleared for this call.
+async function runWithBudget<T>(
+  targets: T[],
+  task: (target: T, signal: AbortSignal) => Promise<void>,
+  budget?: CaptureBudget,
+): Promise<void> {
+  const b = budget ?? startBudget();
   let idx = 0;
   const worker = async (): Promise<void> => {
-    while (idx < targets.length && Date.now() < deadlineAt) {
+    while (idx < targets.length && !b.expired()) {
       const target = targets[idx++];
       try {
-        await task(target, controller.signal);
+        await task(target, b.signal);
       } catch {
         /* ignore (includes the AbortError thrown when the budget expires) */
       }
@@ -82,7 +105,7 @@ async function runWithBudget<T>(
     pool.push(worker());
   }
   await Promise.all(pool);
-  clearTimeout(budgetTimer);
+  if (!budget) b.clear();
 }
 
 async function capturePlatformA(): Promise<CaptureResult> {
@@ -191,13 +214,6 @@ async function capturePlatformB(): Promise<CaptureResult> {
       accept: "*/*",
     };
 
-    // 3. Resolve a delivery area for the session. The per-item endpoint returns no options until one
-    //    is set, and a scrape session has none. Best-effort and idempotent: resolve the store's own
-    //    address to a place and set it; on any failure we still attempt the item fetches below.
-    await ensurePlatformBLocation(headers);
-
-    // 4. One direct POST per item to the per-item endpoint. It accepts the query inline and needs
-    //    only the page's cookies (credentials: include) plus the constant client headers below.
     const buildBody = (itemId: string): string =>
       JSON.stringify({
         operationName: "itemPage",
@@ -210,22 +226,36 @@ async function capturePlatformB(): Promise<CaptureResult> {
         query: ITEM_OPTIONS_QUERY,
       });
 
+    // 3 + 4. Under one shared time budget: first resolve a delivery area for the session -- the
+    //        per-item endpoint returns no options until one is set, and a scrape session has none
+    //        (best-effort and idempotent) -- then fire one direct POST per item. Sharing the budget
+    //        keeps the whole capture bounded even if the location endpoints stall.
+    const budget = startBudget();
     const results: Record<string, unknown> = {};
-    await runWithBudget(itemIds, async (itemId, signal) => {
-      const r = await fetch("/graphql/itemPage?operation=itemPage", {
-        method: "POST",
-        headers,
-        body: buildBody(itemId),
-        credentials: "include",
-        signal,
-      });
-      if (!r.ok) return;
-      const json = (await r.json()) as {
-        data?: { itemPage?: unknown };
-      };
-      const itemPage = json?.data?.itemPage;
-      if (itemPage) results[itemId] = itemPage;
-    });
+    try {
+      await ensurePlatformBLocation(headers, budget.signal);
+      await runWithBudget(
+        itemIds,
+        async (itemId, signal) => {
+          const r = await fetch("/graphql/itemPage?operation=itemPage", {
+            method: "POST",
+            headers,
+            body: buildBody(itemId),
+            credentials: "include",
+            signal,
+          });
+          if (!r.ok) return;
+          const json = (await r.json()) as {
+            data?: { itemPage?: unknown };
+          };
+          const itemPage = json?.data?.itemPage;
+          if (itemPage) results[itemId] = itemPage;
+        },
+        budget,
+      );
+    } finally {
+      budget.clear();
+    }
     out.value.items = results;
   } catch (e) {
     out.value.error = String((e as Error)?.message ?? e);
@@ -251,6 +281,7 @@ interface AutocompletePrediction {
 // (cookies only). Any failure is swallowed -- the caller still attempts the item fetches.
 async function ensurePlatformBLocation(
   headers: Record<string, string>,
+  signal: AbortSignal,
 ): Promise<void> {
   try {
     let address:
@@ -292,14 +323,21 @@ async function ensurePlatformBLocation(
     const acResp = await fetch(
       "/unified-gateway/geo-intelligence/v2/address/autocomplete?input_address=" +
         encodeURIComponent(query),
-      { headers, credentials: "include" },
+      { headers, credentials: "include", signal },
     );
     if (!acResp.ok) return;
     const ac = (await acResp.json()) as {
       predictions?: AutocompletePrediction[];
     };
     const p = ac?.predictions?.[0];
-    if (!p || typeof p.lat !== "number" || !p.source_place_id) return;
+    if (
+      !p ||
+      typeof p.lat !== "number" ||
+      typeof p.lng !== "number" ||
+      !p.source_place_id
+    ) {
+      return;
+    }
 
     await fetch(
       "/graphql/addConsumerAddressV2?operation=addConsumerAddressV2",
@@ -307,6 +345,7 @@ async function ensurePlatformBLocation(
         method: "POST",
         headers,
         credentials: "include",
+        signal,
         body: JSON.stringify({
           operationName: "addConsumerAddressV2",
           variables: {
