@@ -1534,6 +1534,7 @@ type Account = {
 export type TeamFlags = {
   ignoreRobots?: "disabled" | "allowed" | "forced";
   customRobotsAgent?: "disabled" | "allowed";
+  threatProtection?: "disabled" | "allowed" | "forced";
   unblockedDomains?: string[];
   forceZDR?: boolean;
   allowZDR?: boolean;
