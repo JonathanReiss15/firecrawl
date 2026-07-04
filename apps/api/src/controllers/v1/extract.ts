@@ -23,6 +23,11 @@ import { logRequest } from "../../services/logging/log_job";
 import { getScrapeZDR } from "../../lib/zdr-helpers";
 
 import { config } from "../../config";
+import {
+  checkUrlsAgainstThreatPolicy,
+  resolveThreatProtection,
+} from "../../lib/threat-protection/request";
+import { UnsafeDomainBlockedError } from "../../lib/threat-protection/error";
 async function oldExtract(
   req: RequestWithAuth<{}, ExtractResponse, ExtractRequest>,
   res: Response<ExtractResponse>,
@@ -130,6 +135,45 @@ export async function extractController(
         success: false,
         error: UNSUPPORTED_SITE_MESSAGE,
       });
+    }
+  }
+
+  // Threat protection: check target URLs before fetching. Blocked URLs are
+  // reported via invalidURLs (with ignoreInvalidURLs) or reject the request.
+  // Discovered URLs are enforced in the scrape pipeline via the policy
+  // threaded through the extract job.
+  const threatProtection = await resolveThreatProtection({
+    teamId: req.auth.team_id,
+    orgId: req.acuc?.org_id ?? null,
+    flags: req.acuc?.flags ?? null,
+    override: req.body.threatProtection,
+  });
+  if (threatProtection.error) {
+    return res.status(403).json({
+      success: false,
+      error: threatProtection.error,
+    });
+  }
+  if (threatProtection.policy && (req.body.urls?.length ?? 0) > 0) {
+    const { blocked } = await checkUrlsAgainstThreatPolicy(
+      req.body.urls ?? [],
+      threatProtection.policy,
+      { teamId: req.auth.team_id },
+    );
+    if (blocked.length > 0) {
+      if (req.body.ignoreInvalidURLs) {
+        invalidURLs.push(...blocked.map(x => x.url));
+      } else {
+        const first = blocked[0];
+        const error = new UnsafeDomainBlockedError(
+          first.domain,
+          first.decision,
+        );
+        return res.status(403).json({
+          success: false,
+          error: error.message,
+        });
+      }
     }
   }
 

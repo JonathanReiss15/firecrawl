@@ -17,6 +17,24 @@ const CACHE_TTL_SECONDS = 60;
 
 const cacheKey = (orgId: string) => `threat-protection-config:${orgId}`;
 
+/**
+ * Whether an error is Postgres 42P01 (undefined_table) for our config table.
+ * During the rollout window the enforcement code can be deployed before the
+ * `threat_protection_config` DDL has been applied — in that case the feature
+ * behaves as "not configured" instead of failing every flagged-team request.
+ * Any other database error still propagates (we do NOT silently fail open on
+ * transient failures).
+ */
+function isMissingTableError(error: unknown): boolean {
+  let current: unknown = error;
+  for (let depth = 0; depth < 5 && current; depth++) {
+    const code = (current as { code?: unknown }).code;
+    if (code === "42P01") return true;
+    current = (current as { cause?: unknown }).cause;
+  }
+  return false;
+}
+
 interface OrgThreatProtectionSiemConfig {
   url: string;
   secret: string | null;
@@ -89,11 +107,24 @@ export async function getOrgThreatProtectionConfig(
     });
   }
 
-  const rows = await dbRr
-    .select()
-    .from(schema.threat_protection_config)
-    .where(eq(schema.threat_protection_config.org_id, orgId))
-    .limit(1);
+  let rows: ThreatProtectionConfigRow[];
+  try {
+    rows = await dbRr
+      .select()
+      .from(schema.threat_protection_config)
+      .where(eq(schema.threat_protection_config.org_id, orgId))
+      .limit(1);
+  } catch (error) {
+    if (isMissingTableError(error)) {
+      logger.warn(
+        "threat_protection_config table does not exist yet; treating as unconfigured",
+        { orgId },
+      );
+      rows = [];
+    } else {
+      throw error;
+    }
+  }
 
   const config = rows[0] ? rowToConfig(rows[0]) : null;
 

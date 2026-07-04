@@ -19,6 +19,7 @@ import {
   addCrawlJobDone,
   crawlToCrawler,
   recordRobotsBlocked,
+  recordThreatBlocked,
   finishCrawlKickoff,
   generateURLPermutations,
   getCrawl,
@@ -29,6 +30,8 @@ import {
   setCrawlError,
   StoredCrawl,
 } from "../../lib/crawl-redis";
+import { checkUrlsAgainstThreatPolicy } from "../../lib/threat-protection/request";
+import type { ThreatDecision } from "../../lib/threat-protection/types";
 import { redisEvictConnection } from "../redis";
 import {
   resolveBillingMetadata,
@@ -112,6 +115,7 @@ async function billScrapeJob(
   error?: Error | null,
   unsupportedFeatures?: Set<FeatureFlag>,
   dataLayer?: DataLayerScrapeMetadata,
+  threatDecisions?: ThreatDecision[],
 ) {
   let creditsToBeBilled: number | null = null;
   const billing = resolveBillingMetadata({
@@ -140,6 +144,7 @@ async function billScrapeJob(
       error,
       unsupportedFeatures,
       dataLayer,
+      threatDecisions,
     );
 
     // Charge the keyless free tier's per-IP daily credit budget unless this
@@ -244,6 +249,10 @@ async function processJob(job: NuQJob<ScrapeJobSingleUrls>) {
       : undefined;
   const signal = abortController.signal;
 
+  // Hoisted above the try so the catch path can read pipeline.threatDecisions
+  // for billing/logging even when the scrape failed.
+  let pipeline: ScrapeUrlResponse | null = null;
+
   try {
     if (remainingTime !== undefined && remainingTime < 0) {
       throw new ScrapeJobTimeoutError();
@@ -256,7 +265,6 @@ async function processJob(job: NuQJob<ScrapeJobSingleUrls>) {
       }
     }
 
-    let pipeline: ScrapeUrlResponse | null = null;
     let timeoutHandle: NodeJS.Timeout | null = null;
     try {
       pipeline = await Promise.race([
@@ -458,7 +466,45 @@ async function processJob(job: NuQJob<ScrapeJobSingleUrls>) {
               }
             }
 
-            for (const link of links.links) {
+            // Threat protection: silently skip discovered links on blocked
+            // domains (cross-domain links included) — the crawl continues.
+            // Skipped URLs + decisions are recorded for the security-logging
+            // layer. Domain checks are deduped and rely on the Redis verdict
+            // cache, so many links on few domains stay cheap.
+            let discoveredLinks = links.links;
+            const threatPolicy = job.data.internalOptions?.threatProtection;
+            if (
+              threatPolicy &&
+              threatPolicy.mode !== "off" &&
+              discoveredLinks.length > 0
+            ) {
+              const { allowedUrls, blocked } =
+                await checkUrlsAgainstThreatPolicy(
+                  discoveredLinks,
+                  threatPolicy,
+                  { teamId: job.data.team_id },
+                );
+              discoveredLinks = allowedUrls;
+              for (const blockedUrl of blocked) {
+                await recordThreatBlocked(
+                  job.data.crawl_id,
+                  blockedUrl.url,
+                  blockedUrl.decision,
+                );
+              }
+              if (blocked.length > 0) {
+                logger.info(
+                  "Skipped " +
+                    blocked.length +
+                    " discovered link(s) blocked by threat protection",
+                  {
+                    blockedDomains: [...new Set(blocked.map(x => x.domain))],
+                  },
+                );
+              }
+            }
+
+            for (const link of discoveredLinks) {
               if (await lockURL(job.data.crawl_id, sc, link)) {
                 // This seems to work really welel
                 const jobPriority = await getJobPriority({
@@ -559,6 +605,7 @@ async function processJob(job: NuQJob<ScrapeJobSingleUrls>) {
         undefined,
         pipeline.unsupportedFeatures,
         pipeline.dataLayer,
+        pipeline.threatDecisions,
       );
 
       doc.metadata.creditsUsed = credits_billed ?? undefined;
@@ -650,6 +697,7 @@ async function processJob(job: NuQJob<ScrapeJobSingleUrls>) {
         undefined,
         pipeline.unsupportedFeatures,
         pipeline.dataLayer,
+        pipeline.threatDecisions,
       );
 
       doc.metadata.creditsUsed = credits_billed ?? undefined;
@@ -848,6 +896,9 @@ async function processJob(job: NuQJob<ScrapeJobSingleUrls>) {
       costTracking,
       (await getACUCTeam(job.data.team_id))?.flags ?? null,
       error instanceof Error ? error : null,
+      undefined,
+      undefined,
+      pipeline?.threatDecisions,
     );
 
     logger.debug("Logging job to DB...");
@@ -1088,7 +1139,29 @@ async function processKickoffJob(job: NuQJob<ScrapeJobKickoff>) {
       }
     }
 
-    const indexLinks = await kickoffGetIndexLinks(sc, crawler, job.data.url);
+    let indexLinks = await kickoffGetIndexLinks(sc, crawler, job.data.url);
+
+    // Threat protection: skip index-sourced discoveries on blocked domains.
+    const kickoffThreatPolicy = sc.internalOptions?.threatProtection;
+    if (
+      kickoffThreatPolicy &&
+      kickoffThreatPolicy.mode !== "off" &&
+      indexLinks.length > 0
+    ) {
+      const { allowedUrls, blocked } = await checkUrlsAgainstThreatPolicy(
+        indexLinks,
+        kickoffThreatPolicy,
+        { teamId: job.data.team_id },
+      );
+      indexLinks = allowedUrls;
+      for (const blockedUrl of blocked) {
+        await recordThreatBlocked(
+          job.data.crawl_id,
+          blockedUrl.url,
+          blockedUrl.decision,
+        );
+      }
+    }
 
     if (indexLinks.length > 0) {
       logger.debug("Using index links of length " + indexLinks.length, {
@@ -1201,7 +1274,7 @@ async function processKickoffSitemapJob(job: NuQJob<ScrapeJobKickoffSitemap>) {
       isPreCrawl: sc.internalOptions?.isPreCrawl ?? false,
     });
 
-    const passingURLs = (
+    let passingURLs = (
       await crawler.filterLinks(
         results.urls.map(x => x.href),
         Infinity,
@@ -1209,6 +1282,29 @@ async function processKickoffSitemapJob(job: NuQJob<ScrapeJobKickoffSitemap>) {
         false,
       )
     ).links;
+
+    // Threat protection: skip sitemap entries on blocked domains — the crawl
+    // continues; skipped URLs + decisions are recorded for security logging.
+    const sitemapThreatPolicy = sc.internalOptions?.threatProtection;
+    if (
+      sitemapThreatPolicy &&
+      sitemapThreatPolicy.mode !== "off" &&
+      passingURLs.length > 0
+    ) {
+      const { allowedUrls, blocked } = await checkUrlsAgainstThreatPolicy(
+        passingURLs,
+        sitemapThreatPolicy,
+        { teamId: job.data.team_id },
+      );
+      passingURLs = allowedUrls;
+      for (const blockedUrl of blocked) {
+        await recordThreatBlocked(
+          job.data.crawl_id,
+          blockedUrl.url,
+          blockedUrl.decision,
+        );
+      }
+    }
 
     if (passingURLs.length > 0) {
       logger.debug("Using urls of length " + passingURLs.length, {

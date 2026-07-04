@@ -11,6 +11,11 @@ import { logRequest } from "../../services/logging/log_job";
 import { config } from "../../config";
 import { agentConsumeFreeRequestIfLeft } from "../../db/rpc";
 import { getScrapeZDR } from "../../lib/zdr-helpers";
+import {
+  checkUrlsAgainstThreatPolicy,
+  resolveThreatProtection,
+} from "../../lib/threat-protection/request";
+import { UnsafeDomainBlockedError } from "../../lib/threat-protection/error";
 
 export async function agentController(
   req: RequestWithAuth<{}, AgentResponse, AgentRequest>,
@@ -45,6 +50,39 @@ export async function agentController(
     subId: req.acuc?.sub_id,
     zeroDataRetention: getScrapeZDR(req.acuc?.flags) === "forced",
   });
+
+  // Threat protection: check the agent's starting URLs before handing off to
+  // the agent service. Content the agent fetches through the API
+  // (agent-interop scrapes) is additionally enforced by the scrape pipeline's
+  // org-policy resolution; in-page navigations performed by the remote
+  // browser cannot be intercepted here.
+  const threatProtection = await resolveThreatProtection({
+    teamId: req.auth.team_id,
+    orgId: req.acuc?.org_id ?? null,
+    flags: req.acuc?.flags ?? null,
+    override: req.body.threatProtection,
+  });
+  if (threatProtection.error) {
+    return res.status(403).json({
+      success: false,
+      error: threatProtection.error,
+    });
+  }
+  if (threatProtection.policy && (req.body.urls?.length ?? 0) > 0) {
+    const { blocked } = await checkUrlsAgainstThreatPolicy(
+      req.body.urls ?? [],
+      threatProtection.policy,
+      { teamId: req.auth.team_id },
+    );
+    if (blocked.length > 0) {
+      const first = blocked[0];
+      const error = new UnsafeDomainBlockedError(first.domain, first.decision);
+      return res.status(403).json({
+        success: false,
+        error: error.message,
+      });
+    }
+  }
 
   if (!config.EXTRACT_V3_BETA_URL) {
     throw new Error("Agent beta is not enabled.");

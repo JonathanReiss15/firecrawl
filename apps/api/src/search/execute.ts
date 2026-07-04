@@ -16,6 +16,9 @@ import {
 import { applySearchHighlights, highlightsEnvReady } from "./highlights";
 import { trackSearchResults, trackSearchRequest } from "../lib/tracking";
 import type { BillingMetadata } from "../services/billing/types";
+import type { ThreatProtectionPolicy } from "../lib/threat-protection/types";
+import { checkUrlsAgainstThreatPolicy } from "../lib/threat-protection/request";
+import { normalizeDomain } from "../lib/threat-protection/verdict";
 
 interface SearchOptions {
   query: string;
@@ -48,6 +51,8 @@ interface SearchContext {
   billing?: BillingMetadata;
   agentIndexOnly?: boolean;
   keylessReserved?: boolean;
+  /** Effective threat protection policy; blocked domains are removed from results entirely. */
+  threatProtectionPolicy?: ThreatProtectionPolicy | null;
 }
 
 interface SearchExecuteResult {
@@ -103,6 +108,42 @@ export async function executeSearch(
     type: searchTypes,
     enterprise: options.enterprise,
   })) as SearchV2Response;
+
+  // Threat protection: remove results on blocked domains entirely — before
+  // slicing/counting, before scraping, and before returning. Domain checks
+  // are deduped and Redis-cached.
+  const threatPolicy = context.threatProtectionPolicy;
+  if (threatPolicy && threatPolicy.mode !== "off") {
+    const urlsToCheck = [
+      ...(searchResponse.web ?? []).map(x => x.url),
+      ...(searchResponse.news ?? []).map(x => x.url),
+      ...(searchResponse.images ?? []).map(x => x.url),
+    ].filter((x): x is string => !!x);
+
+    if (urlsToCheck.length > 0) {
+      const { decisionsByDomain } = await checkUrlsAgainstThreatPolicy(
+        urlsToCheck,
+        threatPolicy,
+        { teamId },
+      );
+      const isAllowed = (url: string | undefined | null): boolean => {
+        if (!url) return true;
+        const decision = decisionsByDomain.get(normalizeDomain(url));
+        return decision === undefined || decision.allowed;
+      };
+      if (searchResponse.web) {
+        searchResponse.web = searchResponse.web.filter(x => isAllowed(x.url));
+      }
+      if (searchResponse.news) {
+        searchResponse.news = searchResponse.news.filter(x => isAllowed(x.url));
+      }
+      if (searchResponse.images) {
+        searchResponse.images = searchResponse.images.filter(x =>
+          isAllowed(x.url),
+        );
+      }
+    }
+  }
 
   if (searchResponse.web && searchResponse.web.length > 0) {
     searchResponse.web = searchResponse.web.map(result => ({
@@ -171,6 +212,7 @@ export async function executeSearch(
         billing,
         agentIndexOnly: context.agentIndexOnly,
         keylessReserved: context.keylessReserved,
+        threatProtectionPolicy: threatPolicy ?? null,
       };
 
       const allDocsWithCostTracking = await scrapeSearchResults(

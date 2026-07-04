@@ -5,22 +5,29 @@ import {
   getCustomRobotsAgent,
   getThreatProtection,
 } from "./zdr-helpers";
+import {
+  THREAT_PROTECTION_CANNOT_DISABLE_MESSAGE,
+  THREAT_PROTECTION_NOT_ENABLED_MESSAGE,
+  THREAT_PROTECTION_OVERRIDES_DISABLED_MESSAGE,
+} from "./threat-protection/request";
 
 type LocationOptions = { country?: string };
+type ThreatProtectionOption = { mode?: string };
 
 interface APIRequest {
   zeroDataRetention?: boolean;
   location?: LocationOptions;
   scrapeOptions?: {
     location?: LocationOptions;
+    threatProtection?: ThreatProtectionOption;
   };
   crawlerOptions?: {
     ignoreRobotsTxt?: boolean;
     robotsUserAgent?: string;
   };
-  // Per-request threat protection policy override. The request schema ships
-  // with the enforcement PR; presence of any value gates on the team flag.
-  threatProtection?: unknown;
+  // Per-request threat protection policy override (field-level override of
+  // the org config). Presence of any value gates on the team flag.
+  threatProtection?: ThreatProtectionOption;
 }
 
 interface PermissionOptions {
@@ -74,20 +81,21 @@ export function checkPermissions(
   }
 
   // threat protection perms — the flag must be 'allowed' or 'forced' for any
-  // per-request threatProtection option, and the org must not have locked
-  // down request-level overrides.
-  if (request.threatProtection !== undefined) {
+  // per-request threatProtection option, the org must not have locked down
+  // request-level overrides, and a 'forced' team may never disable the
+  // feature per-request.
+  const threatProtectionOption =
+    request.threatProtection ?? request.scrapeOptions?.threatProtection;
+  if (threatProtectionOption !== undefined) {
     const threatMode = getThreatProtection(flags);
     if (threatMode !== "allowed" && threatMode !== "forced") {
-      return {
-        error: `Threat protection is an enterprise feature and is not enabled for your team. Contact ${SUPPORT_EMAIL} to explore whether it can be enabled for your team.`,
-      };
+      return { error: THREAT_PROTECTION_NOT_ENABLED_MESSAGE };
     }
     if (options?.threatProtectionOrgConfig?.allowRequestOverrides === false) {
-      return {
-        error:
-          "Per-request threat protection overrides are disabled by your organization's threat protection configuration.",
-      };
+      return { error: THREAT_PROTECTION_OVERRIDES_DISABLED_MESSAGE };
+    }
+    if (threatMode === "forced" && threatProtectionOption.mode === "off") {
+      return { error: THREAT_PROTECTION_CANNOT_DISABLE_MESSAGE };
     }
   }
 

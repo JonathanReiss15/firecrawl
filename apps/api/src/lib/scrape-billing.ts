@@ -14,6 +14,7 @@ import {
   DataLayerScrapeMetadata,
   getDataLayerSuccessCredits,
 } from "./data-layer";
+import type { ThreatDecision } from "./threat-protection/types";
 
 const creditsPerPDFPage = 1;
 const stealthProxyCostBonus = 4;
@@ -33,7 +34,14 @@ export async function calculateCreditsToBeBilled(
   error?: Error | null,
   unsupportedFeatures?: Set<FeatureFlag>,
   dataLayer?: DataLayerScrapeMetadata,
+  // Threat protection decisions for this scrape (initial + redirect checks).
+  // Not billed yet: a follow-up billing PR charges +2 (normal) / +3 (enhanced)
+  // credits per scrape when any decision has `providerConsulted` set. For
+  // scrapes blocked by threat protection, the UnsafeDomainBlockedError in
+  // `error` also carries its decision.
+  threatDecisions?: ThreatDecision[],
 ) {
+  void threatDecisions;
   const costTrackingJSON: ReturnType<typeof CostTracking.prototype.toJSON> =
     costTracking instanceof CostTracking ? costTracking.toJSON() : costTracking;
 

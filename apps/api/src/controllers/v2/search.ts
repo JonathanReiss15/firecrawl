@@ -28,6 +28,7 @@ import type { BillingMetadata } from "../../services/billing/types";
 import { getSearchForcedKind, getSearchZDR } from "../../lib/zdr-helpers";
 import { projectSearchTotalCredits } from "../../lib/keyless-credit-projection";
 import { applyAgentAuthDiscoveryHeader } from "../../lib/agent-auth-discovery";
+import { resolveThreatProtection } from "../../lib/threat-protection/request";
 
 export async function searchController(
   req: RequestWithAuth<{}, SearchResponse, SearchRequest>,
@@ -74,6 +75,23 @@ export async function searchController(
       return res.status(403).json({
         success: false,
         error: "Agent interop is not enabled.",
+      });
+    }
+
+    // Threat protection: resolve the effective policy. Blocked domains are
+    // removed from search results entirely, and scraped results inherit the
+    // policy through the scrape pipeline.
+    const threatProtection = await resolveThreatProtection({
+      teamId: req.auth.team_id,
+      orgId: req.acuc?.org_id ?? null,
+      flags: req.acuc?.flags ?? null,
+      override:
+        req.body.threatProtection ?? req.body.scrapeOptions?.threatProtection,
+    });
+    if (threatProtection.error) {
+      return res.status(403).json({
+        success: false,
+        error: threatProtection.error,
       });
     }
 
@@ -188,6 +206,7 @@ export async function searchController(
         billing,
         agentIndexOnly: (req as any).agentIndexOnly ?? false,
         keylessReserved: reservedKeylessCredits > 0,
+        threatProtectionPolicy: threatProtection.policy,
       },
       logger,
     );

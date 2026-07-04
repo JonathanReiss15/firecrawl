@@ -73,6 +73,22 @@ export async function recordRobotsBlocked(crawlId: string, url: string) {
   );
 }
 
+/**
+ * Records a URL that was silently skipped during crawl link discovery because
+ * its domain was blocked by the team's threat protection policy. The crawl
+ * continues without it; the record (url -> full ThreatDecision JSON) is kept
+ * for the security-logging layer to read.
+ */
+export async function recordThreatBlocked(
+  crawlId: string,
+  url: string,
+  decision: unknown,
+) {
+  const key = "crawl:" + crawlId + ":threat_blocked";
+  await redisEvictConnection.hset(key, url, JSON.stringify(decision));
+  await redisEvictConnection.expire(key, 24 * 60 * 60);
+}
+
 export async function markCrawlActive(id: string) {
   await redisEvictConnection.sadd("active_crawls", id);
 }

@@ -241,6 +241,36 @@ const _policyContractCheck = (
 ): ThreatProtectionPolicy => x;
 void _policyContractCheck;
 
+/**
+ * Per-request `threatProtection` option: a field-level override of the org
+ * config. Mirrors {@link threatProtectionPolicySchema} but every field is
+ * optional and NO defaults are injected — only fields the caller explicitly
+ * provides replace the org policy's values (see `resolveEffectivePolicy`).
+ */
+export const threatProtectionOverrideSchema = z.strictObject({
+  mode: z.enum(["off", "normal", "enhanced"]).optional(),
+  riskScoreThreshold: z.number().int().min(0).max(100).optional(),
+  deniedCategories: z
+    .array(deniedCategorySchema)
+    .max(ALPHAMOUNTAIN_CATEGORIES.length)
+    .optional(),
+  maxDomainAgeDays: z.number().int().min(1).max(3650).nullable().optional(),
+  blacklist: z.array(domainGlobSchema).max(1000).optional(),
+  whitelist: z.array(domainGlobSchema).max(1000).optional(),
+  blockedTlds: z.array(tldSchema).max(1000).optional(),
+  blockedCountries: z.array(countryCodeSchema).max(250).optional(),
+  failurePolicy: z.enum(["open", "closed"]).optional(),
+});
+
+type ThreatProtectionOverride = z.infer<typeof threatProtectionOverrideSchema>;
+
+// Compile-time assertion that the override shape stays assignable to
+// Partial<ThreatProtectionPolicy> (what `resolveEffectivePolicy` consumes).
+const _overrideContractCheck = (
+  x: ThreatProtectionOverride,
+): Partial<ThreatProtectionPolicy> => x;
+void _overrideContractCheck;
+
 const siemConfigSchema = z.strictObject({
   url: z
     .url({
