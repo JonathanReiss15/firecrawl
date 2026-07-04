@@ -49,6 +49,21 @@ const configSchema = z.object({
   // TOR). Unset disables the check entirely (keyless behaves as before).
   SPUR_API_KEY: z.string().optional(),
 
+  // Threat protection (enterprise domain risk blocking). "normal" mode uses
+  // Google Web Risk, "enhanced" mode uses alphaMountain. Unset keys disable the
+  // corresponding provider (lookups then fail per the org's failurePolicy).
+  GOOGLE_WEB_RISK_API_KEY: z.string().optional(),
+  GOOGLE_WEB_RISK_API_URL: z.string().default("https://webrisk.googleapis.com"),
+  ALPHAMOUNTAIN_API_KEY: z.string().optional(),
+  ALPHAMOUNTAIN_API_URL: z.string().default("https://api.alphamountain.ai"),
+  // TTL for cached provider verdicts, in seconds. Kept modest (6h default)
+  // because verdict freshness is an acceptance criterion for the feature.
+  THREAT_PROTECTION_CACHE_TTL_SECONDS: z.coerce
+    .number()
+    .int()
+    .positive()
+    .default(6 * 60 * 60),
+
   // API Keys & Authentication
   BULL_AUTH_KEY: z.string().optional(),
   OPENAI_API_KEY: z.string().optional(),
