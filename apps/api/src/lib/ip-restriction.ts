@@ -12,8 +12,8 @@ const ALLOWLIST_CACHE_TTL_SECONDS = 60;
 const allowlistCacheKey = (teamId: string) =>
   `ip-restriction-allowlist:${teamId}`;
 
-// Express hands IPv4 clients back as IPv4-mapped IPv6 (::ffff:1.2.3.4) when
-// the socket is dual-stack; compare in IPv4 form so allowlist entries match.
+// A dual-stack listener (bound to ::) reports IPv4 clients as IPv4-mapped
+// IPv6 (::ffff:1.2.3.4); compare in IPv4 form so allowlist entries match.
 export function normalizeIp(ip: string): string {
   const trimmed = ip.trim();
   const lower = trimmed.toLowerCase();
