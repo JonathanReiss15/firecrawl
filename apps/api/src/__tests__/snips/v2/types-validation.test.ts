@@ -1113,6 +1113,25 @@ describe("V2 Types Validation", () => {
       expect(result.enterprise).toEqual(["default", "zdr"]);
     });
 
+    it("should default highlights to true", () => {
+      const input: SearchRequestInput = {
+        query: "test",
+      };
+
+      const result = searchRequestSchema.parse(input);
+      expect(result.highlights).toBe(true);
+    });
+
+    it("should allow opting out of highlights", () => {
+      const input: SearchRequestInput = {
+        query: "test",
+        highlights: false,
+      };
+
+      const result = searchRequestSchema.parse(input);
+      expect(result.highlights).toBe(false);
+    });
+
     it("should accept search scrapeOptions with query format", () => {
       const input: SearchRequestInput = {
         query: "test",
