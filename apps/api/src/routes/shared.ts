@@ -316,7 +316,6 @@ export function blocklistMiddleware(
         zeroDataRetention,
         lockdown: req.body.lockdown,
         flags: req.acuc?.flags ?? null,
-        teamId: req.acuc?.team_id ?? null,
       }));
     const canUseDataLayer =
       typeof dataLayerAccess === "object" && dataLayerAccess.allowed;

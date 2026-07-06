@@ -1,12 +1,14 @@
 import { fetch } from "undici";
-import { sql } from "drizzle-orm";
-import { validate as isUuid } from "uuid";
 import { z } from "zod";
 
 import { config } from "../config";
 import type { FormatObject } from "../controllers/v2/types";
-import { dbRr } from "../db/connection";
 import { logger as rootLogger } from "./logger";
+
+type AcceptedDataSourceTerms = Record<
+  string,
+  string | string[] | Record<string, unknown> | null | undefined
+>;
 
 type RouteInput = {
   url: string;
@@ -20,8 +22,10 @@ type RouteInput = {
   blockAds?: boolean;
   zeroDataRetention?: boolean;
   lockdown?: boolean;
-  flags?: { professionalProfileCompanyDataBeta?: boolean } | null;
-  teamId?: string | null;
+  flags?: {
+    professionalProfileCompanyDataBeta?: boolean;
+    acceptedDataSourceTerms?: AcceptedDataSourceTerms | null;
+  } | null;
 };
 
 export type DataLayerScrapeMetadata = {
@@ -44,8 +48,6 @@ export const THIRD_PARTY_DATA_TERMS_REQUIRED_MESSAGE =
 const DATA_LAYER_CAPABILITIES_PATH = "/v1/data-layer/capabilities";
 const DATA_LAYER_CAPABILITIES_TIMEOUT_MS = 2_000;
 const DATA_LAYER_CAPABILITIES_FALLBACK_TTL_MS = 30_000;
-const THIRD_PARTY_DATA_TERMS_CACHE_TTL_MS = 60_000;
-const THIRD_PARTY_DATA_TERMS_ERROR_CACHE_TTL_MS = 10_000;
 
 const dataLayerCapabilitiesSchema = z
   .object({
@@ -69,14 +71,6 @@ let cachedCapabilities:
     }
   | undefined;
 let capabilitiesRequest: Promise<DataLayerCapabilities | null> | undefined;
-let cachedTermsAcceptance = new Map<
-  string,
-  {
-    expiresAt: number;
-    accepted: boolean;
-  }
->();
-let termsAcceptanceForTest: Map<string, boolean> | undefined;
 
 function normalizeHost(host: string): string {
   return host.trim().toLowerCase().replace(/\.$/, "");
@@ -268,58 +262,38 @@ export function isSupportedDataLayerFormatRequest(
   });
 }
 
-async function hasAcceptedThirdPartyDataTerms(
-  teamId?: string | null,
-): Promise<boolean> {
+function hasAcceptedDataSourceTerms(
+  flags: RouteInput["flags"],
+  sourceId: string,
+  version: string,
+): boolean {
+  const accepted = flags?.acceptedDataSourceTerms?.[sourceId];
+
+  if (Array.isArray(accepted)) {
+    return accepted.includes(version);
+  }
+
+  if (typeof accepted === "string") {
+    return accepted === version;
+  }
+
+  if (typeof accepted === "object" && accepted !== null) {
+    return accepted[version] === true || typeof accepted[version] === "string";
+  }
+
+  return false;
+}
+
+function hasAcceptedThirdPartyDataTerms(flags: RouteInput["flags"]): boolean {
   if (config.USE_DB_AUTHENTICATION !== true) {
     return true;
   }
 
-  if (!teamId || !isUuid(teamId)) {
-    return false;
-  }
-
-  const testValue = termsAcceptanceForTest?.get(teamId);
-  if (testValue !== undefined) {
-    return testValue;
-  }
-
-  const cached = cachedTermsAcceptance.get(teamId);
-  if (cached && cached.expiresAt > Date.now()) {
-    return cached.accepted;
-  }
-
-  try {
-    const result = await dbRr.execute(
-      sql`
-        select 1
-        from teams t
-        join organization_data_source_terms dst on dst.org_id = t.org_id
-        where t.id = ${teamId}
-          and dst.source_id = ${PROFESSIONAL_PROFILE_COMPANY_DATA_TERMS_SOURCE_ID}
-          and dst.version = ${THIRD_PARTY_DATA_TERMS_VERSION}
-        limit 1
-      `,
-    );
-    const accepted = (result.rows?.length ?? 0) > 0;
-
-    cachedTermsAcceptance.set(teamId, {
-      accepted,
-      expiresAt: Date.now() + THIRD_PARTY_DATA_TERMS_CACHE_TTL_MS,
-    });
-
-    return accepted;
-  } catch (error) {
-    rootLogger.warn("Third-Party Data terms lookup failed", {
-      error,
-      teamId,
-    });
-    cachedTermsAcceptance.set(teamId, {
-      accepted: false,
-      expiresAt: Date.now() + THIRD_PARTY_DATA_TERMS_ERROR_CACHE_TTL_MS,
-    });
-    return false;
-  }
+  return hasAcceptedDataSourceTerms(
+    flags,
+    PROFESSIONAL_PROFILE_COMPANY_DATA_TERMS_SOURCE_ID,
+    THIRD_PARTY_DATA_TERMS_VERSION,
+  );
 }
 
 function isDataLayerEligibleRequest(input: RouteInput): boolean {
@@ -385,7 +359,7 @@ export async function getDataLayerAccessForRequest(input: RouteInput): Promise<
     return { allowed: false, termsRequired: false };
   }
 
-  if (!(await hasAcceptedThirdPartyDataTerms(input.teamId))) {
+  if (!hasAcceptedThirdPartyDataTerms(input.flags)) {
     return { allowed: false, termsRequired: true };
   }
 
@@ -447,17 +421,7 @@ export function setDataLayerCapabilitiesForTest(input: {
   };
 }
 
-export function setThirdPartyDataTermsAcceptedForTest(
-  teamId: string,
-  accepted: boolean,
-) {
-  termsAcceptanceForTest ??= new Map();
-  termsAcceptanceForTest.set(teamId, accepted);
-}
-
 export function clearDataLayerCapabilitiesForTest() {
   cachedCapabilities = undefined;
   capabilitiesRequest = undefined;
-  cachedTermsAcceptance.clear();
-  termsAcceptanceForTest = undefined;
 }

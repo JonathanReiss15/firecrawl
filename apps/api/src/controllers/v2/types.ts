@@ -1553,6 +1553,7 @@ export type TeamFlags = {
   menuBeta?: boolean;
   enrichBeta?: boolean;
   professionalProfileCompanyDataBeta?: boolean;
+  acceptedDataSourceTerms?: Record<string, string[]>;
 } | null;
 
 interface RequestWithMaybeACUC<

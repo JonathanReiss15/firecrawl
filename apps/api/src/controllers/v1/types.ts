@@ -1324,6 +1324,7 @@ export type TeamFlags = {
   highlightsBeta?: boolean;
   enrichBeta?: boolean;
   professionalProfileCompanyDataBeta?: boolean;
+  acceptedDataSourceTerms?: Record<string, string[]>;
   // routes the team's new queue work to the FoundationDB backend
   nuqFdb?: boolean;
 } | null;

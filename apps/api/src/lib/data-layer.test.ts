@@ -14,7 +14,6 @@ import {
   isSuccessfulDataLayerStatusCode,
   isSupportedDataLayerFormatRequest,
   setDataLayerCapabilitiesForTest,
-  setThirdPartyDataTermsAcceptedForTest,
 } from "./data-layer";
 
 vi.mock("undici", () => ({
@@ -24,7 +23,12 @@ vi.mock("undici", () => ({
 const originalConfig = {
   FIRE_ENGINE_BETA_URL: config.FIRE_ENGINE_BETA_URL,
 };
-const TEST_TEAM_ID = "00000000-0000-4000-8000-000000000001";
+const ENABLED_DATA_LAYER_FLAGS = {
+  professionalProfileCompanyDataBeta: true,
+  acceptedDataSourceTerms: {
+    professional_profile_company_data: ["2026-07-03"],
+  },
+};
 
 describe("data layer routing", () => {
   beforeEach(() => {
@@ -34,7 +38,6 @@ describe("data layer routing", () => {
       domains: ["profiles.example"],
       baseDomains: ["network.example"],
     });
-    setThirdPartyDataTermsAcceptedForTest(TEST_TEAM_ID, true);
   });
 
   afterEach(() => {
@@ -128,8 +131,7 @@ describe("data layer routing", () => {
       canUseDataLayerForRequest({
         url: "https://profiles.example/person/example-person",
         formats: [{ type: "markdown" }],
-        flags: { professionalProfileCompanyDataBeta: true },
-        teamId: TEST_TEAM_ID,
+        flags: ENABLED_DATA_LAYER_FLAGS,
       }),
     ).resolves.toBe(true);
 
@@ -138,8 +140,7 @@ describe("data layer routing", () => {
         url: "https://profiles.example/person/example-person",
         formats: [{ type: "json" }],
         actions: [{ type: "wait" }],
-        flags: { professionalProfileCompanyDataBeta: true },
-        teamId: TEST_TEAM_ID,
+        flags: ENABLED_DATA_LAYER_FLAGS,
       }),
     ).resolves.toBe(false);
 
@@ -148,21 +149,17 @@ describe("data layer routing", () => {
         url: "https://profiles.example/person/example-person",
         formats: [{ type: "json" }],
         zeroDataRetention: true,
-        flags: { professionalProfileCompanyDataBeta: true },
-        teamId: TEST_TEAM_ID,
+        flags: ENABLED_DATA_LAYER_FLAGS,
       }),
     ).resolves.toBe(false);
   });
 
   it("requires current Third-Party Data terms before routing", async () => {
-    setThirdPartyDataTermsAcceptedForTest(TEST_TEAM_ID, false);
-
     await expect(
       getDataLayerAccessForRequest({
         url: "https://profiles.example/person/example-person",
         formats: [{ type: "markdown" }],
         flags: { professionalProfileCompanyDataBeta: true },
-        teamId: TEST_TEAM_ID,
       }),
     ).resolves.toEqual({ allowed: false, termsRequired: true });
 
@@ -181,7 +178,6 @@ describe("data layer routing", () => {
         url: "https://profiles.example/person/example-person",
         formats: [{ type: "markdown" }],
         flags: { professionalProfileCompanyDataBeta: true },
-        teamId: TEST_TEAM_ID,
       }),
     ).resolves.toBe(false);
 
@@ -194,12 +190,39 @@ describe("data layer routing", () => {
     ).resolves.toBe(false);
   });
 
+  it("uses accepted data source terms from the auth chunk flags", async () => {
+    await expect(
+      canUseDataLayerForRequest({
+        url: "https://profiles.example/person/example-person",
+        formats: [{ type: "markdown" }],
+        flags: {
+          professionalProfileCompanyDataBeta: true,
+          acceptedDataSourceTerms: {
+            professional_profile_company_data: ["2026-07-03"],
+          },
+        },
+      }),
+    ).resolves.toBe(true);
+
+    await expect(
+      canUseDataLayerForRequest({
+        url: "https://profiles.example/person/example-person",
+        formats: [{ type: "markdown" }],
+        flags: {
+          professionalProfileCompanyDataBeta: true,
+          acceptedDataSourceTerms: {
+            professional_profile_company_data: ["2026-07-02"],
+          },
+        },
+      }),
+    ).resolves.toBe(false);
+  });
+
   it("does not bypass unless the org data source beta flag is enabled", async () => {
     await expect(
       canUseDataLayerForRequest({
         url: "https://profiles.example/person/example-person",
         formats: [{ type: "markdown" }],
-        teamId: TEST_TEAM_ID,
       }),
     ).resolves.toBe(false);
 
@@ -208,7 +231,6 @@ describe("data layer routing", () => {
         url: "https://profiles.example/person/example-person",
         formats: [{ type: "markdown" }],
         flags: { professionalProfileCompanyDataBeta: false },
-        teamId: TEST_TEAM_ID,
       }),
     ).resolves.toBe(false);
   });
@@ -220,8 +242,7 @@ describe("data layer routing", () => {
       canUseDataLayerForRequest({
         url: "https://profiles.example/person/example-person",
         formats: [{ type: "markdown" }],
-        flags: { professionalProfileCompanyDataBeta: true },
-        teamId: TEST_TEAM_ID,
+        flags: ENABLED_DATA_LAYER_FLAGS,
       }),
     ).resolves.toBe(false);
   });
