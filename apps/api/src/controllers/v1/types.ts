@@ -1334,7 +1334,6 @@ export type TeamFlags = {
   highlightsBeta?: boolean;
   enrichBeta?: boolean;
   professionalProfileCompanyDataBeta?: boolean;
-  acceptedDataSourceTerms?: Record<string, string[]>;
   organizationDataSourceAccess?: Record<
     string,
     {

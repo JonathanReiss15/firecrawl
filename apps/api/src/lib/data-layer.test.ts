@@ -224,9 +224,6 @@ describe("data layer routing", () => {
         formats: [{ type: "markdown" }],
         flags: {
           professionalProfileCompanyDataBeta: true,
-          acceptedDataSourceTerms: {
-            professional_profile_company_data: ["2026-07-03"],
-          },
           organizationDataSourceAccess: {
             fullenrich: {
               status: "disabled",
@@ -239,34 +236,6 @@ describe("data layer routing", () => {
         },
       }),
     ).resolves.toEqual({ allowed: false, termsRequired: false });
-  });
-
-  it("uses accepted data source terms from the legacy auth chunk flags", async () => {
-    await expect(
-      canUseDataLayerForRequest({
-        url: "https://profiles.example/person/example-person",
-        formats: [{ type: "markdown" }],
-        flags: {
-          professionalProfileCompanyDataBeta: true,
-          acceptedDataSourceTerms: {
-            professional_profile_company_data: ["2026-07-03"],
-          },
-        },
-      }),
-    ).resolves.toBe(true);
-
-    await expect(
-      canUseDataLayerForRequest({
-        url: "https://profiles.example/person/example-person",
-        formats: [{ type: "markdown" }],
-        flags: {
-          professionalProfileCompanyDataBeta: true,
-          acceptedDataSourceTerms: {
-            professional_profile_company_data: ["2026-07-02"],
-          },
-        },
-      }),
-    ).resolves.toBe(false);
   });
 
   it("does not bypass unless the org data source beta flag is enabled", async () => {

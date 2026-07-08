@@ -5,11 +5,6 @@ import { config } from "../config";
 import type { FormatObject } from "../controllers/v2/types";
 import { logger as rootLogger } from "./logger";
 
-type AcceptedDataSourceTerms = Record<
-  string,
-  string | string[] | Record<string, unknown> | null | undefined
->;
-
 type OrganizationDataSourceAccessRecord = {
   status?: string | null;
   termsKey?: string | null;
@@ -39,7 +34,6 @@ type RouteInput = {
   lockdown?: boolean;
   flags?: {
     professionalProfileCompanyDataBeta?: boolean;
-    acceptedDataSourceTerms?: AcceptedDataSourceTerms | null;
     organizationDataSourceAccess?: OrganizationDataSourceAccess | null;
   } | null;
 };
@@ -279,28 +273,6 @@ export function isSupportedDataLayerFormatRequest(
   });
 }
 
-function hasAcceptedDataSourceTerms(
-  flags: RouteInput["flags"],
-  sourceId: string,
-  version: string,
-): boolean {
-  const accepted = flags?.acceptedDataSourceTerms?.[sourceId];
-
-  if (Array.isArray(accepted)) {
-    return accepted.includes(version);
-  }
-
-  if (typeof accepted === "string") {
-    return accepted === version;
-  }
-
-  if (typeof accepted === "object" && accepted !== null) {
-    return accepted[version] === true || typeof accepted[version] === "string";
-  }
-
-  return false;
-}
-
 function getOrganizationDataSourceAccess(
   flags: RouteInput["flags"],
   dataSourceId: string,
@@ -348,13 +320,7 @@ function getProfessionalProfileCompanyDataDecision(
       : "terms_required";
   }
 
-  return hasAcceptedDataSourceTerms(
-    flags,
-    PROFESSIONAL_PROFILE_COMPANY_DATA_TERMS_SOURCE_ID,
-    THIRD_PARTY_DATA_TERMS_VERSION,
-  )
-    ? "allowed"
-    : "terms_required";
+  return "terms_required";
 }
 
 function isDataLayerEligibleRequest(input: RouteInput): boolean {
