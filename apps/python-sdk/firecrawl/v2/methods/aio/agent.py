@@ -1,7 +1,7 @@
 from typing import Any, Dict, List, Literal, Optional, Union
 import asyncio
 
-from ...types import AgentResponse, AgentWebhookConfig
+from ...types import AgentResponse, AgentWebhookConfig, ThreatProtectionOptions
 from ...utils.http_client_async import AsyncHttpClient
 from ...utils.validation import _normalize_schema
 
@@ -16,6 +16,7 @@ def _prepare_agent_request(
     strict_constrain_to_urls: Optional[bool] = None,
     model: Optional[Literal["spark-1-pro", "spark-1-mini"]] = None,
     webhook: Optional[Union[str, AgentWebhookConfig]] = None,
+    threat_protection: Optional[ThreatProtectionOptions] = None,
 ) -> Dict[str, Any]:
     body: Dict[str, Any] = {}
     if urls is not None:
@@ -43,6 +44,10 @@ def _prepare_agent_request(
             body["webhook"] = webhook
         else:
             body["webhook"] = webhook.model_dump(exclude_none=True)
+    if threat_protection is not None:
+        body["threatProtection"] = threat_protection.model_dump(
+            by_alias=True, exclude_none=True
+        )
     return body
 
 
@@ -66,6 +71,7 @@ async def start_agent(
     strict_constrain_to_urls: Optional[bool] = None,
     model: Optional[Literal["spark-1-pro", "spark-1-mini"]] = None,
     webhook: Optional[Union[str, AgentWebhookConfig]] = None,
+    threat_protection: Optional[ThreatProtectionOptions] = None,
 ) -> AgentResponse:
     body = _prepare_agent_request(
         urls,
@@ -76,6 +82,7 @@ async def start_agent(
         strict_constrain_to_urls=strict_constrain_to_urls,
         model=model,
         webhook=webhook,
+        threat_protection=threat_protection,
     )
     resp = await client.post("/v2/agent", body)
     payload = _normalize_agent_response_payload(resp.json())
@@ -118,6 +125,7 @@ async def agent(
     strict_constrain_to_urls: Optional[bool] = None,
     model: Optional[Literal["spark-1-pro", "spark-1-mini"]] = None,
     webhook: Optional[Union[str, AgentWebhookConfig]] = None,
+    threat_protection: Optional[ThreatProtectionOptions] = None,
 ) -> AgentResponse:
     started = await start_agent(
         client,
@@ -129,6 +137,7 @@ async def agent(
         strict_constrain_to_urls=strict_constrain_to_urls,
         model=model,
         webhook=webhook,
+        threat_protection=threat_protection,
     )
     job_id = getattr(started, "id", None)
     if not job_id:
