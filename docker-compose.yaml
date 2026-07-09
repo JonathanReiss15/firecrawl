@@ -55,9 +55,11 @@ x-common-env: &common-env
   SEARXNG_ENDPOINT: ${SEARXNG_ENDPOINT}
   SEARXNG_ENGINES: ${SEARXNG_ENGINES}
   SEARXNG_CATEGORIES: ${SEARXNG_CATEGORIES}
-  # Set NUQ_BACKEND=fdb to run the queue on FoundationDB instead of Postgres
+  # Set FDB_CLUSTER_FILE=/var/fdb/fdb.cluster for every FDB-capable topology.
+  # Leave NUQ_BACKEND unset for mixed routing, or set it to fdb to force FDB.
+  # NUQ_BACKEND=pg with no cluster file remains explicitly PG-only.
   NUQ_BACKEND: ${NUQ_BACKEND}
-  FDB_CLUSTER_FILE: ${NUQ_BACKEND:+/var/fdb/fdb.cluster}
+  FDB_CLUSTER_FILE: ${FDB_CLUSTER_FILE:-}
 
 services:
   playwright-service:
@@ -171,9 +173,10 @@ services:
         max-file: "3"
         compress: "true"
 
-  # FoundationDB queue backend (experimental). Enable by setting
-  # NUQ_BACKEND=fdb; the api container reads the shared cluster file from the
-  # fdb-cluster-file volume. Replaces nuq-postgres once stable.
+  # FoundationDB queue backend (experimental). Set
+  # FDB_CLUSTER_FILE=/var/fdb/fdb.cluster to enable mixed/team-flag routing;
+  # also set NUQ_BACKEND=fdb to force all queue traffic onto FDB. The API
+  # container reads the shared cluster file from the fdb-cluster-file volume.
   foundationdb:
     image: foundationdb/foundationdb:7.3.63
     environment:

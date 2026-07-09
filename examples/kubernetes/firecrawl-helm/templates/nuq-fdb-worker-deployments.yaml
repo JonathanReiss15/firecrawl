@@ -1,0 +1,237 @@
+{{- if include "firecrawl.fdbEnabled" . }}
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "firecrawl.fullname" . }}-nuq-fdb-scrape-worker
+  labels:
+    app: {{ include "firecrawl.name" . }}-nuq-fdb-scrape-worker
+spec:
+  # Zero is valid during a controlled drain. Maintenance and crawl completion
+  # are separate deployments below and remain available.
+  replicas: {{ .Values.nuqFdb.scrapeWorker.replicaCount }}
+  selector:
+    matchLabels:
+      app: {{ include "firecrawl.name" . }}-nuq-fdb-scrape-worker
+  template:
+    metadata:
+      labels:
+        app: {{ include "firecrawl.name" . }}-nuq-fdb-scrape-worker
+    spec:
+      {{- if .Values.image.dockerSecretEnabled }}
+      imagePullSecrets:
+        {{- toYaml .Values.imagePullSecrets | nindent 8 }}
+      {{- end }}
+      terminationGracePeriodSeconds: 180
+      containers:
+        - name: nuq-fdb-scrape-worker
+          image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          command: [ "node" ]
+          args: [ "--max-old-space-size=3072", "dist/src/services/worker/nuq-fdb-worker.js" ]
+          ports:
+            - containerPort: {{ .Values.nuqFdb.scrapeWorker.port | int }}
+          env:
+            - name: FLY_PROCESS_GROUP
+              value: "nuq-fdb-scrape-worker"
+            - name: NUQ_FDB_WORKER_MODE
+              value: "scrape"
+            - name: NUQ_WORKER_PORT
+              value: {{ .Values.nuqFdb.scrapeWorker.port | quote }}
+            - name: NUQ_POD_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+          envFrom:
+            - configMapRef:
+                name: {{ include "firecrawl.fullname" . }}-config
+            - secretRef:
+                name: {{ include "firecrawl.fullname" . }}-secret
+          volumeMounts:
+            - name: fdb-cluster-file
+              mountPath: {{ .Values.nuqFdb.clusterFile.mountPath | quote }}
+              subPath: fdb.cluster
+              readOnly: true
+          {{- if and .Values.resources.enabled .Values.nuqFdb.scrapeWorker.resources }}
+          resources:
+            {{- toYaml .Values.nuqFdb.scrapeWorker.resources | nindent 12 }}
+          {{- end }}
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: {{ .Values.nuqFdb.scrapeWorker.port | int }}
+            initialDelaySeconds: 10
+            periodSeconds: 10
+            timeoutSeconds: 5
+            failureThreshold: 3
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: {{ .Values.nuqFdb.scrapeWorker.port | int }}
+            initialDelaySeconds: 10
+            periodSeconds: 10
+            timeoutSeconds: 5
+            failureThreshold: 3
+      volumes:
+        - name: fdb-cluster-file
+          secret:
+            secretName: {{ .Values.nuqFdb.clusterFile.existingSecret | quote }}
+            items:
+              - key: {{ .Values.nuqFdb.clusterFile.key | quote }}
+                path: fdb.cluster
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "firecrawl.fullname" . }}-nuq-fdb-maintenance-worker
+  labels:
+    app: {{ include "firecrawl.name" . }}-nuq-fdb-maintenance-worker
+spec:
+  replicas: {{ .Values.nuqFdb.maintenanceWorker.replicaCount }}
+  selector:
+    matchLabels:
+      app: {{ include "firecrawl.name" . }}-nuq-fdb-maintenance-worker
+  template:
+    metadata:
+      labels:
+        app: {{ include "firecrawl.name" . }}-nuq-fdb-maintenance-worker
+    spec:
+      {{- if .Values.image.dockerSecretEnabled }}
+      imagePullSecrets:
+        {{- toYaml .Values.imagePullSecrets | nindent 8 }}
+      {{- end }}
+      terminationGracePeriodSeconds: 60
+      containers:
+        - name: nuq-fdb-maintenance-worker
+          image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          command: [ "node" ]
+          args: [ "--max-old-space-size=1024", "dist/src/services/worker/nuq-fdb-worker.js" ]
+          ports:
+            - containerPort: {{ .Values.nuqFdb.maintenanceWorker.port | int }}
+          env:
+            - name: FLY_PROCESS_GROUP
+              value: "nuq-fdb-maintenance-worker"
+            - name: NUQ_FDB_WORKER_MODE
+              value: "maintenance"
+            - name: NUQ_WORKER_PORT
+              value: {{ .Values.nuqFdb.maintenanceWorker.port | quote }}
+            - name: NUQ_POD_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+          envFrom:
+            - configMapRef:
+                name: {{ include "firecrawl.fullname" . }}-config
+            - secretRef:
+                name: {{ include "firecrawl.fullname" . }}-secret
+          volumeMounts:
+            - name: fdb-cluster-file
+              mountPath: {{ .Values.nuqFdb.clusterFile.mountPath | quote }}
+              subPath: fdb.cluster
+              readOnly: true
+          {{- if and .Values.resources.enabled .Values.nuqFdb.maintenanceWorker.resources }}
+          resources:
+            {{- toYaml .Values.nuqFdb.maintenanceWorker.resources | nindent 12 }}
+          {{- end }}
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: {{ .Values.nuqFdb.maintenanceWorker.port | int }}
+            initialDelaySeconds: 10
+            periodSeconds: 10
+            timeoutSeconds: 5
+            failureThreshold: 3
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: {{ .Values.nuqFdb.maintenanceWorker.port | int }}
+            initialDelaySeconds: 10
+            periodSeconds: 10
+            timeoutSeconds: 5
+            failureThreshold: 3
+      volumes:
+        - name: fdb-cluster-file
+          secret:
+            secretName: {{ .Values.nuqFdb.clusterFile.existingSecret | quote }}
+            items:
+              - key: {{ .Values.nuqFdb.clusterFile.key | quote }}
+                path: fdb.cluster
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "firecrawl.fullname" . }}-nuq-fdb-crawl-finished-worker
+  labels:
+    app: {{ include "firecrawl.name" . }}-nuq-fdb-crawl-finished-worker
+spec:
+  replicas: {{ .Values.nuqFdb.crawlFinishedWorker.replicaCount }}
+  selector:
+    matchLabels:
+      app: {{ include "firecrawl.name" . }}-nuq-fdb-crawl-finished-worker
+  template:
+    metadata:
+      labels:
+        app: {{ include "firecrawl.name" . }}-nuq-fdb-crawl-finished-worker
+    spec:
+      {{- if .Values.image.dockerSecretEnabled }}
+      imagePullSecrets:
+        {{- toYaml .Values.imagePullSecrets | nindent 8 }}
+      {{- end }}
+      terminationGracePeriodSeconds: 180
+      containers:
+        - name: nuq-fdb-crawl-finished-worker
+          image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          command: [ "node" ]
+          args: [ "--max-old-space-size=2048", "dist/src/services/worker/nuq-fdb-worker.js" ]
+          ports:
+            - containerPort: {{ .Values.nuqFdb.crawlFinishedWorker.port | int }}
+          env:
+            - name: FLY_PROCESS_GROUP
+              value: "nuq-fdb-crawl-finished-worker"
+            - name: NUQ_FDB_WORKER_MODE
+              value: "crawl-finished"
+            - name: NUQ_WORKER_PORT
+              value: {{ .Values.nuqFdb.crawlFinishedWorker.port | quote }}
+            - name: NUQ_POD_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+          envFrom:
+            - configMapRef:
+                name: {{ include "firecrawl.fullname" . }}-config
+            - secretRef:
+                name: {{ include "firecrawl.fullname" . }}-secret
+          volumeMounts:
+            - name: fdb-cluster-file
+              mountPath: {{ .Values.nuqFdb.clusterFile.mountPath | quote }}
+              subPath: fdb.cluster
+              readOnly: true
+          {{- if and .Values.resources.enabled .Values.nuqFdb.crawlFinishedWorker.resources }}
+          resources:
+            {{- toYaml .Values.nuqFdb.crawlFinishedWorker.resources | nindent 12 }}
+          {{- end }}
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: {{ .Values.nuqFdb.crawlFinishedWorker.port | int }}
+            initialDelaySeconds: 10
+            periodSeconds: 10
+            timeoutSeconds: 5
+            failureThreshold: 3
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: {{ .Values.nuqFdb.crawlFinishedWorker.port | int }}
+            initialDelaySeconds: 10
+            periodSeconds: 10
+            timeoutSeconds: 5
+            failureThreshold: 3
+      volumes:
+        - name: fdb-cluster-file
+          secret:
+            secretName: {{ .Values.nuqFdb.clusterFile.existingSecret | quote }}
+            items:
+              - key: {{ .Values.nuqFdb.clusterFile.key | quote }}
+                path: fdb.cluster
+{{- end }}

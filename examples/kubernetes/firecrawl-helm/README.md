@@ -5,8 +5,9 @@ This chart deploys Firecrawl on Kubernetes with:
 - `api`
 - `worker` (queue-worker)
 - `extract-worker`
-- `nuq-worker`
-- `nuq-prefetch-worker`
+- PG and/or FoundationDB NuQ scrape workers (selected by `nuq.mode`)
+- `nuq-prefetch-worker` and `nuq-reconciler-worker` in PG-capable modes
+- dedicated FDB maintenance and crawl-finished workers in FDB-capable modes
 - `cclog-worker`
 - `playwright-service`
 - `redis`
@@ -32,6 +33,48 @@ Important fields:
 - `resources.enabled` enables/disables all container resource requests/limits.
   Default: `false`.
 - `rabbitmq.enabled`, `extractWorker.enabled`, `nuqPrefetchWorker.enabled`, `cclogWorker.enabled` to toggle components.
+
+## NuQ queue topology and safe rollout
+
+`nuq.mode` selects the worker topology:
+
+| Mode    | PG scrape / prefetch / reconciler | FDB scrape / maintenance / completion | Typical use                            |
+| ------- | --------------------------------- | ------------------------------------- | -------------------------------------- |
+| `pg`    | yes                               | no                                    | Default PG-only deployment             |
+| `mixed` | yes                               | yes                                   | Gradual team-flag rollout and PG drain |
+| `fdb`   | no                                | yes                                   | Forced FDB after PG work is drained    |
+
+For `mixed` or `fdb`, create a Secret containing the FoundationDB cluster
+file, then reference its name. Keep the cluster file out of values files and
+source control:
+
+```bash
+kubectl create secret generic firecrawl-fdb-cluster \
+  --from-file=fdb.cluster=/secure/path/fdb.cluster \
+  -n firecrawl
+
+HELM_NO_PLUGINS=1 helm upgrade firecrawl . \
+  --reuse-values \
+  --set nuq.mode=mixed \
+  --set nuqFdb.clusterFile.existingSecret=firecrawl-fdb-cluster \
+  -n firecrawl
+```
+
+A safe migration is:
+
+1. Deploy `mixed` and verify the three FDB deployments are healthy.
+2. Enable FDB routing gradually for selected teams while both consumer sets
+   remain available. Existing crawls stay pinned to their original backend.
+3. Stop new PG routing and wait for PG active, delayed, and crawl-finished work
+   to drain before switching to `fdb`.
+4. Keep `nuqFdb.maintenanceWorker.replicaCount` and
+   `nuqFdb.crawlFinishedWorker.replicaCount` at one or more. The chart rejects
+   zero for these control loops. `nuqFdb.scrapeWorker.replicaCount=0` is safe
+   during a deliberate scrape-consumer drain because maintenance and crawl
+   completion remain independently available.
+
+To roll back routing, return to `mixed` first so both backends have consumers;
+do not switch directly to `pg` while FDB-pinned work remains.
 
 ## Deploy
 
@@ -97,14 +140,14 @@ docker buildx build --platform linux/amd64,linux/arm64 --push \
 
 ```bash
 HELM_NO_PLUGINS=1 helm package . --destination /tmp/helm-packages
-HELM_NO_PLUGINS=1 helm push /tmp/helm-packages/firecrawl-0.2.0.tgz oci://registry-1.docker.io/winkkgmbh
+HELM_NO_PLUGINS=1 helm push /tmp/helm-packages/firecrawl-0.3.0.tgz oci://registry-1.docker.io/winkkgmbh
 ```
 
 Install from OCI:
 
 ```bash
 HELM_NO_PLUGINS=1 helm upgrade --install firecrawl oci://registry-1.docker.io/winkkgmbh/firecrawl \
-  --version 0.2.0 \
+  --version 0.3.0 \
   -n firecrawl --create-namespace \
   -f values.yaml \
   -f overlays/prod/values.yaml

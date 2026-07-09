@@ -42,6 +42,13 @@ spec:
                 name: {{ include "firecrawl.fullname" . }}-config
             - secretRef:
                 name: {{ include "firecrawl.fullname" . }}-secret
+          {{- if include "firecrawl.fdbEnabled" . }}
+          volumeMounts:
+            - name: fdb-cluster-file
+              mountPath: {{ .Values.nuqFdb.clusterFile.mountPath | quote }}
+              subPath: fdb.cluster
+              readOnly: true
+          {{- end }}
           {{- if and .Values.resources.enabled .Values.cclogWorker.resources }}
           resources:
             {{- toYaml .Values.cclogWorker.resources | nindent 12 }}
@@ -64,4 +71,13 @@ spec:
             timeoutSeconds: 5
             successThreshold: 1
             failureThreshold: 3
+      {{- if include "firecrawl.fdbEnabled" . }}
+      volumes:
+        - name: fdb-cluster-file
+          secret:
+            secretName: {{ .Values.nuqFdb.clusterFile.existingSecret | quote }}
+            items:
+              - key: {{ .Values.nuqFdb.clusterFile.key | quote }}
+                path: fdb.cluster
+      {{- end }}
 {{- end }}

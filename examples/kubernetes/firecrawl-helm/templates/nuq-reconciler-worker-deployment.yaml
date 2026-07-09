@@ -1,19 +1,19 @@
-{{- if and (include "firecrawl.pgEnabled" .) .Values.nuqPrefetchWorker.enabled }}
+{{- if and (include "firecrawl.pgEnabled" .) .Values.nuqReconcilerWorker.enabled }}
 apiVersion: apps/v1
 kind: Deployment
 metadata:
-  name: {{ include "firecrawl.fullname" . }}-nuq-prefetch-worker
+  name: {{ include "firecrawl.fullname" . }}-nuq-reconciler-worker
   labels:
-    app: {{ include "firecrawl.name" . }}-nuq-prefetch-worker
+    app: {{ include "firecrawl.name" . }}-nuq-reconciler-worker
 spec:
-  replicas: {{ .Values.nuqPrefetchWorker.replicaCount | default 1 }}
+  replicas: {{ .Values.nuqReconcilerWorker.replicaCount }}
   selector:
     matchLabels:
-      app: {{ include "firecrawl.name" . }}-nuq-prefetch-worker
+      app: {{ include "firecrawl.name" . }}-nuq-reconciler-worker
   template:
     metadata:
       labels:
-        app: {{ include "firecrawl.name" . }}-nuq-prefetch-worker
+        app: {{ include "firecrawl.name" . }}-nuq-reconciler-worker
     spec:
       {{- if .Values.image.dockerSecretEnabled }}
       imagePullSecrets:
@@ -21,20 +21,18 @@ spec:
       {{- end }}
       terminationGracePeriodSeconds: 60
       containers:
-        - name: nuq-prefetch-worker
+        - name: nuq-reconciler-worker
           image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
           imagePullPolicy: {{ .Values.image.pullPolicy }}
           command: [ "node" ]
-          args: [ "--max-old-space-size=2048", "dist/src/services/worker/nuq-prefetch-worker.js" ]
+          args: [ "--max-old-space-size=1024", "dist/src/services/worker/nuq-reconciler-worker.js" ]
           ports:
-            - containerPort: {{ .Values.nuqPrefetchWorker.port | int }}
+            - containerPort: {{ .Values.nuqReconcilerWorker.port | int }}
           env:
             - name: FLY_PROCESS_GROUP
-              value: "nuq-prefetch-worker"
-            - name: NUQ_PREFETCH_WORKER_PORT
-              value: {{ .Values.nuqPrefetchWorker.port | quote }}
-            - name: NUQ_PREFETCH_REPLICAS
-              value: {{ .Values.nuqPrefetchWorker.replicaCount | quote }}
+              value: "nuq-reconciler-worker"
+            - name: NUQ_RECONCILER_WORKER_PORT
+              value: {{ .Values.nuqReconcilerWorker.port | quote }}
             - name: NUQ_POD_NAME
               valueFrom:
                 fieldRef:
@@ -44,26 +42,24 @@ spec:
                 name: {{ include "firecrawl.fullname" . }}-config
             - secretRef:
                 name: {{ include "firecrawl.fullname" . }}-secret
-          {{- if and .Values.resources.enabled .Values.nuqPrefetchWorker.resources }}
+          {{- if and .Values.resources.enabled .Values.nuqReconcilerWorker.resources }}
           resources:
-            {{- toYaml .Values.nuqPrefetchWorker.resources | nindent 12 }}
+            {{- toYaml .Values.nuqReconcilerWorker.resources | nindent 12 }}
           {{- end }}
           livenessProbe:
             httpGet:
               path: /health
-              port: {{ .Values.nuqPrefetchWorker.port | int }}
+              port: {{ .Values.nuqReconcilerWorker.port | int }}
             initialDelaySeconds: 10
             periodSeconds: 10
             timeoutSeconds: 5
-            successThreshold: 1
             failureThreshold: 3
           readinessProbe:
             httpGet:
               path: /health
-              port: {{ .Values.nuqPrefetchWorker.port | int }}
+              port: {{ .Values.nuqReconcilerWorker.port | int }}
             initialDelaySeconds: 10
             periodSeconds: 10
             timeoutSeconds: 5
-            successThreshold: 1
             failureThreshold: 3
 {{- end }}
