@@ -40,47 +40,26 @@ export async function fetchMenu(
     meta.rewrittenUrl ??
     meta.url;
 
-  // When `modifiers` is opted in, the fire-engine layer ran an in-session capture action whose
-  // result lands in document.actions.javascriptReturns as a `menu-modifiers` envelope:
-  // `{ source, items: { [merchantItemId]: rawPayload } }`. Forward it to the service, which parses
-  // and merges the option groups by merchant item id. Absent/malformed capture -> a normal request.
+  // Per-item modifier payloads are autodetected and captured by the fire-engine scrape layer for
+  // supported store pages (DoorDash/UberEats) -- no request flag. They arrive as an internal
+  // `document.menuModifiers` envelope `{ source, items: { [merchantItemId]: rawPayload } }`. Forward
+  // it to the service, which parses and merges the option groups by merchant item id, then drop it
+  // from the document so the raw per-item payloads never leak into the user-facing response. An
+  // absent/empty capture just yields a normal (items-only) menu request.
   let modifierPayloads:
     | { source: string; items: Record<string, unknown> }
     | undefined;
-  if (menuFormat.modifiers) {
-    // Mirror deriveBrandingFromActions: locate our internal action's return, then splice it out of
-    // document.actions so the raw per-item payloads never leak into the user-facing response.
-    const idx = document.actions?.javascriptReturns?.findIndex(
-      r => r.type === "menu-modifiers",
-    );
-    if (idx !== undefined && idx !== -1) {
-      const captured = document.actions!.javascriptReturns![idx].value as
-        | { source?: unknown; items?: unknown; error?: unknown }
-        | undefined;
-      document.actions!.javascriptReturns!.splice(idx, 1);
-      if (
-        captured &&
-        typeof captured.source === "string" &&
-        captured.items &&
-        typeof captured.items === "object" &&
-        !Array.isArray(captured.items)
-      ) {
-        modifierPayloads = {
-          source: captured.source,
-          items: captured.items as Record<string, unknown>,
-        };
-      } else {
-        // Best-effort feature: an empty/malformed capture is a graceful degradation, not an
-        // anomaly. Log at debug so it does not spam at scale; the item just gets no optionGroups.
-        meta.logger.debug(
-          "menu modifiers requested but capture payload was empty/malformed",
-        );
-      }
-    } else {
-      meta.logger.debug(
-        "menu modifiers requested but no capture payload found",
-      );
-    }
+  const captured = document.menuModifiers;
+  delete document.menuModifiers;
+  if (
+    captured &&
+    typeof captured.source === "string" &&
+    captured.items &&
+    typeof captured.items === "object" &&
+    !Array.isArray(captured.items) &&
+    Object.keys(captured.items).length > 0
+  ) {
+    modifierPayloads = { source: captured.source, items: captured.items };
   }
 
   const response = await fetch(

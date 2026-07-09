@@ -447,9 +447,6 @@ type QueryFormatWithOptions = z.output<typeof queryFormatWithOptions>;
 
 const menuFormatWithOptions = z.strictObject({
   type: z.literal("menu"),
-  // Opt-in: also capture each item's modifier/option groups. On supported platforms these are not
-  // in the page HTML and are fetched per item inside the scrape session (best-effort, adds latency).
-  modifiers: z.boolean().optional(),
 });
 
 type MenuFormatWithOptions = z.output<typeof menuFormatWithOptions>;
@@ -1240,6 +1237,14 @@ export type Document = {
   branding?: BrandingProfile;
   product?: ProductProfile;
   menu?: MenuProfile;
+  // Internal: autodetected per-item menu-modifier capture from the fire-engine scrape layer
+  // (DoorDash/UberEats). Consumed and removed by the menu transformer before the user response;
+  // never serialized to callers.
+  menuModifiers?: {
+    source: string;
+    items: Record<string, unknown>;
+    error?: string;
+  };
   warning?: string;
   attributes?: {
     selector: string;

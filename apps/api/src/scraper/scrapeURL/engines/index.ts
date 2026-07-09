@@ -172,6 +172,14 @@ export type EngineScrapeResult = {
   proxyUsed: "basic" | "stealth";
   timezone?: string;
   dataLayer?: DataLayerScrapeMetadata;
+
+  // Autodetected per-item menu-modifier capture (DoorDash/UberEats) from the fire-engine scrape
+  // layer. Internal; consumed by the menu transformer and never serialized to callers.
+  menuModifiers?: {
+    source: string;
+    items: Record<string, unknown>;
+    error?: string;
+  };
 };
 
 const engineHandlers: {

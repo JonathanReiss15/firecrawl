@@ -162,6 +162,16 @@ const successSchema = z.object({
   usedMobileProxy: z.boolean().optional(),
   youtubeTranscriptContent: z.any().optional(),
   timezone: z.string().optional(),
+
+  // Autodetected per-item menu-modifier capture (DoorDash/UberEats) attached by fire-engine when the
+  // scraped URL is a supported store page. Raw payloads keyed by merchant item id; parsed downstream.
+  menuModifiers: z
+    .object({
+      source: z.enum(["doordash", "ubereats"]),
+      items: z.record(z.string(), z.unknown()).default({}),
+      error: z.string().optional(),
+    })
+    .optional(),
 });
 
 type FireEngineCheckStatusSuccess = z.infer<typeof successSchema>;

@@ -37,7 +37,6 @@ import { AbortManagerThrownError } from "../../lib/abortManager";
 import { youtubePostprocessor } from "../../postprocessors/youtube";
 import { withSpan, setSpanAttributes } from "../../../../lib/otel-tracer";
 import { getBrandingScript } from "./brandingScript";
-import { getMenuModifierScript } from "./menuModifierScript";
 import { abTestFireEngine } from "../../../../services/ab-test";
 import { scheduleABComparison } from "../../../../services/ab-test-comparison";
 import { createHash } from "node:crypto";
@@ -342,15 +341,6 @@ export async function scrapeURLWithFireEngineChromeCDP(
             },
           ]
         : []),
-      ...(hasFormatOfType(meta.options.formats, "menu")?.modifiers
-        ? [
-            {
-              type: "executeJavascript" as const,
-              script: getMenuModifierScript(),
-              metadata: { __firecrawl_internal: true },
-            },
-          ]
-        : []),
       ...(hasAudio || hasVideo || shouldRunYoutubePostprocessor
         ? ([
             {
@@ -500,6 +490,9 @@ export async function scrapeURLWithFireEngineChromeCDP(
       proxyUsed: response.usedMobileProxy ? "stealth" : "basic",
       youtubeTranscriptContent: response.youtubeTranscriptContent,
       timezone: response.timezone,
+      ...(response.menuModifiers
+        ? { menuModifiers: response.menuModifiers }
+        : {}),
       ...(hasAudio || hasVideo || shouldRunYoutubePostprocessor
         ? { audioCookies }
         : {}),
