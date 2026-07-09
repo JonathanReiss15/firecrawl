@@ -19,6 +19,7 @@ describeIf(TEST_PRODUCTION)("POST /v2/team/api-keys", () => {
       expect(res.body.success).toBe(true);
       expect(res.body.apiKey.name).toBe("ci-created-key");
       expect(res.body.apiKey.teamId).toBe(identity.teamId);
+      expect(res.body.apiKey).toHaveProperty("ownerId");
       expect(res.body.apiKey.spendLimit).toBeNull();
       expect(typeof res.body.apiKey.token).toBe("string");
       expect(res.body.apiKey.token).toMatch(/^fc-/);

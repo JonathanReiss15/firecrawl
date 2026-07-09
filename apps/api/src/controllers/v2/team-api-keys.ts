@@ -1,9 +1,9 @@
 import { Response } from "express";
 import { z } from "zod";
-import { eq } from "drizzle-orm";
+import { and, eq } from "drizzle-orm";
 import { logger as _logger } from "../../lib/logger";
 import { ErrorResponse, RequestWithAuth } from "./types";
-import { db } from "../../db/connection";
+import { db, dbRr } from "../../db/connection";
 import * as schema from "../../db/schema";
 import { apiKeyToFcApiKey } from "../../lib/parseApi";
 import { autumnService } from "../../services/autumn/autumn.service";
@@ -32,6 +32,7 @@ interface CreateApiKeyResponse {
     token: string;
     name: string | null;
     teamId: string;
+    ownerId: string | null;
     spendLimit: { credits: number; interval: "day" | "week" | "month" } | null;
     createdAt: string | null;
   };
@@ -45,9 +46,28 @@ export async function createApiKeyController(
   const teamId = req.auth.team_id;
   const spendLimit = body.spendLimit ?? null;
 
+  // There's no session user on a pure-API call, so the new key inherits its
+  // owner from the API key that authenticated this request (scoped to the team
+  // to be safe). Falls back to null (unowned) if the caller's key is unowned.
+  let ownerId: string | null = null;
+  const callerKeyId = req.acuc?.api_key_id;
+  if (callerKeyId) {
+    const [callerKey] = await dbRr
+      .select({ owner_id: schema.api_keys.owner_id })
+      .from(schema.api_keys)
+      .where(
+        and(
+          eq(schema.api_keys.id, callerKeyId),
+          eq(schema.api_keys.team_id, teamId),
+        ),
+      )
+      .limit(1);
+    ownerId = callerKey?.owner_id ?? null;
+  }
+
   const [created] = await db
     .insert(schema.api_keys)
-    .values({ team_id: teamId, name: body.name ?? null })
+    .values({ team_id: teamId, name: body.name ?? null, owner_id: ownerId })
     .returning({
       id: schema.api_keys.id,
       key: schema.api_keys.key,
@@ -103,6 +123,7 @@ export async function createApiKeyController(
       token,
       name: created.name,
       teamId,
+      ownerId,
       spendLimit,
       createdAt: created.created_at,
     },
