@@ -437,7 +437,7 @@ describeIf("NuQ global FDB migration control plane", () => {
   test("pin preparation and residue transitions are exact-once across every counter class", async () => {
     const teamId = team();
     const objectId = object();
-    await initialize(teamId);
+    await initialize(teamId, "fdb");
     const initial = Object.fromEntries(
       MIGRATION_RESIDUE_COUNTERS.map(counter => [counter, 1]),
     );
@@ -489,6 +489,40 @@ describeIf("NuQ global FDB migration control plane", () => {
       activeResidue,
     );
 
+    // An untagged runtime mutation may commit between an operation's unknown
+    // outcome and its retry. It must retain the one bounded token and replay
+    // the historical operation result without restoring stale residue.
+    const reconciledResidue = {
+      capacity_ready_active: 1,
+      control_groups: 1,
+    };
+    await getNuqFdbDatabase().doTn(async tn => {
+      await store.reconcileManagedObjectInTxn(tn, {
+        teamId,
+        kind: "scrape_job",
+        objectId,
+        recordPin: {
+          backend: active.backend,
+          generation: active.generation,
+        },
+        residue: reconciledResidue,
+      });
+    });
+    await expect(
+      store.transitionObjectResidue({
+        teamId,
+        kind: "scrape_job",
+        objectId,
+        operationId: transitionOperationId,
+        fromLifecycle: "prepared",
+        toLifecycle: "active",
+        residue: activeResidue,
+      }),
+    ).resolves.toEqual(active);
+    expect((await store.inspectGeneration(teamId, 1)).residue).toMatchObject(
+      reconciledResidue,
+    );
+
     const completionOperationId = randomUUID();
     const terminal = await store.completePinnedObject({
       teamId,
@@ -507,12 +541,114 @@ describeIf("NuQ global FDB migration control plane", () => {
       }),
     ).resolves.toEqual(terminal);
     expect(terminal.lifecycle).toBe("terminal");
+    expect(terminal.lastOperation).toMatchObject({
+      operationId: completionOperationId,
+      fromLifecycle: "active",
+      toLifecycle: "terminal",
+      resultRevision: terminal.revision,
+    });
+    const operationRange = getFdb().tuple.range([
+      "nuq-migration",
+      1,
+      "team",
+      teamId,
+      "object-operation",
+    ]);
+    await expect(
+      getNuqFdbDatabase().doTn(async tn =>
+        tn
+          .snapshot()
+          .getRangeAll(
+            operationRange.begin as Buffer,
+            operationRange.end as Buffer,
+          ),
+      ),
+    ).resolves.toHaveLength(0);
     expect(
       Object.values((await store.inspectGeneration(teamId, 1)).residue),
     ).toEqual(Array(MIGRATION_RESIDUE_COUNTERS.length).fill(0));
     await expect(store.inspectPin("scrape_job", objectId)).resolves.toEqual(
       terminal,
     );
+  });
+
+  test("legacy object-operation rows replay once into the bounded pin token", async () => {
+    const teamId = team();
+    const objectId = object();
+    await initialize(teamId, "fdb");
+    await store.preparePinnedObject({
+      teamId,
+      kind: "scrape_job",
+      objectId,
+      admission: { type: "new-root" },
+      residue: { capacity_ready_active: 1 },
+    });
+    const operationId = randomUUID();
+    const active = await store.transitionObjectResidue({
+      teamId,
+      kind: "scrape_job",
+      objectId,
+      operationId,
+      fromLifecycle: "prepared",
+      toLifecycle: "active",
+      residue: { capacity_ready_active: 1 },
+    });
+    const { lastOperation: _boundedToken, ...legacyResult } = active;
+    const legacyOperationKey = store.pack([
+      "team",
+      teamId,
+      "object-operation",
+      "scrape_job",
+      objectId,
+      operationId,
+    ]);
+    await getNuqFdbDatabase().doTn(async tn => {
+      const encoded = Buffer.from(JSON.stringify(legacyResult));
+      tn.set(store.objectKey("scrape_job", objectId), encoded);
+      tn.set(
+        store.pack(["team", teamId, "object", "scrape_job", objectId]),
+        encoded,
+      );
+      tn.set(
+        legacyOperationKey,
+        Buffer.from(
+          JSON.stringify({
+            schemaVersion: 1,
+            operationId,
+            teamId,
+            kind: "scrape_job",
+            objectId,
+            fromLifecycle: "prepared",
+            toLifecycle: "active",
+            residue: active.residue,
+            result: legacyResult,
+          }),
+        ),
+      );
+    });
+
+    await expect(
+      store.transitionObjectResidue({
+        teamId,
+        kind: "scrape_job",
+        objectId,
+        operationId,
+        fromLifecycle: "prepared",
+        toLifecycle: "active",
+        residue: { capacity_ready_active: 1 },
+      }),
+    ).resolves.toEqual(legacyResult);
+    await expect(
+      store.inspectPin("scrape_job", objectId),
+    ).resolves.toMatchObject({
+      lastOperation: {
+        operationId,
+        resultRevision: legacyResult.revision,
+      },
+    });
+    await expect(
+      getNuqFdbDatabase().doTn(async tn => tn.get(legacyOperationKey)),
+    ).resolves.toBeUndefined();
   });
 
   test("stable transition operation ids replay after no-op, cancel, and final seal", async () => {

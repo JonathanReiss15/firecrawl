@@ -46,6 +46,7 @@ export type {
   MigrationGeneration,
   MigrationGenerationStatus,
   MigrationObjectKind,
+  MigrationObjectLastOperation,
   MigrationObjectLifecycle,
   MigrationObjectPin,
   MigrationRecordPin,

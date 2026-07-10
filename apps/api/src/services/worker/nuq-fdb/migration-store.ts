@@ -57,6 +57,15 @@ export type MigrationTeamState = {
   transitionOperationId?: string;
 };
 
+export type MigrationObjectLastOperation = {
+  schemaVersion: 1;
+  operationId: string;
+  fromLifecycle: MigrationObjectLifecycle;
+  toLifecycle: MigrationObjectLifecycle;
+  residue: MigrationResidue;
+  resultRevision: number;
+};
+
 export type MigrationObjectPin = {
   schemaVersion: 1;
   teamId: string;
@@ -71,6 +80,9 @@ export type MigrationObjectPin = {
   sourceObjectId?: string;
   initialResidue: MigrationResidue;
   residue: MigrationResidue;
+  /** Single bounded commit-unknown reconciliation token. A later mutation
+   * supersedes it; no per-transition ledger rows are accumulated. */
+  lastOperation?: MigrationObjectLastOperation;
 };
 
 export type MigrationPinAdmission =
@@ -433,7 +445,59 @@ function validatePin(value: unknown, record: string): MigrationObjectPin {
     `${record}.initialResidue`,
   );
   const residue = validateStoredResidue(pin.residue, `${record}.residue`);
-  return { ...(pin as MigrationObjectPin), initialResidue, residue };
+  let lastOperation: MigrationObjectLastOperation | undefined;
+  if (pin.lastOperation !== undefined) {
+    if (
+      !pin.lastOperation ||
+      typeof pin.lastOperation !== "object" ||
+      Array.isArray(pin.lastOperation)
+    ) {
+      throw new MigrationCorruptionError(record, "invalid last operation");
+    }
+    const operation = pin.lastOperation as Record<string, unknown>;
+    if (
+      operation.schemaVersion !== 1 ||
+      typeof operation.operationId !== "string" ||
+      operation.operationId.length === 0 ||
+      !OBJECT_LIFECYCLES.includes(
+        operation.fromLifecycle as MigrationObjectLifecycle,
+      ) ||
+      !OBJECT_LIFECYCLES.includes(
+        operation.toLifecycle as MigrationObjectLifecycle,
+      ) ||
+      !isPositiveInteger(operation.resultRevision)
+    ) {
+      throw new MigrationCorruptionError(
+        record,
+        "invalid last operation fields",
+      );
+    }
+    const operationResidue = validateStoredResidue(
+      operation.residue,
+      `${record}.lastOperation.residue`,
+    );
+    if (
+      operation.resultRevision > (pin.revision as number) ||
+      (operation.resultRevision === pin.revision &&
+        (operation.toLifecycle !== pin.lifecycle ||
+          !residueEqual(operationResidue, residue)))
+    ) {
+      throw new MigrationCorruptionError(
+        record,
+        "last operation does not describe this pin revision history",
+      );
+    }
+    lastOperation = {
+      ...(operation as MigrationObjectLastOperation),
+      residue: operationResidue,
+    };
+  }
+  return {
+    ...(pin as MigrationObjectPin),
+    initialResidue,
+    residue,
+    ...(lastOperation ? { lastOperation } : {}),
+  };
 }
 
 function decodeCounter(
@@ -486,7 +550,10 @@ type ControlOperation = {
   state: MigrationTeamState;
 };
 
-type ObjectOperation = {
+// Read-only compatibility with operation rows produced by the prototype before
+// pins carried their one bounded reconciliation token. New code never creates
+// these rows and migrates one into the pin when it is replayed safely.
+type LegacyObjectOperation = {
   schemaVersion: 1;
   operationId: string;
   teamId: string;
@@ -547,10 +614,10 @@ function validateControlOperation(
   return decoded;
 }
 
-function validateObjectOperation(
+function validateLegacyObjectOperation(
   value: unknown,
   record: string,
-): ObjectOperation {
+): LegacyObjectOperation {
   if (!value || typeof value !== "object" || Array.isArray(value)) {
     throw new MigrationCorruptionError(record, "invalid object operation");
   }
@@ -570,7 +637,7 @@ function validateObjectOperation(
     );
   }
   const decoded = {
-    ...(op as ObjectOperation),
+    ...(op as LegacyObjectOperation),
     residue: validateStoredResidue(op.residue, `${record}.residue`),
     result: validatePin(op.result, `${record}.result`),
   };
@@ -629,7 +696,7 @@ export class NuqFdbMigrationStore {
     return this.pack(["team", teamId, "control-operation", operationId]);
   }
 
-  private objectOperationKey(
+  private legacyObjectOperationKey(
     teamId: string,
     kind: MigrationObjectKind,
     objectId: string,
@@ -1605,31 +1672,6 @@ export class NuqFdbMigrationStore {
     assertNonempty(objectId, "objectId");
     assertNonempty(operationId, "operationId");
     const residue = normalizeResidue(input.residue);
-    const operationKey = this.objectOperationKey(
-      teamId,
-      kind,
-      objectId,
-      operationId,
-    );
-    const rawOperation = await tn.get(operationKey);
-    if (rawOperation) {
-      const op = validateObjectOperation(
-        parseJson(rawOperation, `object operation ${operationId}`),
-        `object operation ${operationId}`,
-      );
-      if (
-        op.operationId !== operationId ||
-        op.teamId !== teamId ||
-        op.kind !== kind ||
-        op.objectId !== objectId ||
-        op.fromLifecycle !== fromLifecycle ||
-        op.toLifecycle !== toLifecycle ||
-        !residueEqual(op.residue, residue)
-      ) {
-        throw new MigrationOperationConflictError(operationId);
-      }
-      return op.result;
-    }
     const key = this.objectKey(kind, objectId);
     const record = `object ${kind}/${objectId}`;
     const rawPin = await tn.get(key);
@@ -1646,6 +1688,110 @@ export class NuqFdbMigrationStore {
       pin.objectId !== objectId
     ) {
       throw new MigrationCorruptionError(record, "identity mismatch");
+    }
+    if (pin.lastOperation?.operationId === operationId) {
+      if (
+        pin.lastOperation.fromLifecycle !== fromLifecycle ||
+        pin.lastOperation.toLifecycle !== toLifecycle ||
+        !residueEqual(pin.lastOperation.residue, residue)
+      ) {
+        throw new MigrationOperationConflictError(operationId);
+      }
+      const replayIndexRaw = await tn.get(
+        this.teamObjectKey(teamId, kind, objectId),
+      );
+      if (!replayIndexRaw) {
+        throw new MigrationCorruptionError(record, "missing team pin index");
+      }
+      const replayIndex = validatePin(
+        parseJson(replayIndexRaw, `${record} team index`),
+        `${record} team index`,
+      );
+      if (JSON.stringify(replayIndex) !== JSON.stringify(pin)) {
+        throw new MigrationCorruptionError(record, "team pin index mismatch");
+      }
+      return {
+        ...pin,
+        lifecycle: pin.lastOperation.toLifecycle,
+        revision: pin.lastOperation.resultRevision,
+        residue: pin.lastOperation.residue,
+      };
+    }
+
+    const legacyOperationKey = this.legacyObjectOperationKey(
+      teamId,
+      kind,
+      objectId,
+      operationId,
+    );
+    const legacyOperationRaw = await tn.get(legacyOperationKey);
+    if (legacyOperationRaw) {
+      const legacyOperation = validateLegacyObjectOperation(
+        parseJson(legacyOperationRaw, `legacy object operation ${operationId}`),
+        `legacy object operation ${operationId}`,
+      );
+      if (
+        legacyOperation.operationId !== operationId ||
+        legacyOperation.teamId !== teamId ||
+        legacyOperation.kind !== kind ||
+        legacyOperation.objectId !== objectId ||
+        legacyOperation.fromLifecycle !== fromLifecycle ||
+        legacyOperation.toLifecycle !== toLifecycle ||
+        !residueEqual(legacyOperation.residue, residue)
+      ) {
+        throw new MigrationOperationConflictError(operationId);
+      }
+      if (
+        legacyOperation.result.backend !== pin.backend ||
+        legacyOperation.result.generation !== pin.generation ||
+        legacyOperation.result.admission !== pin.admission ||
+        legacyOperation.result.sourceKind !== pin.sourceKind ||
+        legacyOperation.result.sourceObjectId !== pin.sourceObjectId ||
+        !residueEqual(
+          legacyOperation.result.initialResidue,
+          pin.initialResidue,
+        ) ||
+        legacyOperation.result.revision > pin.revision ||
+        (legacyOperation.result.revision === pin.revision &&
+          (legacyOperation.result.lifecycle !== pin.lifecycle ||
+            !residueEqual(legacyOperation.result.residue, pin.residue)))
+      ) {
+        throw new MigrationCorruptionError(
+          record,
+          "legacy operation does not describe this pin revision history",
+        );
+      }
+      const legacyIndexRaw = await tn.get(
+        this.teamObjectKey(teamId, kind, objectId),
+      );
+      if (!legacyIndexRaw) {
+        throw new MigrationCorruptionError(record, "missing team pin index");
+      }
+      const legacyIndex = validatePin(
+        parseJson(legacyIndexRaw, `${record} team index`),
+        `${record} team index`,
+      );
+      if (JSON.stringify(legacyIndex) !== JSON.stringify(pin)) {
+        throw new MigrationCorruptionError(record, "team pin index mismatch");
+      }
+      if (!pin.lastOperation) {
+        const migratedPin: MigrationObjectPin = {
+          ...pin,
+          lastOperation: {
+            schemaVersion: 1,
+            operationId,
+            fromLifecycle,
+            toLifecycle,
+            residue,
+            resultRevision: legacyOperation.result.revision,
+          },
+        };
+        const migratedEncoded = encodeJson(migratedPin);
+        tn.set(key, migratedEncoded);
+        tn.set(this.teamObjectKey(teamId, kind, objectId), migratedEncoded);
+        tn.clear(legacyOperationKey);
+      }
+      return legacyOperation.result;
     }
     if (pin.lifecycle !== fromLifecycle) {
       throw new MigrationStoreError(
@@ -1700,22 +1846,18 @@ export class NuqFdbMigrationStore {
       lifecycle: toLifecycle,
       revision,
       residue,
+      lastOperation: {
+        schemaVersion: 1,
+        operationId,
+        fromLifecycle,
+        toLifecycle,
+        residue,
+        resultRevision: revision,
+      },
     };
     const encoded = encodeJson(next);
     tn.set(key, encoded);
     tn.set(this.teamObjectKey(teamId, kind, objectId), encoded);
-    const op: ObjectOperation = {
-      schemaVersion: 1,
-      operationId,
-      teamId,
-      kind,
-      objectId,
-      fromLifecycle,
-      toLifecycle,
-      residue,
-      result: next,
-    };
-    tn.set(operationKey, encodeJson(op));
     return next;
   }
 
