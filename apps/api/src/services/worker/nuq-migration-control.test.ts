@@ -575,7 +575,11 @@ test("PG publication adapter prepares and resolves every intent exact-once", asy
   await adapter.complete([publication], "published");
   await adapter.complete([publication], "promoted");
   await adapter.complete([publication], "promoted");
+  // A later incompatible stable-ID retry compensates only a newly prepared
+  // intent; it must not terminalize this prior active publication.
+  await adapter.complete([publication], "compensated");
 
+  expect(store.completePinnedObject).not.toHaveBeenCalled();
   expect(store.preparePinnedObjects).toHaveBeenNthCalledWith(1, [
     {
       teamId: "team",

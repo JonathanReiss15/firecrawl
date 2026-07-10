@@ -413,7 +413,20 @@ export class DurableNuQPgPublicationAdapter implements NuQPgPublicationAdapter {
     outcome: NuQPgPublicationOutcome,
   ): Promise<void> {
     for (const publication of publications) {
+      const pin = await this.store.inspectPin("scrape_job", publication.id);
+      if (!pin) {
+        throw new NuQRouterError(
+          "NUQ_MIGRATION_PIN_NOT_FOUND",
+          `scrape_job/${publication.id} has no publication pin`,
+        );
+      }
       if (outcome === "compensated") {
+        // A stable-ID retry may discover an incompatible row after an earlier
+        // publication already activated this pin. Roll back only this call's
+        // still-prepared intent; never retire prior live work.
+        if (pin.lifecycle === "active" || pin.lifecycle === "terminal") {
+          continue;
+        }
         await this.store.completePinnedObject({
           teamId: publication.ownerId,
           kind: "scrape_job",
@@ -421,35 +434,38 @@ export class DurableNuQPgPublicationAdapter implements NuQPgPublicationAdapter {
           operationId: publicationOperationId(publication, outcome),
           fromLifecycle: "prepared",
         });
-      } else {
-        const pin = await this.store.inspectPin("scrape_job", publication.id);
-        if (!pin) {
-          throw new NuQRouterError(
-            "NUQ_MIGRATION_PIN_NOT_FOUND",
-            `scrape_job/${publication.id} has no publication pin`,
-          );
-        }
-        if (outcome === "promoted" && pin.lifecycle === "prepared") {
-          await this.store.transitionObjectResidue({
-            teamId: publication.ownerId,
-            kind: "scrape_job",
-            objectId: publication.id,
-            operationId: publicationOperationId(publication, "published"),
-            fromLifecycle: "prepared",
-            toLifecycle: "active",
-            residue: publicationResidue(publication, "published"),
-          });
-        }
+        continue;
+      }
+      if (pin.lifecycle === "terminal") {
+        throw new NuQRouterError(
+          "NUQ_PG_PUBLICATION_TERMINAL_PIN",
+          `scrape_job/${publication.id} cannot be republished`,
+        );
+      }
+      if (outcome === "published" && pin.lifecycle === "active") {
+        // Compatible stable-ID publication replay.
+        continue;
+      }
+      if (outcome === "promoted" && pin.lifecycle === "prepared") {
         await this.store.transitionObjectResidue({
           teamId: publication.ownerId,
           kind: "scrape_job",
           objectId: publication.id,
-          operationId: publicationOperationId(publication, outcome),
-          fromLifecycle: outcome === "promoted" ? "active" : "prepared",
+          operationId: publicationOperationId(publication, "published"),
+          fromLifecycle: "prepared",
           toLifecycle: "active",
-          residue: publicationResidue(publication, outcome),
+          residue: publicationResidue(publication, "published"),
         });
       }
+      await this.store.transitionObjectResidue({
+        teamId: publication.ownerId,
+        kind: "scrape_job",
+        objectId: publication.id,
+        operationId: publicationOperationId(publication, outcome),
+        fromLifecycle: outcome === "promoted" ? "active" : "prepared",
+        toLifecycle: "active",
+        residue: publicationResidue(publication, outcome),
+      });
     }
   }
 
