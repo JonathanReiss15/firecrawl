@@ -13,6 +13,7 @@ import {
   getFdb,
   getNuqFdbDatabase,
 } from "../../services/worker/nuq-fdb/client";
+import { READY_SHARDS } from "../../services/worker/nuq-fdb/keyspace";
 
 const describeIf = config.FDB_CLUSTER_FILE ? describe : describe.skip;
 const run = randomUUID();
@@ -77,6 +78,16 @@ async function residue(teamId: string, generation = 1) {
   return (await store.inspectGeneration(teamId, generation)).residue;
 }
 
+async function takeFinishedForGroup(groupId: string) {
+  for (let attempt = 0; attempt < 20; attempt++) {
+    const job = await finishedQueue.getJobToProcess();
+    if (!job) return null;
+    if (job.groupId === groupId) return job;
+    await finishedQueue.jobFinish(job.id, job.lock!, {});
+  }
+  return null;
+}
+
 async function forceSealCorruptResidueForStaleGenerationTest(teamId: string) {
   await db.doTn(async tn => {
     for (const counter of MIGRATION_RESIDUE_COUNTERS) {
@@ -104,9 +115,18 @@ describeIf("NuQ FDB transaction-scoped migration generation hooks", () => {
     }
     for (const teamId of teams) {
       const range = fdb.tuple.range(["nuq-migration", 1, "team", teamId]);
-      await db.doTn(async tn =>
-        tn.clearRange(range.begin as Buffer, range.end as Buffer),
-      );
+      await db.doTn(async tn => {
+        const objects = fdb.tuple.range(["nuq-migration", 1, "object"]);
+        const rows = await tn
+          .snapshot()
+          .getRangeAll(objects.begin as Buffer, objects.end as Buffer);
+        for (const [key, value] of rows) {
+          if (JSON.parse((value as Buffer).toString()).teamId === teamId) {
+            tn.clear(key as Buffer);
+          }
+        }
+        tn.clearRange(range.begin as Buffer, range.end as Buffer);
+      });
     }
   });
 
@@ -120,6 +140,18 @@ describeIf("NuQ FDB transaction-scoped migration generation hooks", () => {
       unlimited,
     );
     expect(legacy.migrationGeneration).toBeUndefined();
+    let staleReady: [Buffer, Buffer] | undefined;
+    await db.doTn(async tn => {
+      for (let shard = 0; shard < READY_SHARDS && !staleReady; shard++) {
+        const range = queue.ks.readyShardRange(shard);
+        const rows = await tn.snapshot().getRangeAll(range.begin, range.end);
+        staleReady = rows.find(([, value]) => {
+          const entry = JSON.parse((value as Buffer).toString("utf8"));
+          return entry.i === legacyId;
+        }) as [Buffer, Buffer] | undefined;
+      }
+    });
+    expect(staleReady).toBeDefined();
     await queue.beginMetricCounterBackfill();
     while (!(await queue.backfillMetricCounts(100))) {
       // bounded pages
@@ -134,7 +166,30 @@ describeIf("NuQ FDB transaction-scoped migration generation hooks", () => {
     await expect(queue.hasReadyOrActiveJobForOwner(legacyTeam)).resolves.toBe(
       true,
     );
+    const wrongOwner = randomUUID();
+    await db.doTn(async tn => {
+      tn.set(queue.ks.ownerLiveJob(wrongOwner, legacyId), Buffer.alloc(0));
+    });
+    await expect(
+      queue.hasReadyOrActiveJobForOwner(wrongOwner),
+    ).rejects.toMatchObject({ code: "NUQ_MIGRATION_CORRUPT" });
+    await db.doTn(async tn => {
+      tn.clear(queue.ks.ownerLiveJob(wrongOwner, legacyId));
+    });
     await queue.removeJob(legacyId);
+    await db.doTn(async tn => {
+      tn.set(queue.ks.ownerLiveJob(legacyTeam, legacyId), Buffer.alloc(0));
+      tn.set(staleReady![0], staleReady![1]);
+    });
+    await expect(queue.hasReadyOrActiveJobForOwner(legacyTeam)).resolves.toBe(
+      false,
+    );
+    await expect(
+      db.doTn(async tn => tn.get(queue.ks.ownerLiveJob(legacyTeam, legacyId))),
+    ).resolves.toBeUndefined();
+    // The obsolete ready row is not routing authority once the generation-
+    // scoped owner index is READY; normal queue/sweeper reconciliation owns
+    // its bounded cleanup.
 
     const teamId = await managedTeam();
     await expect(
@@ -182,6 +237,86 @@ describeIf("NuQ FDB transaction-scoped migration generation hooks", () => {
     await expect(
       store.inspectPin("external_holder", externalObjectId),
     ).resolves.toMatchObject({ lifecycle: "terminal" });
+  });
+
+  test("terminal cancelled-group pins repair a missing sweeper continuation", async () => {
+    const teamId = randomUUID();
+    teams.add(teamId);
+    const groupId = randomUUID();
+    await groups.addGroup(groupId, teamId);
+    await groups.cancelGroup(groupId);
+    await db.doTn(async tn => {
+      // Simulate pre-hook cancellation clearing owner discovery.
+      tn.clear(queue.ks.ongoingGroup(teamId, groupId));
+    });
+    await queue.beginMetricCounterBackfill();
+    while (!(await queue.backfillMetricCounts(10))) {
+      // bounded pages
+    }
+    while (!(await groups.backfillLegacyOwnerIndex(2))) {
+      // bounded pages
+    }
+    await expect(groups.hasUnfinishedByOwner(teamId)).resolves.toBe(true);
+    await store.initializeLegacyTeam(teamId, "fdb", randomUUID());
+    await store.preparePinnedObject({
+      teamId,
+      kind: "group",
+      objectId: groupId,
+      admission: {
+        type: "legacy-backfill",
+        backend: "fdb",
+        generation: 1,
+        terminal: true,
+      },
+      requiredBackend: "fdb",
+      residue: {},
+    });
+
+    await expect(groups.adoptLegacyCancelledGroup(groupId)).resolves.toBe(true);
+    await expect(
+      store.inspectPin("sweeper_task", `group-cancel/${groupId}`),
+    ).resolves.toMatchObject({
+      admission: "legacy-backfill",
+      lifecycle: "active",
+      residue: { control_sweeper_tasks: 1 },
+    });
+  });
+
+  test("sealed cancelled-group tombstones fail with an explicit lost-continuation fence", async () => {
+    const teamId = randomUUID();
+    teams.add(teamId);
+    const groupId = randomUUID();
+    await groups.addGroup(groupId, teamId);
+    await groups.cancelGroup(groupId);
+    await store.initializeLegacyTeam(teamId, "fdb", randomUUID());
+    await store.preparePinnedObject({
+      teamId,
+      kind: "group",
+      objectId: groupId,
+      admission: {
+        type: "legacy-backfill",
+        backend: "fdb",
+        generation: 1,
+        terminal: true,
+      },
+      requiredBackend: "fdb",
+      residue: {},
+    });
+    const transition = await store.beginTransition({
+      teamId,
+      targetBackend: "pg",
+      operationId: randomUUID(),
+    });
+    await store.finalSeal({
+      teamId,
+      transitionOperationId: transition.transitionOperationId!,
+    });
+
+    await expect(
+      groups.adoptLegacyCancelledGroup(groupId),
+    ).rejects.toMatchObject({
+      code: "NUQ_MIGRATION_CANCELLED_GROUP_CONTINUATION_LOST",
+    });
   });
 
   test("ready/active residue is exact and terminal drain remains allowed", async () => {
@@ -318,7 +453,8 @@ describeIf("NuQ FDB transaction-scoped migration generation hooks", () => {
     const delayed = await queue.getJobToProcess();
     expect(delayed?.id).toBe(delayedId);
     await queue.jobFinish(delayedId, delayed!.lock!, {});
-    const finished = await finishedQueue.getJobToProcess();
+    const finished = await takeFinishedForGroup(gid);
+    expect(finished?.groupId).toBe(gid);
     await finishedQueue.jobFinish(finished!.id, finished!.lock!, {});
     expect(
       Object.values(await residue(teamId)).every(value => value === 0),
@@ -371,8 +507,9 @@ describeIf("NuQ FDB transaction-scoped migration generation hooks", () => {
     const afterChild = await residue(teamId);
     expect(afterChild.control_groups).toBe(0);
     expect(afterChild.control_crawl_finished).toBe(1);
-    const finished = await finishedQueue.getJobToProcess();
+    const finished = await takeFinishedForGroup(gid);
     expect(finished).toMatchObject({
+      groupId: gid,
       migrationBackend: "fdb",
       migrationGeneration: 1,
     });

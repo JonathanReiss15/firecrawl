@@ -1126,6 +1126,8 @@ export class NuqFdbMigrationStore {
       return null;
     }
     await this.validateTopology(tn, state);
+    const residue = normalizeResidue(input.residue);
+    const terminal = input.terminal === true;
     let pin = await this.inspectPinInTxn(tn, kind, objectId);
     let adoptedLegacyRecord = false;
     if (!pin) {
@@ -1139,6 +1141,9 @@ export class NuqFdbMigrationStore {
           `${kind}/${objectId} has no durable pin`,
         );
       }
+      const generation = terminal
+        ? await this.ensureTerminalLegacyGenerationInTxn(tn, state, "fdb")
+        : state.activeGeneration;
       pin = await this.preparePinnedObjectInTxn(tn, {
         teamId,
         kind,
@@ -1146,10 +1151,11 @@ export class NuqFdbMigrationStore {
         admission: {
           type: "legacy-backfill",
           backend: "fdb",
-          generation: state.activeGeneration,
+          generation,
+          terminal,
         },
         requiredBackend: "fdb",
-        residue: input.residue,
+        residue,
       });
       adoptedLegacyRecord = true;
     }
@@ -1176,9 +1182,15 @@ export class NuqFdbMigrationStore {
       );
     }
     const generation = await this.requireGeneration(tn, teamId, pin.generation);
+    const terminalIdempotent =
+      pin.lifecycle === "terminal" &&
+      terminal &&
+      Object.values(residue).every(value => value === 0);
     if (
       generation.backend !== pin.backend ||
-      (generation.status !== "open" && generation.status !== "draining")
+      (generation.status !== "open" &&
+        generation.status !== "draining" &&
+        !terminalIdempotent)
     ) {
       throw new MigrationStaleGenerationError(
         teamId,
@@ -1186,8 +1198,6 @@ export class NuqFdbMigrationStore {
         pin.generation,
       );
     }
-    const residue = normalizeResidue(input.residue);
-    const terminal = input.terminal === true;
     const targetLifecycle: MigrationObjectLifecycle = terminal
       ? "terminal"
       : input.activateNonterminal === false && !adoptedLegacyRecord
@@ -1242,12 +1252,15 @@ export class NuqFdbMigrationStore {
 
   public async validateManagedObjectInTxn(
     tn: Transaction,
-    input: Omit<ReconcileManagedObjectInput, "residue" | "terminal">,
+    input: Omit<ReconcileManagedObjectInput, "residue" | "terminal"> & {
+      legacyResidue?: Partial<MigrationResidue>;
+    },
   ): Promise<MigrationObjectPin | null> {
     const pin = await this.inspectPinInTxn(tn, input.kind, input.objectId);
+    const { legacyResidue, ...reconcileInput } = input;
     return await this.reconcileManagedObjectInTxn(tn, {
-      ...input,
-      residue: pin?.residue ?? {},
+      ...reconcileInput,
+      residue: pin?.residue ?? legacyResidue ?? {},
       activateNonterminal: false,
     });
   }
@@ -1355,6 +1368,69 @@ export class NuqFdbMigrationStore {
       tn.set(this.generationKey(teamId, 1), encodeJson(generation));
       tn.set(opKey, encodeJson(op));
       return state;
+    });
+  }
+
+  private async ensureTerminalLegacyGenerationInTxn(
+    tn: Transaction,
+    state: MigrationTeamState,
+    backend: MigrationBackend,
+  ): Promise<number> {
+    const { teamId } = state;
+    if (state.activeBackend === backend) return state.activeGeneration;
+    for (let candidate = state.maxGeneration; candidate >= 1; candidate--) {
+      const generation = await this.requireGeneration(tn, teamId, candidate);
+      if (generation.backend === backend) return candidate;
+    }
+    if (state.phase !== "PG_ONLY" && state.phase !== "FDB_ONLY") {
+      throw new MigrationInProgressError(teamId);
+    }
+    const generationNumber = state.maxGeneration + 1;
+    if (!Number.isSafeInteger(generationNumber)) {
+      throw new MigrationCorruptionError(
+        `team ${teamId}`,
+        "generation exhausted safe integer range",
+      );
+    }
+    if (await this.readGeneration(tn, teamId, generationNumber)) {
+      throw new MigrationCorruptionError(
+        `team ${teamId} generation ${generationNumber}`,
+        "generation was previously allocated beyond maxGeneration",
+      );
+    }
+    const generation: MigrationGeneration = {
+      schemaVersion: 1,
+      teamId,
+      backend,
+      generation: generationNumber,
+      status: "closed",
+    };
+    const next: MigrationTeamState = {
+      ...state,
+      revision: nextRevision(state),
+      maxGeneration: generationNumber,
+    };
+    tn.set(
+      this.generationKey(teamId, generationNumber),
+      encodeJson(generation),
+    );
+    tn.set(this.teamStateKey(teamId), encodeJson(next));
+    return generationNumber;
+  }
+
+  /** Allocates at most one closed historical generation for terminal runtime
+   * records discovered after authority initialization. It never changes the
+   * active backend and is idempotent across commit-unknown retries. */
+  public async ensureTerminalLegacyGeneration(
+    teamId: string,
+    backend: MigrationBackend,
+  ): Promise<number> {
+    assertNonempty(teamId, "teamId");
+    return await this.db.doTn(async tn => {
+      const state = await this.readState(tn, teamId);
+      if (!state) throw new MigrationLegacyStateError(teamId);
+      await this.validateTopology(tn, state);
+      return await this.ensureTerminalLegacyGenerationInTxn(tn, state, backend);
     });
   }
 

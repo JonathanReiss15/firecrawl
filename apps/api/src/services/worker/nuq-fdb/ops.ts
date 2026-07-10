@@ -100,7 +100,10 @@ export async function validateJobMigrationInTxn(
   tn: Transaction,
   ks: NuqFdbKeyspace,
   entry: QueueEntry,
-  options?: { allowMissingRecordPin?: boolean },
+  options?: {
+    allowMissingRecordPin?: boolean;
+    legacyResidue?: Partial<MigrationResidue>;
+  },
 ): Promise<MigrationObjectPin | null> {
   if (!entry.o) return null;
   return await nuqFdbMigrationStore.validateManagedObjectInTxn(tn, {
@@ -109,6 +112,11 @@ export async function validateJobMigrationInTxn(
     objectId: entry.i,
     recordPin: runtimeMigrationPin(entry),
     allowMissingRecordPin: options?.allowMissingRecordPin,
+    legacyResidue:
+      options?.legacyResidue ??
+      (ks.migrationObjectKind === "crawl_finished"
+        ? { control_crawl_finished: 1 }
+        : { capacity_ready_active: 1 }),
   });
 }
 

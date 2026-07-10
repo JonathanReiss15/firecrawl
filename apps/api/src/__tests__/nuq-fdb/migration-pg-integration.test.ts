@@ -19,6 +19,7 @@ import { getRedisConnection } from "../../services/queue-service";
 import { redisEvictConnection } from "../../services/redis";
 import {
   crawlFinishedQueueFdb,
+  crawlGroupFdb,
   externalSlotMigrationObjectId,
   externalSlotsFdb,
   getNuqFdbSweeper,
@@ -46,6 +47,7 @@ import {
   isFdbTeam,
   mirrorExternalSlotAcquire,
   mirrorExternalSlotRelease,
+  renewExternalSlot,
   scrapeQueue as routedScrapeQueue,
 } from "../../services/worker/nuq-router";
 
@@ -60,6 +62,9 @@ async function makeMetricsReady(): Promise<void> {
     while (!(await queue.backfillMetricCounts(100))) {
       // bounded pages
     }
+  }
+  while (!(await crawlGroupFdb.backfillLegacyOwnerIndex(100))) {
+    // bounded pages
   }
 }
 
@@ -456,9 +461,9 @@ describeIf("NuQ PG publication with durable FDB authority", () => {
     await isFdbTeam(externalTeamId);
     const concurrencyKey = `concurrency-limiter:${externalTeamId}`;
     const failedHolder = randomUUID();
-    const zaddFailure = new Error("injected zadd failure");
+    const zaddFailure = new Error("injected Redis publication failure");
     const zaddSpy = vi
-      .spyOn(getRedisConnection(), "zadd")
+      .spyOn(getRedisConnection(), "eval")
       .mockRejectedValueOnce(zaddFailure);
     await expect(
       mirrorExternalSlotAcquire(externalTeamId, failedHolder, -1),
@@ -503,7 +508,14 @@ describeIf("NuQ PG publication with durable FDB authority", () => {
     });
 
     const renewedHolder = randomUUID();
-    await mirrorExternalSlotAcquire(externalTeamId, renewedHolder, -1);
+    await mirrorExternalSlotAcquire(externalTeamId, renewedHolder, 60_000);
+    // Force the durable deadline due while the Redis holder remains live, then
+    // exercise the heartbeat renewal path that publishes a fresh generation.
+    await externalSlotsFdb.renewPg(
+      externalTeamId,
+      renewedHolder,
+      Date.now() - 1,
+    );
     let stale: [Buffer, Buffer] | undefined;
     for (let bucket = 0; bucket < TIME_BUCKETS && !stale; bucket++) {
       const range = externalSlotsFdb.pgExpiryScanRange(bucket, Date.now());
@@ -513,7 +525,9 @@ describeIf("NuQ PG publication with durable FDB authority", () => {
       stale = rows[0] as [Buffer, Buffer] | undefined;
     }
     expect(stale).toBeDefined();
-    await mirrorExternalSlotAcquire(externalTeamId, renewedHolder, 60_000);
+    await expect(
+      renewExternalSlot(externalTeamId, renewedHolder, 60_000),
+    ).resolves.toBe(true);
     await getRedisConnection().del(concurrencyKey);
     await getNuqFdbDatabase().doTn(async tn => tn.set(stale![0], stale![1]));
     await getNuqFdbSweeper().sweepOnce();

@@ -120,6 +120,9 @@ async function makeMetricsReady(): Promise<void> {
       // bounded pages; queues are empty in this focused suite
     }
   }
+  while (!(await crawlGroupFdb.backfillLegacyOwnerIndex(100))) {
+    // bounded pages
+  }
 }
 
 describeIf("NuQ durable migration router", () => {
@@ -251,7 +254,7 @@ describeIf("NuQ durable migration router", () => {
     ).resolves.toMatchObject({
       admission: "legacy-backfill",
       backend: "fdb",
-      lifecycle: "prepared",
+      lifecycle: "active",
     });
     await nuqFdbMigrationStore.preparePinnedObject({
       teamId,
@@ -361,7 +364,7 @@ describeIf("NuQ durable migration router", () => {
     ).resolves.toBeNull();
   });
 
-  test("failed PG activation removes a new Redis holder and retires its intent", async () => {
+  test("failed PG durable-expiry publication removes a new Redis holder and retires its intent", async () => {
     const teamId = randomUUID();
     const holderId = randomUUID();
     const activationError = new Error("activation unavailable");
@@ -380,7 +383,7 @@ describeIf("NuQ durable migration router", () => {
     await expect(isFdbTeam(teamId)).resolves.toBe(false);
 
     const transition = vi
-      .spyOn(nuqFdbMigrationStore, "transitionObjectResidue")
+      .spyOn(externalSlotsFdb, "renewPg")
       .mockRejectedValueOnce(activationError);
     try {
       await expect(
@@ -410,7 +413,7 @@ describeIf("NuQ durable migration router", () => {
     });
   });
 
-  test("stale PG activation failure cannot roll back a replacement holder", async () => {
+  test("stale PG durable-expiry failure cannot roll back a replacement holder", async () => {
     const teamId = randomUUID();
     const holderId = randomUUID();
     const objectId = externalSlotMigrationObjectId(teamId, holderId);
@@ -430,7 +433,7 @@ describeIf("NuQ durable migration router", () => {
     await expect(isFdbTeam(teamId)).resolves.toBe(false);
 
     const transition = vi
-      .spyOn(nuqFdbMigrationStore, "transitionObjectResidue")
+      .spyOn(externalSlotsFdb, "renewPg")
       .mockRejectedValueOnce(activationError);
     try {
       await expect(
@@ -517,7 +520,7 @@ describeIf("NuQ durable migration router", () => {
     ).resolves.toMatchObject({ lifecycle: "terminal" });
   });
 
-  test("failed PG renewal does not remove or terminalize an existing holder", async () => {
+  test("failed PG durable-expiry renewal does not remove or terminalize an existing holder", async () => {
     const teamId = randomUUID();
     const holderId = randomUUID();
     const objectId = externalSlotMigrationObjectId(teamId, holderId);
@@ -544,7 +547,7 @@ describeIf("NuQ durable migration router", () => {
     controls.redisRollback.mockClear();
 
     const transition = vi
-      .spyOn(nuqFdbMigrationStore, "transitionObjectResidue")
+      .spyOn(externalSlotsFdb, "renewPg")
       .mockRejectedValueOnce(activationError);
     try {
       await expect(

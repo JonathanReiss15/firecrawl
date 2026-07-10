@@ -14,7 +14,8 @@ vi.mock("../../services/worker/nuq", () => {
   return {
     scrapeQueue: queue,
     crawlFinishedQueue: queue,
-    crawlGroup: {},
+    crawlGroup: { getGroup: vi.fn().mockResolvedValue(null) },
+    getNuQPgOwnerLiveResidue: vi.fn().mockResolvedValue({ total: 0 }),
   };
 });
 vi.mock("../../services/ab-test", () => ({
@@ -22,6 +23,17 @@ vi.mock("../../services/ab-test", () => ({
 }));
 vi.mock("../../lib/crawl-redis", () => ({
   getCrawl: vi.fn(),
+}));
+vi.mock("../../lib/concurrency-redis", () => ({
+  getTeamQueueLimit: vi.fn().mockResolvedValue(100),
+  getConcurrencyLimitActiveJobsCount: vi.fn().mockResolvedValue(0),
+  pushConcurrencyLimitActiveJob: vi.fn().mockResolvedValue(undefined),
+  removeConcurrencyLimitActiveJob: vi.fn().mockResolvedValue(undefined),
+  renewConcurrencyLimitActiveJob: vi.fn().mockResolvedValue(false),
+  reserveConcurrencyLimitActiveJob: vi.fn(),
+  rollbackConcurrencyLimitActiveJob: vi.fn(),
+  finalizeConcurrencyLimitActiveJobRollback: vi.fn(),
+  constructConcurrencyLimitKey: (teamId: string) => `concurrency:${teamId}`,
 }));
 import { config } from "../../config";
 import { redisEvictConnection } from "../../services/redis";
@@ -42,6 +54,7 @@ import {
 import { waitForJob as waitForQueuedJob } from "../../services/queue-jobs";
 import {
   crawlFinishedQueueFdb,
+  crawlGroupFdb,
   scrapeQueueFdb,
 } from "../../services/worker/nuq-fdb";
 import {
@@ -57,16 +70,28 @@ const describeIf = config.FDB_CLUSTER_FILE ? describe : describe.skip;
 
 const prevNuqBackend = config.NUQ_BACKEND;
 const prevDbAuth = config.USE_DB_AUTHENTICATION;
+const prevMetricsActivation = config.NUQ_FDB_METRICS_V2_ACTIVATE;
 
 describeIf("NuQ router (forced FDB mode)", () => {
-  beforeAll(() => {
+  beforeAll(async () => {
     config.NUQ_BACKEND = "fdb";
     config.USE_DB_AUTHENTICATION = false; // self-hosted: unlimited concurrency
+    config.NUQ_FDB_METRICS_V2_ACTIVATE = true;
+    for (const queue of [scrapeQueueFdb, crawlFinishedQueueFdb]) {
+      await queue.beginMetricCounterBackfill();
+      while (!(await queue.backfillMetricCounts(100))) {
+        // bounded pages
+      }
+    }
+    while (!(await crawlGroupFdb.backfillLegacyOwnerIndex(100))) {
+      // bounded pages
+    }
   });
 
   afterAll(async () => {
     config.NUQ_BACKEND = prevNuqBackend;
     config.USE_DB_AUTHENTICATION = prevDbAuth;
+    config.NUQ_FDB_METRICS_V2_ACTIVATE = prevMetricsActivation;
     // forced mode writes into the real "scrape"/"crawl_finished" queue
     // namespaces; wipe them so reruns and other suites start clean
     const fdb = getFdb();
@@ -259,6 +284,7 @@ describeIf("NuQ router (forced FDB mode)", () => {
       await scrapeQueue.removeJob(jobId);
 
       const cancelId = randomUUID();
+      const cancelTeamId = randomUUID();
       config.NUQ_BACKEND = "fdb";
       await fdbEnqueueScrapeJobs(
         [
@@ -267,13 +293,13 @@ describeIf("NuQ router (forced FDB mode)", () => {
             data: {
               mode: "single_urls",
               url: "https://example.com/cancel",
-              team_id: teamId,
+              team_id: cancelTeamId,
             } as any,
             priority: 0,
             backlogTimeoutMs: 60_000,
           },
         ],
-        teamId,
+        cancelTeamId,
       );
       // ID-only standalone cancellation also probes durable FDB state.
       config.NUQ_BACKEND = "pg";

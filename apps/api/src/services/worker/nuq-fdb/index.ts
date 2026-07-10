@@ -22,6 +22,7 @@ export type {
   NuQFdbJob,
   NuQFdbJobOptions,
   NuQFdbGate,
+  NuQFdbLegacyJobDescriptor,
   NuQJobStatusCompat,
 } from "./queue";
 export { NuQFdbJobGroup } from "./groups";

@@ -51,8 +51,13 @@ import {
   validateJobMigrationInTxn,
   runtimeMigrationPin,
 } from "./ops";
-import { nuqFdbMigrationStore } from "./migration-store";
-import { ACTIVE_GROUP_MAX_AGE_MS, prepareGroupSweepTaskInTxn } from "./groups";
+import { MigrationStoreError, nuqFdbMigrationStore } from "./migration-store";
+import {
+  ACTIVE_GROUP_MAX_AGE_MS,
+  LEGACY_GROUP_OWNER_INDEX_PHASE,
+  NuQFdbJobGroup,
+  prepareGroupSweepTaskInTxn,
+} from "./groups";
 import { NuQFdbQueue } from "./queue";
 import { ExternalSlotSweepGuard, NuqFdbExternalSlots } from "./slots";
 
@@ -531,6 +536,29 @@ export class NuqFdbSweeper {
           phase: "legacy-all-group-index",
           partition: 0,
           run: claim => this.indexLegacyGroups(queue, claim),
+        },
+        {
+          ks: queue.ks,
+          phase: LEGACY_GROUP_OWNER_INDEX_PHASE,
+          partition: 0,
+          run: async claim => {
+            await this.renewClaim(claim);
+            if (!queue.groupOps) return;
+            try {
+              await new NuQFdbJobGroup(
+                queue.ks,
+                queue.groupOps,
+              ).backfillLegacyOwnerIndex(SWEEP_BATCH * 2);
+            } catch (error) {
+              if (
+                error instanceof MigrationStoreError &&
+                error.code === "NUQ_FDB_GROUP_OWNER_INDEX_NOT_READY"
+              ) {
+                return;
+              }
+              throw error;
+            }
+          },
         },
         {
           ks: queue.ks,

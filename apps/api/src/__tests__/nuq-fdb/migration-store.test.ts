@@ -357,6 +357,115 @@ describeIf("NuQ global FDB migration control plane", () => {
     ).resolves.toMatchObject({ backend: "pg", generation: 1 });
   });
 
+  test("terminal legacy rows allocate bounded closed backend history without changing authority", async () => {
+    const teamId = team();
+    const objectId = object();
+    await initialize(teamId, "pg");
+    await expect(
+      store.ensureTerminalLegacyGeneration(teamId, "fdb"),
+    ).resolves.toBe(2);
+    await expect(
+      store.ensureTerminalLegacyGeneration(teamId, "fdb"),
+    ).resolves.toBe(2);
+    await expect(store.inspectState(teamId)).resolves.toMatchObject({
+      activeBackend: "pg",
+      activeGeneration: 1,
+      maxGeneration: 2,
+    });
+    await expect(store.inspectGeneration(teamId, 2)).resolves.toMatchObject({
+      generation: { backend: "fdb", status: "closed" },
+    });
+    await expect(
+      store.preparePinnedObject({
+        teamId,
+        kind: "scrape_job",
+        objectId,
+        admission: {
+          type: "legacy-backfill",
+          backend: "fdb",
+          generation: 2,
+          terminal: true,
+        },
+        residue: {},
+      }),
+    ).resolves.toMatchObject({
+      backend: "fdb",
+      generation: 2,
+      lifecycle: "terminal",
+    });
+    await expect(
+      getNuqFdbDatabase().doTn(async tn =>
+        store.reconcileManagedObjectInTxn(tn, {
+          teamId,
+          kind: "scrape_job",
+          objectId,
+          residue: {},
+          terminal: true,
+        }),
+      ),
+    ).resolves.toMatchObject({ lifecycle: "terminal", generation: 2 });
+  });
+
+  test("runtime rows adopt legacy pins but existing new-root pins still require generations", async () => {
+    const teamId = team();
+    const newRootId = object();
+    const legacyId = object();
+    const implicitLegacyId = object();
+    await initialize(teamId, "fdb");
+    await store.preparePinnedObject({
+      teamId,
+      kind: "scrape_job",
+      objectId: newRootId,
+      admission: { type: "new-root" },
+      residue: { capacity_ready_active: 1 },
+    });
+    await store.preparePinnedObject({
+      teamId,
+      kind: "scrape_job",
+      objectId: legacyId,
+      admission: { type: "legacy-backfill", backend: "fdb", generation: 1 },
+      residue: { capacity_ready_active: 1 },
+    });
+
+    await expect(
+      getNuqFdbDatabase().doTn(async tn =>
+        store.reconcileManagedObjectInTxn(tn, {
+          teamId,
+          kind: "scrape_job",
+          objectId: newRootId,
+          residue: { capacity_ready_active: 1 },
+        }),
+      ),
+    ).rejects.toMatchObject({ code: "NUQ_MIGRATION_RUNTIME_PIN_MISSING" });
+    await expect(
+      getNuqFdbDatabase().doTn(async tn =>
+        store.reconcileManagedObjectInTxn(tn, {
+          teamId,
+          kind: "scrape_job",
+          objectId: legacyId,
+          residue: { capacity_ready_active: 1 },
+        }),
+      ),
+    ).resolves.toMatchObject({
+      admission: "legacy-backfill",
+      lifecycle: "active",
+    });
+    await expect(
+      getNuqFdbDatabase().doTn(async tn =>
+        store.reconcileManagedObjectInTxn(tn, {
+          teamId,
+          kind: "scrape_job",
+          objectId: implicitLegacyId,
+          residue: { capacity_ready_active: 1 },
+        }),
+      ),
+    ).resolves.toMatchObject({
+      admission: "legacy-backfill",
+      lifecycle: "active",
+      residue: { capacity_ready_active: 1 },
+    });
+  });
+
   test("a concurrent residue increment and final seal cannot both win", async () => {
     const teamId = team();
     const pinId = object();

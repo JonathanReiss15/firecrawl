@@ -70,7 +70,11 @@ import {
   validateJobMigrationInTxn,
   stampMigrationPin,
 } from "./ops";
-import { MigrationStoreError, nuqFdbMigrationStore } from "./migration-store";
+import {
+  MigrationCorruptionError,
+  MigrationStoreError,
+  nuqFdbMigrationStore,
+} from "./migration-store";
 import type {
   MigrationBackend,
   MigrationObjectKind,
@@ -135,6 +139,12 @@ export type NuQFdbJob<Data = any, ReturnValue = any> = {
   groupId?: string;
   migrationBackend?: MigrationBackend;
   migrationGeneration?: number;
+};
+
+export type NuQFdbLegacyJobDescriptor = {
+  teamId: string;
+  terminal: boolean;
+  residue: Partial<MigrationResidue>;
 };
 
 export type NuQFdbJobOptions = {
@@ -1662,6 +1672,70 @@ export class NuQFdbQueue<JobData = any, JobReturnValue = any> {
     });
   }
 
+  /** Explicit adoption descriptor for runtime rows written before generation
+   * hooks. It conservatively accounts one live object in its exact placement
+   * class; terminal records adopt a zero-residue tombstone. */
+  public async inspectLegacyMigrationObject(
+    id: string,
+  ): Promise<NuQFdbLegacyJobDescriptor | null> {
+    return await this.db.doTn(async tn => {
+      const snapshot = tn.snapshot();
+      const [meta, status] = await Promise.all([
+        snapshot
+          .get(this.ks.jobMeta(id))
+          .then(value => decodeJson<JobMeta>(value)),
+        snapshot
+          .get(this.ks.jobStatus(id))
+          .then(value => decodeJson<JobStatusRecord>(value)),
+      ]);
+      if (!meta || !status || !meta.o) return null;
+      if (
+        status.s === "completed" ||
+        status.s === "failed" ||
+        status.s === "cancelled"
+      ) {
+        return { teamId: meta.o, terminal: true, residue: {} };
+      }
+      if (this.ks.migrationObjectKind === "crawl_finished") {
+        return {
+          teamId: meta.o,
+          terminal: false,
+          residue: { control_crawl_finished: 1 },
+        };
+      }
+      if (status.s === "queued" || status.s === "active") {
+        return {
+          teamId: meta.o,
+          terminal: false,
+          residue: { capacity_ready_active: 1 },
+        };
+      }
+      if (status.s === "pending") {
+        const counter =
+          status.loc?.k === "kq"
+            ? "capacity_key_pending"
+            : status.loc?.k === "gq"
+              ? "capacity_crawl_pending"
+              : status.loc?.k === "dl"
+                ? "capacity_delayed"
+                : "capacity_team_pending";
+        return {
+          teamId: meta.o,
+          terminal: false,
+          residue: { [counter]: 1 },
+        };
+      }
+      // In-progress ingest manifests have no published JobMeta and normally
+      // return above. If a legacy partial row does carry metadata, keep seal
+      // conservative until its cleanup reconciles it.
+      return {
+        teamId: meta.o,
+        terminal: false,
+        residue: { capacity_ready_active: 1 },
+      };
+    });
+  }
+
   public async getJobs(
     ids: string[],
     logger: Logger = _logger,
@@ -2056,12 +2130,43 @@ export class NuQFdbQueue<JobData = any, JobReturnValue = any> {
           );
         }
         const ownerRange = this.ks.ownerLiveJobRange(owner);
-        // Normal range reads conflict with a concurrent indexed publication.
+        // Normal range reads conflict with concurrent publication. Validate
+        // each index row against authoritative status/meta so mixed-version
+        // terminalization cannot leave sticky residue, and fail closed if an
+        // index ever points across tenant ownership.
         const indexed = await tn.getRangeAll(ownerRange.begin, ownerRange.end, {
-          limit: 1,
+          limit: 100,
         });
-        if (indexed.length > 0) return { found: true, ready: true };
+        for (const [key] of indexed) {
+          const id = this.ks.unpackId(key as Buffer);
+          const [status, meta] = await Promise.all([
+            tn
+              .get(this.ks.jobStatus(id))
+              .then(value => decodeJson<JobStatusRecord>(value)),
+            tn
+              .get(this.ks.jobMeta(id))
+              .then(value => decodeJson<JobMeta>(value)),
+          ]);
+          if (status?.s === "queued" || status?.s === "active") {
+            if (meta?.o !== owner) {
+              throw new MigrationCorruptionError(
+                `owner index ${owner}/${id}`,
+                "live job owner mismatch",
+              );
+            }
+            return { found: true, ready: true };
+          }
+          tn.clear(key as Buffer);
+        }
         if (await tn.get(this.ks.ownerLiveBackfillReady(control.generation))) {
+          if (indexed.length === 100) {
+            // Commit this bounded stale-row cleanup, then retry before making a
+            // negative authority decision; a live row may follow this page.
+            return { found: false, ready: false };
+          }
+          // READY makes the maintained owner index authoritative. Obsolete
+          // ready-shard entries are ignored here and cleaned by queue/sweeper
+          // reconciliation; they cannot pin a team without a live status row.
           return { found: false, ready: true };
         }
         const jobs = this.ks.jobRootRange();

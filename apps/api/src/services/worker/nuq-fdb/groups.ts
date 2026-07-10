@@ -29,7 +29,7 @@ import {
   runtimeMigrationPin,
   stampMigrationPin,
 } from "./ops";
-import { nuqFdbMigrationStore } from "./migration-store";
+import { MigrationStoreError, nuqFdbMigrationStore } from "./migration-store";
 
 export type NuQFdbGroupStatus = "active" | "completed" | "cancelled";
 
@@ -51,6 +51,8 @@ const DEFAULT_GROUP_TTL_MS = 86400000;
 // never reaches normal completion must not live forever. This deadline is
 // independent of the post-completion retention TTL.
 export const ACTIVE_GROUP_MAX_AGE_MS = 7 * 24 * 60 * 60 * 1000;
+export const LEGACY_GROUP_OWNER_INDEX_PHASE =
+  "migration-legacy-group-owner-index-v1";
 
 export function groupSweepTaskId(gid: string): string {
   return `group-cancel/${gid}`;
@@ -66,6 +68,7 @@ export async function prepareGroupSweepTaskInTxn(
     kind: "group",
     objectId: gid,
     recordPin: runtimeMigrationPin(group),
+    legacyResidue: { control_groups: 1 },
   });
   if (!groupPin) return null;
   const taskPin = await nuqFdbMigrationStore.preparePinnedObjectInTxn(tn, {
@@ -167,12 +170,14 @@ export class NuqFdbGroupOps {
             kind: "sweeper_task",
             objectId: groupSweepTaskId(gid),
             recordPin: runtimeMigrationPin(gMeta),
+            legacyResidue: { control_sweeper_tasks: 1 },
           })
         : await nuqFdbMigrationStore.validateManagedObjectInTxn(tn, {
             teamId: gMeta.o,
             kind: "group",
             objectId: gid,
             recordPin: runtimeMigrationPin(gMeta),
+            legacyResidue: { control_groups: 1 },
           });
     const expiresAt = now + gMeta.t;
     const expiryGeneration = randomUUID();
@@ -300,6 +305,7 @@ export class NuQFdbJobGroup {
           kind: "group",
           objectId: id,
           recordPin: runtimeMigrationPin(existing),
+          legacyResidue: { control_groups: 1 },
         });
         return this.toInstance(id, existing);
       }
@@ -346,6 +352,58 @@ export class NuQFdbJobGroup {
     });
   }
 
+  /** Advances the bounded deployment backfill that restores owner rows cleared
+   * by pre-hook cancellation code. Migration discovery fails closed until the
+   * global scan reaches its durable completion cursor. */
+  public async backfillLegacyOwnerIndex(batchSize = 500): Promise<boolean> {
+    const pageSize = Math.max(1, batchSize);
+    return await this.db.doTn(async tn => {
+      const control = decodeJson<{ generation: string; phase: string }>(
+        await tn.get(this.ks.metricControl()),
+      );
+      if (!control?.generation || control.phase !== "ready") {
+        throw new MigrationStoreError(
+          "NUQ_FDB_GROUP_OWNER_INDEX_NOT_READY",
+          "group owner backfill requires a ready metric generation",
+          true,
+        );
+      }
+      const range = this.ks.groupAllRange();
+      const cursorKey = this.ks.sweeperCursor(
+        `${LEGACY_GROUP_OWNER_INDEX_PHASE}/${control.generation}`,
+        0,
+      );
+      const cursor = await tn.get(cursorKey);
+      if (cursor?.equals(range.end)) return true;
+      const begin = cursor
+        ? Buffer.concat([cursor as Buffer, Buffer.from([0])])
+        : range.begin;
+      const rows = await tn.getRangeAll(begin, range.end, { limit: pageSize });
+      for (const [key, value] of rows) {
+        let parts: unknown[];
+        try {
+          // groupDone carries a raw versionstamp suffix, not a complete tuple.
+          parts = this.ks.unpack(key as Buffer);
+        } catch {
+          continue;
+        }
+        if (parts[parts.length - 1] !== "meta") continue;
+        const group = decodeJson<GroupMeta>(value as Buffer);
+        if (!group || (group.s !== "active" && group.s !== "cancelled")) {
+          continue;
+        }
+        const gid = String(parts[parts.length - 2]);
+        tn.set(this.ks.ongoingGroup(group.o, gid), encodeJson({ c: group.c }));
+      }
+      if (rows.length < pageSize) {
+        tn.set(cursorKey, range.end);
+        return true;
+      }
+      tn.set(cursorKey, rows[rows.length - 1][0] as Buffer);
+      return false;
+    });
+  }
+
   public async hasUnfinishedByOwner(ownerId: string): Promise<boolean> {
     const owner = normalizeOwnerId(ownerId);
     if (owner === null) return false;
@@ -358,8 +416,40 @@ export class NuQFdbJobGroup {
           await tn.get(this.ks.groupMeta(gid)),
         );
         if (group?.s === "active" || group?.s === "cancelled") return true;
+        tn.clear(key as Buffer);
+      }
+      const control = decodeJson<{ generation: string; phase: string }>(
+        await tn.get(this.ks.metricControl()),
+      );
+      const all = this.ks.groupAllRange();
+      const cursor = control?.generation
+        ? await tn.get(
+            this.ks.sweeperCursor(
+              `${LEGACY_GROUP_OWNER_INDEX_PHASE}/${control.generation}`,
+              0,
+            ),
+          )
+        : null;
+      if (control?.phase !== "ready" || !cursor?.equals(all.end)) {
+        throw new MigrationStoreError(
+          "NUQ_FDB_GROUP_OWNER_INDEX_NOT_READY",
+          "legacy group owner index backfill is not complete",
+          true,
+        );
       }
       return false;
+    });
+  }
+
+  /** Restores the owner-discovery row cleared by pre-hook cancellation code. */
+  public async restoreLegacyCancelledGroupOwnerIndex(
+    id: string,
+  ): Promise<boolean> {
+    return await this.db.doTn(async tn => {
+      const group = decodeJson<GroupMeta>(await tn.get(this.ks.groupMeta(id)));
+      if (!group || group.s !== "cancelled") return false;
+      tn.set(this.ks.ongoingGroup(group.o, id), encodeJson({ c: group.c }));
+      return true;
     });
   }
 
@@ -381,6 +471,100 @@ export class NuQFdbJobGroup {
         if (g && g.s === "active") out.push(this.toInstance(gid, g));
       }
       return out;
+    });
+  }
+
+  /** Adopts cancellation work written before migration hooks. The legacy
+   * group pin becomes terminal only after an active sweeper continuation is
+   * established in the same transaction. */
+  public async adoptLegacyCancelledGroup(id: string): Promise<boolean> {
+    return await this.db.doTn(async tn => {
+      const group = decodeJson<GroupMeta>(await tn.get(this.ks.groupMeta(id)));
+      if (!group || group.s !== "cancelled") return false;
+      const groupPin =
+        (await nuqFdbMigrationStore.inspectPinInTxn(tn, "group", id)) ??
+        (await nuqFdbMigrationStore.reconcileManagedObjectInTxn(tn, {
+          teamId: group.o,
+          kind: "group",
+          objectId: id,
+          residue: { control_groups: 1 },
+          activateNonterminal: false,
+        }));
+      if (!groupPin) throw new Error(`Legacy group ${id} was not adopted`);
+      if (groupPin.lifecycle === "terminal") {
+        // Older rollout code could terminalize a cancelled group without first
+        // creating its continuation. Repair that state as an explicit legacy
+        // task in the same generation while it remains drainable.
+        let taskPin = await nuqFdbMigrationStore.inspectPinInTxn(
+          tn,
+          "sweeper_task",
+          groupSweepTaskId(id),
+        );
+        if (!taskPin) {
+          try {
+            taskPin = await nuqFdbMigrationStore.preparePinnedObjectInTxn(tn, {
+              teamId: group.o,
+              kind: "sweeper_task",
+              objectId: groupSweepTaskId(id),
+              admission: {
+                type: "legacy-backfill",
+                backend: groupPin.backend,
+                generation: groupPin.generation,
+              },
+              requiredBackend: "fdb",
+              residue: { control_sweeper_tasks: 1 },
+            });
+          } catch (error) {
+            if (
+              error instanceof MigrationStoreError &&
+              error.code === "NUQ_MIGRATION_STALE_GENERATION"
+            ) {
+              throw new MigrationStoreError(
+                "NUQ_MIGRATION_CANCELLED_GROUP_CONTINUATION_LOST",
+                `cancelled group ${id} was sealed before its sweeper continuation was recorded`,
+              );
+            }
+            throw error;
+          }
+          taskPin = await nuqFdbMigrationStore.reconcileManagedObjectInTxn(tn, {
+            teamId: group.o,
+            kind: "sweeper_task",
+            objectId: groupSweepTaskId(id),
+            recordPin: taskPin,
+            residue: { control_sweeper_tasks: 1 },
+          });
+        } else {
+          await nuqFdbMigrationStore.validatePinnedObjectInTxn(tn, {
+            teamId: group.o,
+            kind: "sweeper_task",
+            objectId: groupSweepTaskId(id),
+            backend: groupPin.backend,
+            generation: groupPin.generation,
+          });
+        }
+        tn.set(this.ks.taskGroupCancel(id), EMPTY);
+        tn.set(this.ks.taskGroupFinish(id), EMPTY);
+        return taskPin !== null;
+      }
+
+      await prepareGroupSweepTaskInTxn(tn, id, group);
+      await nuqFdbMigrationStore.reconcileManagedObjectInTxn(tn, {
+        teamId: group.o,
+        kind: "group",
+        objectId: id,
+        recordPin: runtimeMigrationPin(group),
+        residue: {},
+        terminal: true,
+      });
+      // Backfill the shared generation onto GroupMeta so later sweeper-task
+      // validation does not depend on the legacy missing-pin exception.
+      tn.set(
+        this.ks.groupMeta(id),
+        encodeJson(stampMigrationPin(group, groupPin)),
+      );
+      tn.set(this.ks.taskGroupCancel(id), EMPTY);
+      tn.set(this.ks.taskGroupFinish(id), EMPTY);
+      return true;
     });
   }
 

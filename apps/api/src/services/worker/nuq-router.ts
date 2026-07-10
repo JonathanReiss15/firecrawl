@@ -46,6 +46,8 @@ import {
   type DurablePgJobRemoval,
   type MigrationObjectKind,
   type MigrationObjectPin,
+  type MigrationResidue,
+  type NuQFdbLegacyJobDescriptor,
 } from "./nuq-fdb";
 import type { QueueOperationOptions } from "./nuq-worker-runtime";
 import {
@@ -240,11 +242,63 @@ async function legacyGenerationForBackend(
     );
     if (record.generation.backend === backend) return generation;
   }
-  throw new NuQRouterPinMismatchError(
-    "team",
-    teamId,
-    state.activeBackend,
-    backend,
+  return await fdbMutation(() =>
+    nuqFdbMigrationStore.ensureTerminalLegacyGeneration(teamId, backend),
+  );
+}
+
+async function adoptLegacyFdbObject(input: {
+  teamId: string;
+  kind: MigrationObjectKind;
+  objectId: string;
+  residue: Partial<MigrationResidue>;
+  terminal: boolean;
+}): Promise<MigrationObjectPin> {
+  const existing = await optionalFdbRead(() =>
+    nuqFdbMigrationStore.inspectPin(input.kind, input.objectId),
+  );
+  if (existing) return existing;
+  const generation = await legacyGenerationForBackend(
+    input.teamId,
+    "fdb",
+    input.terminal,
+  );
+  const prepared = await fdbMutation(() =>
+    nuqFdbMigrationStore.preparePinnedObject({
+      teamId: input.teamId,
+      kind: input.kind,
+      objectId: input.objectId,
+      admission: {
+        type: "legacy-backfill",
+        backend: "fdb",
+        generation,
+        terminal: input.terminal,
+      },
+      requiredBackend: "fdb",
+      residue: input.residue,
+    }),
+  );
+  if (input.terminal || prepared.lifecycle === "active") return prepared;
+  const current = await optionalFdbRead(() =>
+    nuqFdbMigrationStore.inspectPin(input.kind, input.objectId),
+  );
+  if (
+    !current ||
+    current.lifecycle === "terminal" ||
+    current.lifecycle === "active"
+  ) {
+    return current ?? prepared;
+  }
+  return await fdbMutation(() =>
+    nuqFdbMigrationStore.transitionObjectResidue({
+      teamId: input.teamId,
+      kind: input.kind,
+      objectId: input.objectId,
+      operationId: `nuq-router/v1/legacy-fdb-adopt/${input.kind}/${input.objectId}`,
+      fromLifecycle: "prepared",
+      toLifecycle: "active",
+      residue: input.residue,
+    }),
   );
 }
 
@@ -514,30 +568,28 @@ async function getCrawlQueueBackend(
   const existingPin = await optionalFdbRead(() =>
     nuqFdbMigrationStore.inspectPin("group", crawlId),
   );
-  if (backend === "fdb" && !existingPin) {
+  if (backend === "fdb") {
     const group = await optionalFdbRead(() => crawlGroupFdb.getGroup(crawlId));
     if (!group) return null;
-    const terminal = group.status !== "active";
-    const generation = await legacyGenerationForBackend(
-      group.ownerId,
-      "fdb",
-      terminal,
-    );
-    await fdbMutation(() =>
-      nuqFdbMigrationStore.preparePinnedObject({
+    if (group.status === "cancelled") {
+      await fdbMutation(() =>
+        crawlGroupFdb.restoreLegacyCancelledGroupOwnerIndex(crawlId),
+      );
+    }
+    if (!existingPin) {
+      await adoptLegacyFdbObject({
         teamId: group.ownerId,
         kind: "group",
         objectId: crawlId,
-        admission: {
-          type: "legacy-backfill",
-          backend: "fdb",
-          generation,
-          terminal,
-        },
-        requiredBackend: "fdb",
-        residue: { control_groups: terminal ? 0 : 1 },
-      }),
-    );
+        terminal: group.status === "completed",
+        residue: { control_groups: group.status === "completed" ? 0 : 1 },
+      });
+    }
+    // Always ensure the cancelled continuation. This repairs process death
+    // after group adoption but before sweeper work was published.
+    if (group.status === "cancelled") {
+      await fdbMutation(() => crawlGroupFdb.adoptLegacyCancelledGroup(crawlId));
+    }
   } else if (backend === "pg" && !existingPin) {
     const group = await crawlGroupPg.getGroup(crawlId);
     if (!group) return null;
@@ -573,6 +625,7 @@ async function getJobQueueBackend(
     kind?: MigrationObjectKind;
     hasFdbJob?: () => Promise<boolean>;
     hasPgJob?: () => Promise<boolean>;
+    inspectFdbJob?: () => Promise<NuQFdbLegacyJobDescriptor | null>;
   } = {},
 ): Promise<QueueBackend | null> {
   if (fdbForced()) return "fdb";
@@ -582,7 +635,7 @@ async function getJobQueueBackend(
   const marker = cachedMarker ?? hint ?? null;
   if (!fdbQueueEnabled()) return "pg";
   const kind = probes.kind ?? "scrape_job";
-  return await resolveAuthoritativeObjectBackend({
+  const backend = await resolveAuthoritativeObjectBackend({
     kind,
     objectId: jobId,
     marker,
@@ -593,6 +646,26 @@ async function getJobQueueBackend(
     probePg: probes.hasPgJob ?? (() => pgHasScrapeJob(jobId)),
     repairMarker: backend => repairBackendMarker(jobBackendKey(jobId), backend),
   });
+  if (
+    backend === "fdb" &&
+    !(await optionalFdbRead(() => nuqFdbMigrationStore.inspectPin(kind, jobId)))
+  ) {
+    const descriptor = await optionalFdbRead(
+      probes.inspectFdbJob ??
+        (() => scrapeQueueFdb.inspectLegacyMigrationObject(jobId)),
+    );
+    if (!descriptor) {
+      throw new NuQRouterObjectNotFoundError(kind, jobId);
+    }
+    await adoptLegacyFdbObject({
+      teamId: descriptor.teamId,
+      kind,
+      objectId: jobId,
+      terminal: descriptor.terminal,
+      residue: descriptor.residue,
+    });
+  }
+  return backend;
 }
 
 // Which backend a job belongs to at enqueue time. Crawl jobs follow their
@@ -811,7 +884,7 @@ async function acquireExternalSlot(
       externalSlotsFdb.renewPg(teamId, holderId, now + ttlMs),
     );
   }
-  await pushConcurrencyLimitActiveJob(teamId, holderId, ttlMs, now);
+  await pushConcurrencyLimitActiveJob(teamId, holderId, ttlMs);
   await syncFdbLimitToPgOccupancy(teamId);
 }
 
@@ -910,11 +983,14 @@ export async function reserveExternalSlot(
           "pg",
         );
       }
-      await activateRoutingPin(
-        pin,
-        { capacity_external_holders: 1 },
-        "external-holder-active",
-      );
+      if (pin) {
+        // Couple every successful Redis reservation/renewal to a durable,
+        // generation-fenced expiry. Redis disappearance alone is never
+        // terminal evidence; this deadline is the crash-recovery authority.
+        await fdbMutation(() =>
+          externalSlotsFdb.renewPg(teamId, holderId, Date.now() + ttlMs),
+        );
+      }
       return true;
     } catch (error) {
       // Do not tear down a pre-existing holder if only its renewal raced a
@@ -989,11 +1065,11 @@ export async function renewExternalSlot(
       holderId,
       ttlMs,
     );
-    if (renewed) {
-      await activateRoutingPin(
-        pin,
-        { capacity_external_holders: 1 },
-        "external-holder-active",
+    if (renewed && pin) {
+      // Renewal publishes a fresh generation before protected work continues;
+      // stale sweeper rows conflict-check this record and cannot retire it.
+      await fdbMutation(() =>
+        externalSlotsFdb.renewPg(teamId, holderId, Date.now() + ttlMs),
       );
     }
     return renewed;
@@ -1742,6 +1818,8 @@ class RoutedCrawlFinishedQueue {
       (await getJobQueueBackend(id, undefined, {
         kind: "crawl_finished",
         hasFdbJob: () => crawlFinishedQueueFdb.hasJob(id),
+        inspectFdbJob: () =>
+          crawlFinishedQueueFdb.inspectLegacyMigrationObject(id),
         hasPgJob: async () =>
           (await crawlFinishedQueuePg.getJob(id, logger)) !== null,
       })) === "fdb"
