@@ -24,7 +24,7 @@ import {
   setStatusQueued,
   setGroupJobIndex,
   bumpGroupStatusCount,
-  enrollQueueStatus,
+  alignQueueMetricStatus,
 } from "./ops";
 
 export type NuQFdbGroupStatus = "active" | "completed" | "cancelled";
@@ -133,7 +133,7 @@ export class NuqFdbGroupOps {
       };
       pushReady(tn, this.finishedKs, entry, txc);
       setStatusQueued(tn, this.finishedKs, fid);
-      await enrollQueueStatus(tn, this.finishedKs, fid, "queued");
+      await alignQueueMetricStatus(tn, this.finishedKs, fid);
       // pointer for group TTL cleanup to find the finished job's records
       tn.set(this.ks.groupFinishedJob(gid), Buffer.from(fid, "utf8"));
     }

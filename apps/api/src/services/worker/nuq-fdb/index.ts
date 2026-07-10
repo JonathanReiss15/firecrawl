@@ -51,6 +51,11 @@ export async function nuqFdbGetMetrics(): Promise<string> {
   const readiness = `# HELP firecrawl_nuq_fdb_metrics_ready Whether maintained FDB queue metrics are fully initialized
 # TYPE firecrawl_nuq_fdb_metrics_ready gauge
 `;
+  const workerLoadFamily = (workerLoad: number) =>
+    `# HELP firecrawl_nuq_fdb_pending_jobs Number of FDB scrape jobs currently admitted to workers or waiting in ready shards
+# TYPE firecrawl_nuq_fdb_pending_jobs gauge
+firecrawl_nuq_fdb_pending_jobs ${workerLoad}
+`;
   try {
     const [scrapeQueueMetrics, crawlFinishedQueueMetrics, workerLoad] =
       await Promise.all([
@@ -60,14 +65,16 @@ export async function nuqFdbGetMetrics(): Promise<string> {
       ]);
 
     return `${readiness}firecrawl_nuq_fdb_metrics_ready 1
-${scrapeQueueMetrics}${crawlFinishedQueueMetrics}# HELP firecrawl_nuq_fdb_pending_jobs Number of FDB scrape jobs currently admitted to workers or waiting in ready shards
-# TYPE firecrawl_nuq_fdb_pending_jobs gauge
-firecrawl_nuq_fdb_pending_jobs ${workerLoad}
-`;
+${scrapeQueueMetrics}${crawlFinishedQueueMetrics}${workerLoadFamily(workerLoad)}`;
   } catch (error) {
     if (error instanceof NuqFdbMetricsInitializingError) {
+      // Release A must preserve the established autoscaling family while the
+      // fixed generation is absent/building. Do not expose partial new
+      // families; the legacy fixed-shard/lease fallback is removed only at
+      // READY.
+      const workerLoad = await scrapeQueueFdb.getLegacyWorkerLoadCount();
       return `${readiness}firecrawl_nuq_fdb_metrics_ready 0
-`;
+${workerLoadFamily(workerLoad)}`;
     }
     throw error;
   }

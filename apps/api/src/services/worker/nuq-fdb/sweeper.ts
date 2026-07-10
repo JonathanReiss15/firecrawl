@@ -43,7 +43,7 @@ import {
   bumpGroupStatusCount,
   bumpTeamActive,
   GroupJobIndexValue,
-  bumpQueueStatus,
+  alignQueueMetricStatus,
 } from "./ops";
 import { NuQFdbQueue } from "./queue";
 import { NuqFdbExternalSlots } from "./slots";
@@ -254,8 +254,7 @@ export class NuqFdbSweeper {
             // requeue directly to ready -- the job retains its slots
             pushReady(tn, ks, entry, txc);
             setStatusQueued(tn, ks, id, st.st + 1);
-            await bumpQueueStatus(tn, ks, id, "active", -1);
-            await bumpQueueStatus(tn, ks, id, "queued", 1);
+            await alignQueueMetricStatus(tn, ks, id);
             if (meta.g && meta.f & F_COUNTABLE) {
               bumpGroupStatusCount(tn, ks, meta.g, "active", -1);
               bumpGroupStatusCount(tn, ks, meta.g, "queued", 1);
@@ -273,7 +272,7 @@ export class NuqFdbSweeper {
               ks.jobFailedReason(id),
               Buffer.from(STALL_FAILED_REASON, "utf8"),
             );
-            await bumpQueueStatus(tn, ks, id, "active", -1);
+            await alignQueueMetricStatus(tn, ks, id);
             if (meta.g && meta.f & F_GACC && queue.groupOps) {
               await queue.groupOps.terminalAccounting(
                 tn,
@@ -340,7 +339,6 @@ export class NuqFdbSweeper {
           if (!st || st.s !== "pending" || !st.loc) return;
           const meta = decodeJson<JobMeta>(await tn.get(ks.jobMeta(id)));
           if (!meta) return;
-          await bumpQueueStatus(tn, ks, id, "pending", -1);
           clearPendingPlacement(
             tn,
             ks,
@@ -369,6 +367,7 @@ export class NuqFdbSweeper {
             tn.set(ks.taskGroupFinish(meta.g), EMPTY);
           }
           deleteJobRecords(tn, ks, id);
+          await alignQueueMetricStatus(tn, ks, id);
         });
         stats.processedCount++;
       }
@@ -406,6 +405,7 @@ export class NuqFdbSweeper {
           // the job already holds its crawl slot; admit through the key gate
           // and then the team gate
           await admitThroughGates(tn, ks, e, txc);
+          await alignQueueMetricStatus(tn, ks, e.i);
         });
         stats.processedCount++;
       }
@@ -430,9 +430,16 @@ export class NuqFdbSweeper {
     if (due.length === 0) return;
     await this.db.doTn(async tn => {
       for (const [key] of due) {
-        const op = ks.unpackId(key as Buffer);
-        tn.clear(ks.claim(op));
-        tn.clear(key as Buffer);
+        const expiryKey = key as Buffer;
+        const op = ks.unpackId(expiryKey);
+        const expiresAt = Number(ks.unpackId(expiryKey, 1));
+        const marker = decodeJson<{ e: number }>(await tn.get(ks.claim(op)));
+        if (marker && marker.e === expiresAt && marker.e <= now) {
+          tn.clear(ks.claim(op));
+        }
+        // Always discard the observed expiry row. A mismatched/live marker has
+        // its own later durable row and must survive this stale-row cleanup.
+        tn.clear(expiryKey);
       }
     });
   }
@@ -467,6 +474,7 @@ export class NuqFdbSweeper {
           );
           if (status?.s === "ingesting" && status.op === op) {
             deleteJobRecords(tn, ks, id);
+            await alignQueueMetricStatus(tn, ks, id);
           }
           tn.clear(memberKey as Buffer);
         }
@@ -565,7 +573,6 @@ export class NuqFdbSweeper {
             if (!st || st.s !== "pending" || !st.loc) continue;
             const meta = decodeJson<JobMeta>(await tn.get(ks.jobMeta(id)));
             if (!meta) continue;
-            await bumpQueueStatus(tn, ks, id, "pending", -1);
             clearPendingPlacement(
               tn,
               ks,
@@ -588,6 +595,7 @@ export class NuqFdbSweeper {
             if (meta.f & F_COUNTABLE)
               bumpGroupStatusCount(tn, ks, gid, "pending", -1);
             deleteJobRecords(tn, ks, id);
+            await alignQueueMetricStatus(tn, ks, id);
             cleaned++;
             if (cleaned >= SWEEP_BATCH) break;
           }
@@ -706,6 +714,7 @@ export class NuqFdbSweeper {
           ) {
             deleteJobRecords(tn, ks, id);
           }
+          await alignQueueMetricStatus(tn, ks, id);
         }
       });
     }
@@ -734,17 +743,8 @@ export class NuqFdbSweeper {
             .getRangeAll(jr.begin, jr.end, { limit: 200 });
           for (const [mKey] of members) {
             const id = ks.unpackId(mKey as Buffer);
-            const status = decodeJson<JobStatusRecord>(
-              await tn.get(ks.jobStatus(id)),
-            );
-            if (
-              status?.s === "queued" ||
-              status?.s === "active" ||
-              status?.s === "pending"
-            ) {
-              await bumpQueueStatus(tn, ks, id, status.s, -1);
-            }
             deleteJobRecords(tn, ks, id);
+            await alignQueueMetricStatus(tn, ks, id);
             tn.clear(mKey as Buffer);
           }
           return members.length < 200;
@@ -758,17 +758,8 @@ export class NuqFdbSweeper {
         if (fjobBuf && queue.groupOps!.finishedKs) {
           const fid = fjobBuf.toString("utf8");
           const finishedKs = queue.groupOps!.finishedKs;
-          const status = decodeJson<JobStatusRecord>(
-            await tn.get(finishedKs.jobStatus(fid)),
-          );
-          if (
-            status?.s === "queued" ||
-            status?.s === "active" ||
-            status?.s === "pending"
-          ) {
-            await bumpQueueStatus(tn, finishedKs, fid, status.s, -1);
-          }
           deleteJobRecords(tn, finishedKs, fid);
+          await alignQueueMetricStatus(tn, finishedKs, fid);
         }
         const gr = ks.groupRange(gid);
         tn.clearRange(gr.begin, gr.end);

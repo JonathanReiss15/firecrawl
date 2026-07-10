@@ -9,7 +9,15 @@ import {
   getNuqFdbDatabase,
   getFdb,
 } from "../../services/worker/nuq-fdb/client";
-import { decodeI64, encodeJson } from "../../services/worker/nuq-fdb/keyspace";
+import {
+  decodeI64,
+  encodeI64,
+  encodeJson,
+  fnv1a,
+  METRIC_SHARDS,
+  METRIC_STATUSES,
+  NuqFdbMetricStatus,
+} from "../../services/worker/nuq-fdb/keyspace";
 import { newTxContext, uvSuffix } from "../../services/worker/nuq-fdb/ops";
 
 // These tests exercise the FDB queue core directly against a real FoundationDB
@@ -47,11 +55,22 @@ async function makeCtx(
     ...overrides,
   });
   const finishedQueue = new NuQFdbQueue(finishedName, { hasGroups: false });
-  await queue.backfillMetricCounts(100, true);
-  await finishedQueue.backfillMetricCounts(100, true);
+  await activateMetricGeneration(queue);
+  await activateMetricGeneration(finishedQueue);
   const group = new NuQFdbJobGroup(queue.ks, queue.groupOps!);
   const sweeper = new NuqFdbSweeper([queue, finishedQueue]);
   return { queue, finishedQueue, group, sweeper };
+}
+
+async function activateMetricGeneration(
+  queue: NuQFdbQueue,
+  batchSize = 100,
+): Promise<void> {
+  await queue.beginMetricCounterBackfill();
+  for (let page = 0; page < 10_000; page++) {
+    if (await queue.backfillMetricCounts(batchSize)) return;
+  }
+  throw new Error("metric generation did not become READY");
 }
 
 async function takeAll(
@@ -80,6 +99,55 @@ const gate = (limit: number, cap: number = 1_000_000) => ({
   teamLimit: limit,
   queueCap: cap,
 });
+
+async function readMetricInvariant(queue: NuQFdbQueue): Promise<{
+  generation: string;
+  ledger: Map<string, NuqFdbMetricStatus>;
+  counts: Record<NuqFdbMetricStatus, number>;
+}> {
+  const control = await queue.getMetricCounterBackfillStatus();
+  if (!control) throw new Error("metric control is absent");
+  return await getNuqFdbDatabase().doTn(async tn => {
+    const ledgerRange = queue.ks.metricLedgerRange(control.generation);
+    const rows = await tn
+      .snapshot()
+      .getRangeAll(ledgerRange.begin, ledgerRange.end);
+    const ledger = new Map<string, NuqFdbMetricStatus>();
+    for (const [key, value] of rows) {
+      ledger.set(
+        queue.ks.unpackId(key as Buffer),
+        (value as Buffer).toString("utf8") as NuqFdbMetricStatus,
+      );
+    }
+    const counts = Object.fromEntries(
+      await Promise.all(
+        METRIC_STATUSES.map(async status => [
+          status,
+          (
+            await Promise.all(
+              Array.from({ length: METRIC_SHARDS }, (_, shard) =>
+                tn
+                  .snapshot()
+                  .get(queue.ks.metricCount(control.generation, status, shard)),
+              ),
+            )
+          ).reduce((sum, value) => sum + decodeI64(value), 0),
+        ]),
+      ),
+    ) as Record<NuqFdbMetricStatus, number>;
+    return { generation: control.generation, ledger, counts };
+  });
+}
+
+function countsFromLedger(
+  ledger: Map<string, NuqFdbMetricStatus>,
+): Record<NuqFdbMetricStatus, number> {
+  const counts = Object.fromEntries(
+    METRIC_STATUSES.map(status => [status, 0]),
+  ) as Record<NuqFdbMetricStatus, number>;
+  for (const status of ledger.values()) counts[status]++;
+  return counts;
+}
 
 describeIf("NuQ FDB core", () => {
   afterAll(async () => {
@@ -449,8 +517,14 @@ describeIf("NuQ FDB core", () => {
     );
   });
 
-  test("metric backfill enrolls legacy jobs without negative transition debt", async () => {
+  test("fresh generation backfills legacy jobs and all terminal statuses", async () => {
     const { queue } = await makeCtx("metric-backfill");
+    const prior = await queue.getMetricCounterBackfillStatus();
+    expect(prior?.phase).toBe("ready");
+    expect(
+      await queue.invalidateMetricCounterGeneration(prior!.generation),
+    ).toBe(true);
+
     const owner = freshOwner();
     const ids = [randomUUID(), randomUUID(), randomUUID()];
     await queue.addJobs(
@@ -462,26 +536,17 @@ describeIf("NuQ FDB core", () => {
       gate(1),
     );
     const [active] = await takeAll(queue, 1);
-
-    await getNuqFdbDatabase().doTn(async tn => {
-      tn.clear(queue.ks.metricBackfillDone());
-      tn.clear(queue.ks.metricBackfillCursor());
-      for (const id of ids) tn.clear(queue.ks.jobMetricTracked(id));
-      for (const status of ["queued", "active", "pending"]) {
-        const range = queue.ks.metricStatusRange(status);
-        tn.clearRange(range.begin, range.end);
-      }
-    });
+    // A release-A transition while control is absent must remain valid legacy
+    // state and must not write into the invalidated generation.
+    await queue.jobFinish(active.id, active.lock!, null);
     await expect(queue.getMetrics()).rejects.toThrow(
       "NuQ FDB metrics are initializing",
     );
 
-    // This legacy transition happens before enrollment. It must not subtract
-    // from empty counters; the backfill observes the post-transition states.
-    await queue.jobFinish(active.id, active.lock!, null);
-
+    const building = await queue.beginMetricCounterBackfill();
+    expect(building.phase).toBe("backfill-jobs");
     let initialized = false;
-    for (let page = 0; page < 100 && !initialized; page++) {
+    for (let page = 0; page < 500 && !initialized; page++) {
       initialized = await queue.backfillMetricCounts(5);
     }
     expect(initialized).toBe(true);
@@ -490,11 +555,266 @@ describeIf("NuQ FDB core", () => {
       `nuq_fdb_queue_t_${RUN}_metric_backfill_job_count{status="queued"} 1`,
     );
     expect(metrics).toContain(
-      `nuq_fdb_queue_t_${RUN}_metric_backfill_job_count{status="active"} 0`,
+      `nuq_fdb_queue_t_${RUN}_metric_backfill_job_count{status="completed"} 1`,
     );
     expect(metrics).toContain(
       `nuq_fdb_queue_t_${RUN}_metric_backfill_job_count{status="backlog"} 1`,
     );
+  });
+
+  test("backfill pages raw legacy keys, survives cursor replay, and removes ledger orphans", async () => {
+    const { queue } = await makeCtx("metric-cursors");
+    const prior = await queue.getMetricCounterBackfillStatus();
+    await queue.invalidateMetricCounterGeneration(prior!.generation);
+
+    const owner = freshOwner();
+    const statuses = [
+      "pending",
+      "queued",
+      "active",
+      "completed",
+      "failed",
+    ] as const;
+    await getNuqFdbDatabase().doTn(async tn => {
+      for (const status of statuses) {
+        const id = `legacy-${status}`;
+        tn.set(
+          queue.ks.jobMeta(id),
+          encodeJson({ c: Date.now(), p: 0, o: owner, f: 0, dc: 120 }),
+        );
+        tn.set(queue.ks.jobStatus(id), encodeJson({ s: status, st: 0 }));
+        // Interleaved payload keys force many raw-key pages for one job.
+        for (let chunk = 0; chunk < 120; chunk++) {
+          tn.set(queue.ks.jobData(id, chunk), Buffer.from("x"));
+        }
+      }
+      tn.set(
+        queue.ks.jobMeta("legacy-cancelled"),
+        encodeJson({ c: Date.now(), p: 0, o: owner, f: 0, dc: 0 }),
+      );
+      tn.set(
+        queue.ks.jobStatus("legacy-cancelled"),
+        encodeJson({ s: "cancelled", st: 0 }),
+      );
+      tn.set(
+        queue.ks.jobMeta("legacy-ingesting"),
+        encodeJson({ c: Date.now(), p: 0, o: owner, f: 0, dc: 0 }),
+      );
+      tn.set(
+        queue.ks.jobStatus("legacy-ingesting"),
+        encodeJson({ s: "ingesting", st: 0 }),
+      );
+      tn.set(
+        queue.ks.jobStatus("status-only-tombstone"),
+        encodeJson({ s: "queued", st: 0 }),
+      );
+      tn.set(
+        queue.ks.jobMeta("meta-only-tombstone"),
+        encodeJson({ c: Date.now(), p: 0, o: owner, f: 0, dc: 0 }),
+      );
+    });
+
+    const building = await queue.beginMetricCounterBackfill();
+    expect(await queue.backfillMetricCounts(7)).toBe(false);
+    const cursor = await getNuqFdbDatabase().doTn(tn =>
+      tn.get(queue.ks.metricJobsCursor(building.generation)),
+    );
+    expect(cursor).toBeTruthy();
+
+    // Replay a committed page as if a process crashed before observing its
+    // result. Status-valued membership makes the repeat exactly idempotent.
+    await getNuqFdbDatabase().doTn(async tn => {
+      const range = queue.ks.jobRootRange();
+      tn.set(queue.ks.metricJobsCursor(building.generation), range.begin);
+      const orphan = "000-ledger-orphan";
+      tn.set(
+        queue.ks.metricLedger(building.generation, orphan),
+        Buffer.from("queued"),
+      );
+      tn.add(
+        queue.ks.metricCount(
+          building.generation,
+          "queued",
+          fnv1a(orphan) % METRIC_SHARDS,
+        ),
+        encodeI64(1),
+      );
+    });
+
+    // A protocol-aware insertion behind the durable cursor self-enrolls. A
+    // deletion during discovery atomically removes canonical state + ledger.
+    const newId = "000-new-behind-cursor";
+    await queue.addJob(newId, scrapeData(), { ownerId: owner }, UNLIMITED);
+    expect(await queue.removeJob("legacy-failed")).toBe(true);
+
+    await activateMetricGeneration(queue, 7);
+    const invariant = await readMetricInvariant(queue);
+    expect(invariant.ledger.get(newId)).toBe("queued");
+    expect(invariant.ledger.has("legacy-failed")).toBe(false);
+    expect(invariant.ledger.has("000-ledger-orphan")).toBe(false);
+    expect(invariant.ledger.has("legacy-cancelled")).toBe(false);
+    expect(invariant.ledger.has("legacy-ingesting")).toBe(false);
+    expect(invariant.ledger.has("status-only-tombstone")).toBe(false);
+    expect(invariant.counts).toEqual(countsFromLedger(invariant.ledger));
+    expect(invariant.counts).toEqual({
+      pending: 1,
+      queued: 2,
+      active: 1,
+      completed: 1,
+      failed: 0,
+    });
+  }, 60_000);
+
+  test("activation conflicts converge and rollback invalidation fences stale generations", async () => {
+    const { queue } = await makeCtx("metric-activation");
+    const ready = await queue.getMetricCounterBackfillStatus();
+    await queue.invalidateMetricCounterGeneration(ready!.generation);
+
+    const controls = await Promise.all(
+      Array.from({ length: 12 }, () => queue.beginMetricCounterBackfill()),
+    );
+    expect(new Set(controls.map(control => control.generation)).size).toBe(1);
+    const firstGeneration = controls[0].generation;
+    expect(
+      await queue.invalidateMetricCounterGeneration("wrong-generation"),
+    ).toBe(false);
+    expect((await queue.getMetricCounterBackfillStatus())?.generation).toBe(
+      firstGeneration,
+    );
+    expect(await queue.invalidateMetricCounterGeneration(firstGeneration)).toBe(
+      true,
+    );
+    await expect(queue.getMetrics()).rejects.toThrow(
+      "NuQ FDB metrics are initializing",
+    );
+
+    const next = await queue.beginMetricCounterBackfill();
+    expect(next.generation).not.toBe(firstGeneration);
+    await activateMetricGeneration(queue, 3);
+    expect((await queue.getMetricCounterBackfillStatus())?.phase).toBe("ready");
+  });
+
+  test("randomized lifecycle preserves canonical ledger and exact counters", async () => {
+    const { queue, sweeper } = await makeCtx("metric-randomized");
+    const owner = freshOwner();
+    const ids = Array.from(
+      { length: 40 },
+      (_, index) => `random-${String(index).padStart(3, "0")}`,
+    );
+    await queue.addJobs(
+      ids.map(id => ({
+        id,
+        data: scrapeData(),
+        options: { ownerId: owner },
+      })),
+      gate(13),
+    );
+    const active = await takeAll(queue, 13);
+    for (let index = 0; index < active.length; index++) {
+      if (index % 3 === 0) {
+        await queue.jobFinish(active[index].id, active[index].lock!, null);
+      } else if (index % 3 === 1) {
+        await queue.jobFail(active[index].id, active[index].lock!, "failed");
+      } else {
+        await queue.removeJob(active[index].id);
+      }
+    }
+    for (let index = 0; index < ids.length; index += 7) {
+      await queue.removeJob(ids[index]);
+    }
+    await sweeper.sweepOnce();
+
+    const invariant = await readMetricInvariant(queue);
+    expect(invariant.counts).toEqual(countsFromLedger(invariant.ledger));
+    for (const id of ids) {
+      const job = await queue.getJob(id);
+      const expected =
+        job?.status === "backlog"
+          ? "pending"
+          : job?.status === "queued" ||
+              job?.status === "active" ||
+              job?.status === "completed" ||
+              job?.status === "failed"
+            ? job.status
+            : undefined;
+      expect(invariant.ledger.get(id)).toBe(expected);
+    }
+  }, 30_000);
+
+  test("dequeue never waits for capped fire-and-forget claim cleanup", async () => {
+    let cleanupCalls = 0;
+    const never = new Promise<void>(() => {});
+    const { queue } = await makeCtx("claim-cleanup-cap", {
+      testHooks: {
+        runClaimCleanup: async () => {
+          cleanupCalls++;
+          await never;
+        },
+      },
+    });
+    const ids = Array.from({ length: 12 }, () => randomUUID());
+    await queue.addJobs(
+      ids.map(id => ({ id, data: scrapeData(), options: {} })),
+      UNLIMITED,
+    );
+
+    const startedAt = Date.now();
+    const jobs = await takeAll(queue, ids.length);
+    expect(jobs).toHaveLength(ids.length);
+    expect(Date.now() - startedAt).toBeLessThan(2_000);
+    expect(cleanupCalls).toBe(8);
+    expect(queue.getClaimCleanupInFlightForTest()).toBe(8);
+    const claims = await getNuqFdbDatabase().doTn(async tn => {
+      const range = queue.ks.claimRange();
+      return await tn.snapshot().getRangeAll(range.begin, range.end);
+    });
+    expect(claims).toHaveLength(ids.length);
+  });
+
+  test("claim cleanup errors fall back to expiry GC without racing live markers", async () => {
+    const { queue, sweeper } = await makeCtx("claim-cleanup-gc", {
+      leaseMs: 80,
+      testHooks: {
+        runClaimCleanup: async () => {
+          throw new Error("cleanup unavailable");
+        },
+      },
+    });
+    await queue.addJob(randomUUID(), scrapeData(), {}, UNLIMITED);
+    const job = await queue.getJobToProcess();
+    expect(job).not.toBeNull();
+
+    const futureOp = randomUUID();
+    const futureExpiry = Date.now() + 200;
+    await getNuqFdbDatabase().doTn(async tn => {
+      tn.set(
+        queue.ks.claim(futureOp),
+        encodeJson({ i: "future", l: "lock", e: futureExpiry }),
+      );
+      tn.set(queue.ks.claimExpiry(Date.now() - 1, futureOp), Buffer.alloc(0));
+      tn.set(queue.ks.claimExpiry(futureExpiry, futureOp), Buffer.alloc(0));
+    });
+    await sweeper.sweepOnce();
+    expect(
+      await getNuqFdbDatabase().doTn(tn => tn.get(queue.ks.claim(futureOp))),
+    ).toBeTruthy();
+
+    await new Promise(resolve => setTimeout(resolve, 250));
+    await sweeper.sweepOnce();
+    const remaining = await getNuqFdbDatabase().doTn(async tn => {
+      const claimRange = queue.ks.claimRange();
+      const expiryRange = queue.ks.claimExpiryRange();
+      return {
+        claims: await tn
+          .snapshot()
+          .getRangeAll(claimRange.begin, claimRange.end),
+        expiries: await tn
+          .snapshot()
+          .getRangeAll(expiryRange.begin, expiryRange.end),
+      };
+    });
+    expect(remaining.claims).toEqual([]);
+    expect(remaining.expiries).toEqual([]);
   });
 
   test("promotion respects priority order", async () => {

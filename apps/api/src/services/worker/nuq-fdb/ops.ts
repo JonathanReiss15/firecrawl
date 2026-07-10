@@ -3,6 +3,7 @@ import { logger as _logger } from "../../../lib/logger";
 import {
   NuqFdbKeyspace,
   QueueEntry,
+  JobMeta,
   JobStatusRecord,
   GroupMeta,
   PendingLoc,
@@ -19,6 +20,9 @@ import {
   F_COUNTABLE,
   F_KEY_GATED,
   METRIC_SHARDS,
+  METRIC_STATUSES,
+  NuqFdbMetricControl,
+  NuqFdbMetricStatus,
   fnv1a,
 } from "./keyspace";
 
@@ -56,41 +60,65 @@ export function setTeamActive(
   else tn.set(ks.teamActiveIndex(teamId), EMPTY);
 }
 
-export async function enrollQueueStatus(
-  tn: Transaction,
-  ks: NuqFdbKeyspace,
-  id: string,
-  status: "pending" | "queued" | "active",
-): Promise<void> {
-  // Activation is an explicit second rollout after all pre-membership writers
-  // have drained. Compatibility-version writers observe this shared key even
-  // when their local activation flag remains off.
-  const generation = await tn.get(ks.metricBackfillActive());
-  if (!generation) return;
-  const membership = await tn.get(ks.jobMetricTracked(id));
-  if (membership && (membership as Buffer).equals(generation as Buffer)) return;
-  tn.set(ks.jobMetricTracked(id), generation as Buffer);
-  const shard = fnv1a(id) % METRIC_SHARDS;
-  tn.add(ks.metricCount(status, shard), ONE);
+function decodeMetricControl(
+  value: Buffer | undefined | null,
+): NuqFdbMetricControl | null {
+  const control = decodeJson<NuqFdbMetricControl>(value);
+  if (!control) return null;
+  if (
+    control.format !== 3 ||
+    control.shards !== METRIC_SHARDS ||
+    !control.generation ||
+    !["backfill-jobs", "backfill-ledger", "ready"].includes(control.phase)
+  ) {
+    throw new Error("Unsupported NuQ FDB metric control record");
+  }
+  return control;
 }
 
-export async function bumpQueueStatus(
+export function canonicalQueueMetricStatus(
+  meta: JobMeta | null,
+  status: JobStatusRecord | null,
+): NuqFdbMetricStatus | null {
+  if (!meta || !status) return null;
+  return METRIC_STATUSES.includes(status.s as NuqFdbMetricStatus)
+    ? (status.s as NuqFdbMetricStatus)
+    : null;
+}
+
+// Reconciles the one status-valued ledger row with the final canonical job
+// state. The stable control read is deliberately normal (even when absent), so
+// activation/invalidation conflicts with every protocol-aware lifecycle write.
+// The ledger and both counter deltas commit atomically with the job mutation.
+export async function alignQueueMetricStatus(
   tn: Transaction,
   ks: NuqFdbKeyspace,
   id: string,
-  status: "pending" | "queued" | "active",
-  delta: 1 | -1,
 ): Promise<void> {
-  // Legacy jobs are enrolled by the durable sweeper backfill. Until then their
-  // transitions must not create negative counter debt.
-  const generation = await tn.get(ks.metricBackfillActive());
-  if (!generation) return;
-  const membership = await tn.get(ks.jobMetricTracked(id));
-  if (!membership || !(membership as Buffer).equals(generation as Buffer)) {
-    return;
+  const control = decodeMetricControl(await tn.get(ks.metricControl()));
+  if (!control) return;
+  const [meta, status] = await Promise.all([
+    tn.get(ks.jobMeta(id)).then(value => decodeJson<JobMeta>(value)),
+    tn.get(ks.jobStatus(id)).then(value => decodeJson<JobStatusRecord>(value)),
+  ]);
+  const next = canonicalQueueMetricStatus(meta, status);
+  const ledgerKey = ks.metricLedger(control.generation, id);
+  const priorBuf = await tn.get(ledgerKey);
+  const prior = priorBuf?.toString("utf8") as NuqFdbMetricStatus | undefined;
+  if (prior !== undefined && !METRIC_STATUSES.includes(prior)) {
+    throw new Error(`Invalid NuQ FDB metric ledger status for ${id}`);
   }
+  if (prior === next) return;
   const shard = fnv1a(id) % METRIC_SHARDS;
-  tn.add(ks.metricCount(status, shard), delta === 1 ? ONE : MINUS_ONE);
+  if (prior !== undefined) {
+    tn.add(ks.metricCount(control.generation, prior, shard), MINUS_ONE);
+  }
+  if (next === null) {
+    tn.clear(ledgerKey);
+  } else {
+    tn.add(ks.metricCount(control.generation, next, shard), ONE);
+    tn.set(ledgerKey, Buffer.from(next, "utf8"));
+  }
 }
 
 // Per-transaction-attempt context. uv makes versionstamp-suffixed keys unique
@@ -213,8 +241,7 @@ export async function promoteEntryToReady(
 ): Promise<void> {
   pushReady(tn, ks, e, txc);
   setStatusQueued(tn, ks, e.i);
-  await bumpQueueStatus(tn, ks, e.i, "pending", -1);
-  await bumpQueueStatus(tn, ks, e.i, "queued", 1);
+  await alignQueueMetricStatus(tn, ks, e.i);
   if (e.g && e.f & F_COUNTABLE) {
     tn.add(ks.groupStatusCount(e.g, "pending"), MINUS_ONE);
     tn.add(ks.groupStatusCount(e.g, "queued"), ONE);
@@ -444,6 +471,7 @@ export async function releaseSlotsAndPromote(
         } else {
           const loc = appendTeamPending(tn, ks, keyHead);
           setStatusPending(tn, ks, keyHead.i, loc);
+          await alignQueueMetricStatus(tn, ks, keyHead.i);
         }
       }
     }
@@ -474,6 +502,7 @@ export async function releaseSlotsAndPromote(
       const notBefore = now + crawlDelaySeconds * 1000;
       tn.set(ks.delayed(timeBucket(j2.i), notBefore, j2.i), encodeJson(j2));
       setStatusPending(tn, ks, j2.i, { k: "dl", at: notBefore });
+      await alignQueueMetricStatus(tn, ks, j2.i);
     } else {
       // key gate for the crawl-promoted job
       const j2KeyGated = !!j2.k && !!(j2.f & F_KEY_GATED);
@@ -498,6 +527,7 @@ export async function releaseSlotsAndPromote(
         // waits in the key gate; keeps the crawl slot
         const loc = appendKeyPending(tn, ks, j2);
         setStatusPending(tn, ks, j2.i, loc);
+        await alignQueueMetricStatus(tn, ks, j2.i);
       } else if (teamSlotFree()) {
         // the freed team slot goes directly to the crawl-promoted job
         await promoteEntryToReady(tn, ks, j2, txc);
@@ -510,6 +540,7 @@ export async function releaseSlotsAndPromote(
         // waits in the team gate; keeps the crawl + key slots
         const loc = appendTeamPending(tn, ks, j2);
         setStatusPending(tn, ks, j2.i, loc);
+        await alignQueueMetricStatus(tn, ks, j2.i);
       }
     }
   }
@@ -548,6 +579,7 @@ export async function admitThroughTeamGate(
   } else {
     const loc = appendTeamPending(tn, ks, e);
     setStatusPending(tn, ks, e.i, loc);
+    await alignQueueMetricStatus(tn, ks, e.i);
   }
 }
 
@@ -566,6 +598,7 @@ export async function admitThroughGates(
     if (kActive >= kLimit) {
       const loc = appendKeyPending(tn, ks, e);
       setStatusPending(tn, ks, e.i, loc);
+      await alignQueueMetricStatus(tn, ks, e.i);
       return;
     }
     tn.add(ks.keyActive(e.k), ONE);

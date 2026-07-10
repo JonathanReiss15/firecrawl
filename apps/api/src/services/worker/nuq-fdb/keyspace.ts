@@ -10,6 +10,21 @@ export const READY_SHARDS = config.NUQ_FDB_READY_SHARDS;
 export const TEAM_PENDING_SHARDS = config.NUQ_FDB_TEAM_PENDING_SHARDS;
 export const TIME_BUCKETS = config.NUQ_FDB_TIME_BUCKETS;
 export const METRIC_SHARDS = 32;
+export const METRIC_STATUSES = [
+  "pending",
+  "queued",
+  "active",
+  "completed",
+  "failed",
+] as const;
+export type NuqFdbMetricStatus = (typeof METRIC_STATUSES)[number];
+export type NuqFdbMetricPhase = "backfill-jobs" | "backfill-ledger" | "ready";
+export type NuqFdbMetricControl = {
+  format: 3;
+  generation: string;
+  phase: NuqFdbMetricPhase;
+  shards: 32;
+};
 
 export type NuqFdbJobStatus =
   | "ingesting" // reserved by a resumable multi-transaction enqueue
@@ -168,9 +183,6 @@ export class NuqFdbKeyspace {
   jobMeta(id: string): Buffer {
     return this.pack(["j", id, "m"]);
   }
-  jobMetricTracked(id: string): Buffer {
-    return this.pack(["j", id, "mt"]);
-  }
   jobStatus(id: string): Buffer {
     return this.pack(["j", id, "s"]);
   }
@@ -221,8 +233,14 @@ export class NuqFdbKeyspace {
   claim(op: string): Buffer {
     return this.pack(["claim", op]);
   }
+  claimRange() {
+    return this.packRange(["claim"]);
+  }
   claimExpiry(atMs: number, op: string): Buffer {
     return this.pack(["claimexp", atMs, op]);
+  }
+  claimExpiryRange() {
+    return this.packRange(["claimexp"]);
   }
   claimExpiryScanRange(untilMs: number) {
     return {
@@ -366,21 +384,31 @@ export class NuqFdbKeyspace {
     return this.packRange(["rn"]);
   }
 
-  // === Maintained queue metrics
-  metricCount(status: string, shard: number): Buffer {
-    return this.pack(["mn", status, shard]);
+  // === Generation-scoped maintained queue metrics
+  // Writers always normal-read the stable control key, including while it is
+  // absent. Generation data is immutable after invalidation and therefore can
+  // never leak into a later activation.
+  metricControl(): Buffer {
+    return this.pack(["metrics", "v3", "ctl"]);
   }
-  metricStatusRange(status: string) {
-    return this.packRange(["mn", status]);
+  metricCount(
+    generation: string,
+    status: NuqFdbMetricStatus,
+    shard: number,
+  ): Buffer {
+    return this.pack(["metrics", "v3", "gen", generation, "n", status, shard]);
   }
-  metricBackfillActive(): Buffer {
-    return this.pack(["mn-backfill", "active-v2"]);
+  metricLedger(generation: string, id: string): Buffer {
+    return this.pack(["metrics", "v3", "gen", generation, "status", id]);
   }
-  metricBackfillCursor(): Buffer {
-    return this.pack(["mn-backfill", "cursor"]);
+  metricLedgerRange(generation: string) {
+    return this.packRange(["metrics", "v3", "gen", generation, "status"]);
   }
-  metricBackfillDone(): Buffer {
-    return this.pack(["mn-backfill", "done"]);
+  metricJobsCursor(generation: string): Buffer {
+    return this.pack(["metrics", "v3", "gen", generation, "cursor", "jobs"]);
+  }
+  metricLedgerCursor(generation: string): Buffer {
+    return this.pack(["metrics", "v3", "gen", generation, "cursor", "ledger"]);
   }
 
   // === Time-ordered indexes (sweeper-owned)

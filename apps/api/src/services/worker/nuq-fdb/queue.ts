@@ -22,6 +22,9 @@ import {
   timeBucket,
   READY_SHARDS,
   METRIC_SHARDS,
+  METRIC_STATUSES,
+  NuqFdbMetricControl,
+  NuqFdbMetricStatus,
   F_GATED,
   F_CRAWL_GATED,
   F_LISTENABLE,
@@ -58,8 +61,7 @@ import {
   setGroupJobIndex,
   bumpGroupStatusCount,
   bumpTeamActive,
-  enrollQueueStatus,
-  bumpQueueStatus,
+  alignQueueMetricStatus,
   GroupJobIndexValue,
 } from "./ops";
 import { NuqFdbGroupOps } from "./groups";
@@ -68,6 +70,8 @@ import { NuqFdbGroupOps } from "./groups";
 // importing queue types does not eagerly load libfdb_c in PG-only processes.
 const TransactionOptionCode = {
   Timeout: 500 as FdbTransactionOptionCode,
+  RetryLimit: 501 as FdbTransactionOptionCode,
+  MaxRetryDelay: 502 as FdbTransactionOptionCode,
 };
 
 const DATA_CHUNK_BYTES = 90 * 1024;
@@ -81,6 +85,10 @@ const ENQUEUE_MAX_JOBS_PER_TRANSACTION = 250;
 const MAX_INLINE_RETURNVALUE_BYTES = 8 * 1024 * 1024;
 const MAX_FAILED_REASON_BYTES = 90 * 1024;
 const INGEST_TTL_MS = 60 * 60 * 1000;
+const CLAIM_CLEANUP_MAX_IN_FLIGHT = 8;
+const CLAIM_CLEANUP_TIMEOUT_MS = 250;
+const CLAIM_CLEANUP_RETRY_LIMIT = 1;
+const CLAIM_CLEANUP_MAX_RETRY_DELAY_MS = 25;
 
 export { QueueFullError };
 
@@ -204,6 +212,7 @@ function semanticDataHash(value: unknown): string {
 export class NuQFdbQueue<JobData = any, JobReturnValue = any> {
   public readonly ks: NuqFdbKeyspace;
   public readonly groupOps: NuqFdbGroupOps | null;
+  private claimCleanupInFlight = 0;
 
   constructor(
     public readonly queueName: string,
@@ -220,6 +229,7 @@ export class NuQFdbQueue<JobData = any, JobReturnValue = any> {
         afterStageBatch?: (batch: number) => Promise<void>;
         afterPublishBatch?: (batch: number) => Promise<void>;
         simulateClaimCommitUnknown?: () => boolean;
+        runClaimCleanup?: (cleanup: () => Promise<void>) => Promise<void>;
       };
     },
   ) {
@@ -445,8 +455,17 @@ export class NuQFdbQueue<JobData = any, JobReturnValue = any> {
       encodedJsonBytes(meta) +
       ks.jobStatus(job.id).length +
       encodedJsonBytes({ s: "pending", st: 0 }) +
-      ks.jobMetricTracked(job.id).length +
-      1 +
+      // One generation ledger row and two fixed-counter atomic mutations are
+      // the worst-case metric transition footprint.
+      ks.metricLedger("00000000-0000-0000-0000-000000000000", job.id).length +
+      "completed".length +
+      2 *
+        (ks.metricCount(
+          "00000000-0000-0000-0000-000000000000",
+          "completed",
+          METRIC_SHARDS - 1,
+        ).length +
+          8) +
       ks.readyPrefix(READY_SHARDS - 1, priority).length +
       encodedJsonBytes(entry) +
       ks.readyShardCount(READY_SHARDS - 1).length +
@@ -519,24 +538,10 @@ export class NuQFdbQueue<JobData = any, JobReturnValue = any> {
     const ks = this.ks;
     await this.db.doTn(async tn => {
       if (await tn.get(ks.ingest(op))) return;
-      const metricGeneration = await tn.get(ks.metricBackfillActive());
-      const completedGeneration = await tn.get(ks.metricBackfillDone());
-      if (
-        metricGeneration &&
-        (!completedGeneration ||
-          !(completedGeneration as Buffer).equals(
-            metricGeneration as Buffer,
-          )) &&
-        !(await tn.get(ks.metricBackfillCursor()))
-      ) {
-        const jobs = ks.jobRootRange();
-        const existing = await tn.getRangeAll(jobs.begin, jobs.end, {
-          limit: 1,
-        });
-        if (existing.length === 0) {
-          tn.set(ks.metricBackfillDone(), metricGeneration as Buffer);
-        }
-      }
+      // Even an ingest that only creates the untracked "ingesting" state must
+      // conflict with activation/invalidation. Publication performs the actual
+      // canonical ledger alignment.
+      await tn.get(ks.metricControl());
       const createdAt = Date.now();
       const meta: IngestMeta = {
         o: ownerId ?? "",
@@ -674,6 +679,7 @@ export class NuQFdbQueue<JobData = any, JobReturnValue = any> {
         job.dataChunks.forEach((chunk, chunkIndex) =>
           tn.set(ks.jobData(job.id, chunkIndex), chunk),
         );
+        await alignQueueMetricStatus(tn, ks, job.id);
       }
     });
   }
@@ -866,12 +872,7 @@ export class NuQFdbQueue<JobData = any, JobReturnValue = any> {
           }
         }
 
-        await enrollQueueStatus(
-          tn,
-          ks,
-          j.id,
-          placedStatus === "pending" ? "pending" : "queued",
-        );
+        await alignQueueMetricStatus(tn, ks, j.id);
         if (groupAccounted && gid) {
           tn.add(ks.groupRemaining(gid), ONE);
           setGroupJobIndex(tn, ks, gid, j.id, countable, placedStatus);
@@ -929,6 +930,7 @@ export class NuQFdbQueue<JobData = any, JobReturnValue = any> {
           );
           if (status?.s === "ingesting" && status.op === op) {
             deleteJobRecords(tn, ks, id);
+            await alignQueueMetricStatus(tn, ks, id);
           }
           tn.clear(jobKey as Buffer);
         }
@@ -1167,7 +1169,9 @@ export class NuQFdbQueue<JobData = any, JobReturnValue = any> {
 
       const st = decodeJson<JobStatusRecord>(await tn.get(ks.jobStatus(e.i)));
       if (!st || st.s !== "queued") {
-        // tombstone (removed job) -- slots were released by the remover
+        // Tombstone (removed job) -- slots were released by the remover. The
+        // placement GC still participates in the metric control protocol.
+        await alignQueueMetricStatus(tn, ks, e.i);
         return "dropped";
       }
 
@@ -1187,8 +1191,8 @@ export class NuQFdbQueue<JobData = any, JobReturnValue = any> {
               tn.set(ks.taskGroupFinish(e.g), EMPTY);
             }
           }
-          await bumpQueueStatus(tn, ks, e.i, "queued", -1);
           deleteJobRecords(tn, ks, e.i);
+          await alignQueueMetricStatus(tn, ks, e.i);
           await releaseSlotsAndPromote(
             tn,
             ks,
@@ -1205,7 +1209,7 @@ export class NuQFdbQueue<JobData = any, JobReturnValue = any> {
         await tn.snapshot().get(ks.jobMeta(e.i)),
       );
       if (!meta) {
-        await bumpQueueStatus(tn, ks, e.i, "queued", -1);
+        await alignQueueMetricStatus(tn, ks, e.i);
         return "dropped";
       }
       const dataRange = ks.jobDataRange(e.i);
@@ -1226,8 +1230,7 @@ export class NuQFdbQueue<JobData = any, JobReturnValue = any> {
         encodeJson({ i: e.i, l: lock, e: exp } satisfies ClaimRecord),
       );
       tn.set(ks.claimExpiry(exp, op), EMPTY);
-      await bumpQueueStatus(tn, ks, e.i, "queued", -1);
-      await bumpQueueStatus(tn, ks, e.i, "active", 1);
+      await alignQueueMetricStatus(tn, ks, e.i);
       if (e.g && e.f & F_COUNTABLE) {
         bumpGroupStatusCount(tn, ks, e.g, "queued", -1);
         bumpGroupStatusCount(tn, ks, e.g, "active", 1);
@@ -1253,16 +1256,50 @@ export class NuQFdbQueue<JobData = any, JobReturnValue = any> {
       // ambiguous. The operation marker must return the original claim.
       result = await this.db.doTn(claimTransaction);
     }
-    // The marker must survive retries of the claim transaction, then can be
-    // discarded. A failed cleanup is harmless and never affects accounting.
-    await this.db
-      .doTn(async tn => {
-        const marker = decodeJson<ClaimRecord>(await tn.get(ks.claim(op)));
-        if (marker) tn.clear(ks.claimExpiry(marker.e, op));
-        tn.clear(ks.claim(op));
-      })
-      .catch(() => {});
+    // A definite result may return immediately. Marker cleanup is best-effort,
+    // bounded per queue, and has no wait queue; durable claimExpiry is the
+    // fallback whenever the cap, timeout, error, or process exit wins.
+    if (result !== "empty" && result !== "dropped") {
+      this.scheduleClaimCleanup(op);
+    }
     return result;
+  }
+
+  private scheduleClaimCleanup(op: string): void {
+    if (this.claimCleanupInFlight >= CLAIM_CLEANUP_MAX_IN_FLIGHT) return;
+    this.claimCleanupInFlight++;
+    const cleanup = async () => {
+      await this.db.doTn(async tn => {
+        tn.setOption(TransactionOptionCode.Timeout, CLAIM_CLEANUP_TIMEOUT_MS);
+        tn.setOption(
+          TransactionOptionCode.RetryLimit,
+          CLAIM_CLEANUP_RETRY_LIMIT,
+        );
+        tn.setOption(
+          TransactionOptionCode.MaxRetryDelay,
+          CLAIM_CLEANUP_MAX_RETRY_DELAY_MS,
+        );
+        const marker = decodeJson<ClaimRecord>(await tn.get(this.ks.claim(op)));
+        if (marker) tn.clear(this.ks.claimExpiry(marker.e, op));
+        tn.clear(this.ks.claim(op));
+      });
+    };
+    const run = this.options.testHooks?.runClaimCleanup;
+    void (run ? run(cleanup) : cleanup())
+      .catch(error => {
+        _logger.debug("NuQ FDB claim cleanup deferred to sweeper", {
+          canonicalLog: "nuq-fdb/claim_cleanup_deferred",
+          queueName: this.queueName,
+          error,
+        });
+      })
+      .finally(() => {
+        this.claimCleanupInFlight--;
+      });
+  }
+
+  public getClaimCleanupInFlightForTest(): number {
+    return this.claimCleanupInFlight;
   }
 
   private async readClaimedJob(
@@ -1322,6 +1359,7 @@ export class NuQFdbQueue<JobData = any, JobReturnValue = any> {
         encodeJson({ l: lock }),
       );
       tn.set(ks.jobStatus(id), encodeJson({ ...st, e: effectiveExp }));
+      await alignQueueMetricStatus(tn, ks, id);
       return true;
     });
   }
@@ -1370,12 +1408,21 @@ export class NuQFdbQueue<JobData = any, JobReturnValue = any> {
       const txc = newTxContext();
       const now = Date.now();
       const st = decodeJson<JobStatusRecord>(await tn.get(ks.jobStatus(id)));
-      if (!st) return false;
+      if (!st) {
+        await alignQueueMetricStatus(tn, ks, id);
+        return false;
+      }
       // idempotency: a commit_unknown_result retry lands here
-      if (st.s === outcome && st.l === lock) return true;
+      if (st.s === outcome && st.l === lock) {
+        await alignQueueMetricStatus(tn, ks, id);
+        return true;
+      }
       if (st.s !== "active" || st.l !== lock) return false;
       const meta = decodeJson<JobMeta>(await tn.get(ks.jobMeta(id)));
-      if (!meta) return false;
+      if (!meta) {
+        await alignQueueMetricStatus(tn, ks, id);
+        return false;
+      }
 
       const rec: JobStatusRecord = {
         s: outcome,
@@ -1406,7 +1453,7 @@ export class NuQFdbQueue<JobData = any, JobReturnValue = any> {
         );
       }
 
-      await bumpQueueStatus(tn, ks, id, "active", -1);
+      await alignQueueMetricStatus(tn, ks, id);
 
       // Shed job input data early on cloud (results live in GCS) and always for
       // ZDR. Group members are exempt on the plain cloud path: the crawl-finish
@@ -1593,9 +1640,15 @@ export class NuQFdbQueue<JobData = any, JobReturnValue = any> {
       const txc = newTxContext();
       const now = Date.now();
       const st = decodeJson<JobStatusRecord>(await tn.get(ks.jobStatus(id)));
-      if (!st || st.s === "cancelled") return false;
+      if (!st || st.s === "cancelled") {
+        await alignQueueMetricStatus(tn, ks, id);
+        return false;
+      }
       const meta = decodeJson<JobMeta>(await tn.get(ks.jobMeta(id)));
-      if (!meta) return false;
+      if (!meta) {
+        await alignQueueMetricStatus(tn, ks, id);
+        return false;
+      }
       const entry: QueueEntry = {
         i: id,
         o: meta.o,
@@ -1610,7 +1663,6 @@ export class NuQFdbQueue<JobData = any, JobReturnValue = any> {
       const accounted = !!(meta.f & F_GACC) && !!meta.g && !!this.groupOps;
 
       if (st.s === "pending") {
-        await bumpQueueStatus(tn, ks, id, "pending", -1);
         clearPendingPlacement(
           tn,
           ks,
@@ -1640,8 +1692,8 @@ export class NuQFdbQueue<JobData = any, JobReturnValue = any> {
           tn.set(ks.taskGroupFinish(meta.g!), EMPTY);
         }
         deleteJobRecords(tn, ks, id);
+        await alignQueueMetricStatus(tn, ks, id);
       } else if (st.s === "queued" || st.s === "active") {
-        await bumpQueueStatus(tn, ks, id, st.s, -1);
         tn.set(
           ks.jobStatus(id),
           encodeJson({ s: "cancelled", st: st.st } satisfies JobStatusRecord),
@@ -1672,6 +1724,7 @@ export class NuQFdbQueue<JobData = any, JobReturnValue = any> {
           ),
           EMPTY,
         );
+        await alignQueueMetricStatus(tn, ks, id);
       } else {
         // terminal: drop the records, like the PG row delete
         if (accounted) {
@@ -1679,6 +1732,7 @@ export class NuQFdbQueue<JobData = any, JobReturnValue = any> {
           if (countable) bumpGroupStatusCount(tn, ks, meta.g!, st.s, -1);
         }
         deleteJobRecords(tn, ks, id);
+        await alignQueueMetricStatus(tn, ks, id);
       }
       return true;
     });
@@ -1930,126 +1984,228 @@ export class NuQFdbQueue<JobData = any, JobReturnValue = any> {
     );
   }
 
-  // Enrolls one bounded page of jobs created before maintained counters were
-  // introduced. A per-job marker and normal status reads make this conflict
-  // safely with concurrent transitions. Metrics stay unavailable until the
-  // durable cursor reaches the end, rather than reporting partial counts.
+  private decodeMetricControl(
+    value: Buffer | undefined | null,
+  ): NuqFdbMetricControl | null {
+    const control = decodeJson<NuqFdbMetricControl>(value);
+    if (!control) return null;
+    if (
+      control.format !== 3 ||
+      control.shards !== METRIC_SHARDS ||
+      !control.generation ||
+      !["backfill-jobs", "backfill-ledger", "ready"].includes(control.phase)
+    ) {
+      throw new Error("Unsupported NuQ FDB metric control record");
+    }
+    return control;
+  }
+
+  // Explicit release-B activation API. Concurrent callers converge on the one
+  // generation that wins the normal control-key conflict.
+  public async beginMetricCounterBackfill(): Promise<NuqFdbMetricControl> {
+    const requested: NuqFdbMetricControl = {
+      format: 3,
+      generation: randomUUID(),
+      phase: "backfill-jobs",
+      shards: METRIC_SHARDS,
+    };
+    return await this.db.doTn(async tn => {
+      const current = this.decodeMetricControl(
+        await tn.get(this.ks.metricControl()),
+      );
+      if (current) return current;
+      tn.set(this.ks.metricControl(), encodeJson(requested));
+      return requested;
+    });
+  }
+
+  public async getMetricCounterBackfillStatus(): Promise<NuqFdbMetricControl | null> {
+    return await this.db.doTn(async tn =>
+      this.decodeMetricControl(
+        await tn.snapshot().get(this.ks.metricControl()),
+      ),
+    );
+  }
+
+  // Deployment rollback must call this before any pre-protocol writer returns.
+  // Old generation keys intentionally remain isolated for later bounded GC.
+  public async invalidateMetricCounterGeneration(
+    expectedGeneration?: string,
+  ): Promise<boolean> {
+    return await this.db.doTn(async tn => {
+      const control = this.decodeMetricControl(
+        await tn.get(this.ks.metricControl()),
+      );
+      if (!control) return true;
+      if (
+        expectedGeneration !== undefined &&
+        control.generation !== expectedGeneration
+      ) {
+        return false;
+      }
+      tn.clear(this.ks.metricControl());
+      return true;
+    });
+  }
+
+  // Advances one durable raw-key page. Job discovery intentionally scans every
+  // legacy job key so status-only tombstones and jobs with very large payloads
+  // are handled exactly. The second, separately enumerable ledger pass removes
+  // orphans before READY. Cursor, all alignments, and phase change are atomic.
   public async backfillMetricCounts(
     batchSize = 100,
     activate = false,
   ): Promise<boolean> {
-    const ks = this.ks;
-    const requestedGeneration = Buffer.from(randomUUID(), "utf8");
+    if (activate) await this.beginMetricCounterBackfill();
+    const pageSize = Math.max(1, batchSize);
     return await this.db.doTn(async tn => {
-      let generation = await tn.get(ks.metricBackfillActive());
-      if (!generation) {
-        if (!activate) return false;
-        // Activation is allowed only after old writers have drained. Start
-        // from a fresh bounded generation so an interrupted pre-activation
-        // attempt cannot leak stale values into the authoritative counters.
-        for (const status of ["pending", "queued", "active"]) {
-          for (let shard = 0; shard < METRIC_SHARDS; shard++) {
-            tn.clear(ks.metricCount(status, shard));
+      const control = this.decodeMetricControl(
+        await tn.get(this.ks.metricControl()),
+      );
+      if (!control) return false;
+      if (control.phase === "ready") return true;
+
+      if (control.phase === "backfill-jobs") {
+        const range = this.ks.jobRootRange();
+        const cursor = await tn.get(
+          this.ks.metricJobsCursor(control.generation),
+        );
+        const begin = cursor
+          ? Buffer.concat([cursor as Buffer, Buffer.from([0])])
+          : range.begin;
+        const rows = await tn.getRangeAll(begin, range.end, {
+          limit: pageSize,
+        });
+        const ids = new Set<string>();
+        for (const [key] of rows) {
+          const parts = this.ks.unpack(key as Buffer);
+          if (parts[2] === "j" && typeof parts[3] === "string") {
+            ids.add(parts[3]);
           }
         }
-        tn.clear(ks.metricBackfillCursor());
-        tn.clear(ks.metricBackfillDone());
-        tn.set(ks.metricBackfillActive(), requestedGeneration);
-        generation = requestedGeneration;
+        for (const id of ids) {
+          await alignQueueMetricStatus(tn, this.ks, id);
+        }
+        if (rows.length < pageSize) {
+          tn.clear(this.ks.metricJobsCursor(control.generation));
+          tn.set(
+            this.ks.metricControl(),
+            encodeJson({ ...control, phase: "backfill-ledger" }),
+          );
+        } else {
+          tn.set(
+            this.ks.metricJobsCursor(control.generation),
+            rows[rows.length - 1][0] as Buffer,
+          );
+        }
+        return false;
       }
-      const completedGeneration = await tn.get(ks.metricBackfillDone());
-      if (
-        completedGeneration &&
-        (completedGeneration as Buffer).equals(generation as Buffer)
-      ) {
-        return true;
-      }
-      const range = ks.jobRootRange();
-      const cursor = await tn.get(ks.metricBackfillCursor());
+
+      const range = this.ks.metricLedgerRange(control.generation);
+      const cursor = await tn.get(
+        this.ks.metricLedgerCursor(control.generation),
+      );
       const begin = cursor
         ? Buffer.concat([cursor as Buffer, Buffer.from([0])])
         : range.begin;
       const rows = await tn.getRangeAll(begin, range.end, {
-        limit: Math.max(1, batchSize),
+        limit: pageSize,
       });
-
-      for (const [key, value] of rows) {
-        const parts = ks.unpack(key as Buffer);
-        if (parts[4] !== "m" || typeof parts[3] !== "string") continue;
-        const id = parts[3];
-        const membership = await tn.get(ks.jobMetricTracked(id));
-        if (membership && (membership as Buffer).equals(generation as Buffer)) {
-          continue;
-        }
-        const meta = decodeJson<JobMeta>(value as Buffer);
-        const status = decodeJson<JobStatusRecord>(
-          await tn.get(ks.jobStatus(id)),
+      for (const [key] of rows) {
+        await alignQueueMetricStatus(
+          tn,
+          this.ks,
+          this.ks.unpackId(key as Buffer),
         );
-        if (!meta || !status) continue;
-        if (
-          status.s === "pending" ||
-          status.s === "queued" ||
-          status.s === "active"
-        ) {
-          await enrollQueueStatus(tn, ks, id, status.s);
-        } else {
-          tn.set(ks.jobMetricTracked(id), generation as Buffer);
-        }
       }
-
-      if (rows.length < Math.max(1, batchSize)) {
-        tn.clear(ks.metricBackfillCursor());
-        tn.set(ks.metricBackfillDone(), generation as Buffer);
+      if (rows.length < pageSize) {
+        tn.clear(this.ks.metricLedgerCursor(control.generation));
+        tn.set(
+          this.ks.metricControl(),
+          encodeJson({ ...control, phase: "ready" }),
+        );
         return true;
       }
-      tn.set(ks.metricBackfillCursor(), rows[rows.length - 1][0] as Buffer);
+      tn.set(
+        this.ks.metricLedgerCursor(control.generation),
+        rows[rows.length - 1][0] as Buffer,
+      );
       return false;
     });
   }
 
+  public async getLegacyWorkerLoadCount(): Promise<number> {
+    const ks = this.ks;
+    return await this.db.doTn(async tn => {
+      const [readyRows, activeRows] = await Promise.all([
+        tn
+          .snapshot()
+          .getRangeAll(
+            ks.readyShardCountRange().begin,
+            ks.readyShardCountRange().end,
+          ),
+        tn.snapshot().getRangeAll(ks.leaseRange().begin, ks.leaseRange().end),
+      ]);
+      const queued = readyRows.reduce(
+        (sum, [, value]) => sum + Math.max(0, decodeI64(value as Buffer)),
+        0,
+      );
+      return queued + activeRows.length;
+    });
+  }
+
   public async getWorkerLoadCount(): Promise<number> {
-    const counts = await this.getMetricCounts();
-    return counts.queued + counts.active;
+    try {
+      const counts = await this.getMetricCounts();
+      return counts.queued + counts.active;
+    } catch (error) {
+      if (error instanceof NuqFdbMetricsInitializingError) {
+        return await this.getLegacyWorkerLoadCount();
+      }
+      throw error;
+    }
   }
 
   private async getMetricCounts(): Promise<Record<NuQJobStatusCompat, number>> {
     const ks = this.ks;
     return await this.db.doTn(async tn => {
-      const internal = ["queued", "active", "pending"] as const;
-      // Read only the fixed-width maintained counter set plus its readiness
-      // marker. The scrape footprint is independent of jobs, teams, leases,
-      // ready entries, and unexpected keys in these prefixes.
-      const [generation, ready, rows] = await Promise.all([
-        tn.snapshot().get(ks.metricBackfillActive()),
-        tn.snapshot().get(ks.metricBackfillDone()),
-        Promise.all(
-          internal.map(status =>
-            Promise.all(
-              Array.from({ length: METRIC_SHARDS }, (_, shard) =>
-                tn.snapshot().get(ks.metricCount(status, shard)),
-              ),
-            ),
-          ),
-        ),
-      ]);
-      if (
-        !generation ||
-        !ready ||
-        !(ready as Buffer).equals(generation as Buffer)
-      ) {
+      const snapshot = tn.snapshot();
+      // READY has one control read plus exactly 5x32 generation-scoped point
+      // reads. No job, ledger, placement, lease, or team range is touched.
+      const control = this.decodeMetricControl(
+        await snapshot.get(ks.metricControl()),
+      );
+      if (!control || control.phase !== "ready") {
         throw new NuqFdbMetricsInitializingError(
           "NuQ FDB metrics are initializing",
         );
       }
-      const totals = rows.map(statusRows =>
-        statusRows.reduce((sum, value) => sum + decodeI64(value), 0),
+      const rows = await Promise.all(
+        METRIC_STATUSES.map(status =>
+          Promise.all(
+            Array.from({ length: METRIC_SHARDS }, (_, shard) =>
+              snapshot.get(ks.metricCount(control.generation, status, shard)),
+            ),
+          ),
+        ),
       );
+      const totals = new Map<NuqFdbMetricStatus, number>();
+      METRIC_STATUSES.forEach((status, index) => {
+        const total = rows[index].reduce(
+          (sum, value) => sum + decodeI64(value),
+          0,
+        );
+        if (!Number.isSafeInteger(total) || total < 0) {
+          throw new Error(`Corrupt NuQ FDB metric counter ${status}: ${total}`);
+        }
+        totals.set(status, total);
+      });
       return {
-        queued: Math.max(0, totals[0]),
-        active: Math.max(0, totals[1]),
-        completed: 0,
-        failed: 0,
-        backlog: Math.max(0, totals[2]),
+        queued: totals.get("queued")!,
+        active: totals.get("active")!,
+        completed: totals.get("completed")!,
+        failed: totals.get("failed")!,
+        backlog: totals.get("pending")!,
       };
     });
   }
