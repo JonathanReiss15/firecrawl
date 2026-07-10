@@ -1185,6 +1185,9 @@ export class NuqFdbSweeper {
     const range = ks.claimExpiryScanRange(now);
     while (Date.now() - startedAt < PARTITION_WORK_BUDGET_MS) {
       const due = await this.dueBatch(claim, range);
+      this.observeDue(claim, "claim_expiry", due, key =>
+        Number(ks.unpackId(key, 1)),
+      );
       if (due.length === 0) break;
       await this.renewClaim(claim);
       await this.db.doTn(async tn => {
@@ -1215,6 +1218,9 @@ export class NuqFdbSweeper {
     const range = ks.ingestExpiryScanRange(now);
     while (Date.now() - startedAt < PARTITION_WORK_BUDGET_MS) {
       const due = await this.dueBatch(claim, range, 20);
+      this.observeDue(claim, "ingest_expiry", due, key =>
+        Number(ks.unpackId(key, 1)),
+      );
       if (due.length === 0) break;
       let incomplete = false;
       for (const [expiryKey] of due) {

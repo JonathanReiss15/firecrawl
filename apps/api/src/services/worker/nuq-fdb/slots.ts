@@ -196,7 +196,10 @@ export class NuqFdbExternalSlots {
         const holderId = String(parts[legacy ? 5 : 6]);
         const generation = legacy ? undefined : String(parts[7]);
         if (!owner) {
-          await this.db.doTn(async tn => tn.clear(key as Buffer));
+          await this.db.doTn(async tn => {
+            if (guard) await guard(tn);
+            tn.clear(key as Buffer);
+          });
           continue;
         }
         await this.db.doTn(async tn => {

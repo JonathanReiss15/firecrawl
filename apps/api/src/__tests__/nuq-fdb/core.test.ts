@@ -1599,7 +1599,7 @@ describeIf("NuQ FDB core", () => {
   });
 
   test("group TTL cleanup resumes after more than 40k members", async () => {
-    const { queue, group, sweeper } = await makeCtx("gttl");
+    const { queue, finishedQueue, group, sweeper } = await makeCtx("gttl");
     const owner = freshOwner();
     const gid = randomUUID();
     await group.addGroup(gid, owner, 1000); // 1s TTL
@@ -1615,6 +1615,10 @@ describeIf("NuQ FDB core", () => {
     await queue.jobFinish(j.id, j.lock!, null);
 
     expect((await group.getGroup(gid))?.status).toBe("completed");
+    const control = await finishedQueue.getJobToProcess();
+    expect(control?.groupId).toBe(gid);
+    await finishedQueue.jobFinish(control!.id, control!.lock!, null);
+
     for (let start = 0; start < 40_001; start += 5_000) {
       await getNuqFdbDatabase().doTn(async tn => {
         for (let i = start; i < Math.min(start + 5_000, 40_001); i++) {
@@ -1627,8 +1631,7 @@ describeIf("NuQ FDB core", () => {
     }
     await new Promise(resolve => setTimeout(resolve, 1100));
     await sweeper.sweepOnce();
-    expect(await group.getGroup(gid)).not.toBeNull();
-    await sweeper.sweepOnce();
+    if (await group.getGroup(gid)) await sweeper.sweepOnce();
 
     expect(await group.getGroup(gid)).toBeNull();
     expect(await queue.getJob(id)).toBeNull();

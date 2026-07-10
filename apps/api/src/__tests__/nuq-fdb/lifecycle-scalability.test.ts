@@ -148,6 +148,41 @@ describeIf("NuQ FDB lifecycle scalability", () => {
     await slots.release(owner, holder);
   }, 30_000);
 
+  test("malformed external expiry cleanup remains ownership-guarded", async () => {
+    const { queue, slots } = await makeCtx("external-malformed");
+    const owner = randomUUID();
+    await slots.acquire(owner, "live-holder", 60_000);
+
+    const holder = "malformed-holder";
+    const bucket = timeBucket(holder);
+    const expiresAt = Date.now() - 1_000;
+    const malformedKey = queue.ks.pack(["xsexp", bucket, expiresAt, holder]);
+    await getNuqFdbDatabase().doTn(async tn =>
+      tn.set(malformedKey, encodeJson({})),
+    );
+
+    const ownershipLost = new Error("ownership transferred");
+    let guardCalls = 0;
+    await expect(
+      slots.sweepExpiredBucket(Date.now(), bucket, async () => {
+        guardCalls++;
+        if (guardCalls === 2) throw ownershipLost;
+      }),
+    ).rejects.toBe(ownershipLost);
+    expect(guardCalls).toBe(2);
+    await getNuqFdbDatabase().doTn(async tn => {
+      expect(await tn.get(malformedKey)).toBeTruthy();
+    });
+    expect(await queue.getTeamActiveCount(owner)).toBe(1);
+
+    await slots.sweepExpiredBucket(Date.now(), bucket);
+    await getNuqFdbDatabase().doTn(async tn => {
+      expect(await tn.get(malformedKey)).toBeFalsy();
+    });
+    expect(await queue.getTeamActiveCount(owner)).toBe(1);
+    await slots.release(owner, "live-holder");
+  }, 30_000);
+
   test("renewable pass stays fenced while scanning past more than 25k stale rows", async () => {
     const { queue, finishedQueue, group } = await makeCtx("cancel-25k");
     const sweeper = new NuqFdbSweeper([queue, finishedQueue], [], {
@@ -491,6 +526,46 @@ describeIf("NuQ FDB lifecycle scalability", () => {
     expect(sweeper.getMetrics()).not.toContain(
       `queue="${queue.queueName}",index="delay",partition="0"`,
     );
+  }, 30_000);
+
+  test("claim and ingest expiry metrics use bounded ownership labels", async () => {
+    const { queue } = await makeCtx("overdue-ingest");
+    const sweeper = new NuqFdbSweeper([queue]);
+    const dueAt = Date.now() - 5_000;
+    await getNuqFdbDatabase().doTn(async tn => {
+      for (let i = 0; i < 3; i++) {
+        const claimOp = `claim-${i}`;
+        tn.set(queue.ks.claim(claimOp), EMPTY);
+        tn.set(queue.ks.claimExpiry(dueAt + i, claimOp), EMPTY);
+        tn.set(queue.ks.ingestExpiry(dueAt + i, `ingest-${i}`), EMPTY);
+      }
+    });
+
+    await sweeper.sweepOnce();
+    const metricLines = sweeper
+      .getMetrics()
+      .split("\n")
+      .filter(line => line.startsWith("firecrawl_nuq_fdb_sweeper_"));
+    expect(
+      metricLines.filter(line =>
+        line.includes(
+          `queue="${queue.queueName}",index="claim_expiry",partition="0"`,
+        ),
+      ),
+    ).toHaveLength(1);
+    expect(
+      metricLines.filter(line =>
+        line.includes(
+          `queue="${queue.queueName}",index="ingest_expiry",partition="0"`,
+        ),
+      ),
+    ).toHaveLength(1);
+    expect(metricLines.join("\n")).not.toContain("claim-0");
+    expect(metricLines.join("\n")).not.toContain("ingest-0");
+
+    await sweeper.sweepOnce();
+    expect(sweeper.getMetrics()).not.toContain('index="claim_expiry"');
+    expect(sweeper.getMetrics()).not.toContain('index="ingest_expiry"');
   }, 30_000);
 
   test("an ownership transfer removes the previous sweeper's stale label", async () => {
