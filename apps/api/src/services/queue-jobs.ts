@@ -5,13 +5,9 @@ import {
   getCrawlConcurrencyLimitActiveJobs,
   getTeamQueueLimit,
   MAX_BACKLOG_TIMEOUT_MS,
-  pushConcurrencyLimitActiveJob,
   pushConcurrencyLimitedJob,
   pushConcurrencyLimitedJobs,
-  pushCrawlConcurrencyLimitActiveJob,
-  removeConcurrencyLimitActiveJob,
   removeConcurrencyLimitedJobs,
-  removeCrawlConcurrencyLimitActiveJob,
   QueueFullError,
 } from "../lib/concurrency-limit";
 import { logger as _logger } from "../lib/logger";
@@ -43,6 +39,7 @@ import {
 import { serializeTraceContext } from "../lib/otel-tracer";
 import { isSelfHosted } from "../lib/deployment";
 import { MONITOR_CHECK_STALE_TIMEOUT_MS } from "./monitoring/stale";
+import { getRedisConnection } from "./queue-service";
 import {
   completePreparedNuQPgPublication,
   prepareNuQPgPublication,
@@ -102,27 +99,160 @@ async function compensateAmbiguousBacklogRedisPublication(
   }
 }
 
-async function rollbackActiveReservations(
-  jobs: readonly { jobId: string; data: ScrapeJobData }[],
-): Promise<void> {
-  const cleanup: Promise<unknown>[] = [];
-  for (const job of jobs) {
-    cleanup.push(removeConcurrencyLimitActiveJob(job.data.team_id, job.jobId));
-    if (job.data.crawl_id) {
-      cleanup.push(
-        removeCrawlConcurrencyLimitActiveJob(job.data.crawl_id, job.jobId),
-      );
-    }
+type ReservationOwnership = {
+  zsetKey: string;
+  markerKey: string;
+  jobId: string;
+  token: string;
+  previousScore: string | null;
+  reservedScore: string;
+};
+
+type ActiveReservation = {
+  jobId: string;
+  data: ScrapeJobData;
+  ownerships: ReservationOwnership[];
+};
+
+async function acquireActiveReservation(
+  zsetKey: string,
+  markerKey: string,
+  jobId: string,
+): Promise<ReservationOwnership | null> {
+  const token = crypto.randomUUID();
+  const now = Date.now();
+  const reservedScore = String(now + 60 * 1000);
+  const result = (await getRedisConnection().eval(
+    `local current = redis.call('ZSCORE', KEYS[1], ARGV[1])
+     if redis.call('EXISTS', KEYS[2]) == 1 then
+       return {2, current or '', ''}
+     end
+     if current and tonumber(current) > tonumber(ARGV[2]) then
+       return {0, current, ''}
+     end
+     redis.call('ZADD', KEYS[1], ARGV[3], ARGV[1])
+     redis.call('SET', KEYS[2], cjson.encode({token=ARGV[4], previous=current or '', reserved=ARGV[3]}), 'PX', ARGV[5])
+     return {1, current or '', ARGV[3]}`,
+    2,
+    zsetKey,
+    markerKey,
+    jobId,
+    now,
+    reservedScore,
+    token,
+    2 * 60 * 1000,
+  )) as [number, string, string];
+  const status = Number(result[0]);
+  if (status === 2) {
+    throw new Error(`PG active reservation is already pending for ${jobId}`);
   }
-  const results = await Promise.allSettled(cleanup);
+  if (status !== 1) return null;
+  return {
+    zsetKey,
+    markerKey,
+    jobId,
+    token,
+    previousScore: result[1] || null,
+    reservedScore: result[2],
+  };
+}
+
+async function rollbackReservationOwnership(
+  ownership: ReservationOwnership,
+): Promise<void> {
+  await getRedisConnection().eval(
+    `local raw = redis.call('GET', KEYS[2])
+     if not raw then return 0 end
+     local marker = cjson.decode(raw)
+     if marker.token ~= ARGV[2] then return 0 end
+     local current = redis.call('ZSCORE', KEYS[1], ARGV[1])
+     if current and current == ARGV[3] then
+       if ARGV[4] == '' then
+         redis.call('ZREM', KEYS[1], ARGV[1])
+       else
+         redis.call('ZADD', KEYS[1], ARGV[4], ARGV[1])
+       end
+     end
+     redis.call('DEL', KEYS[2])
+     return 1`,
+    2,
+    ownership.zsetKey,
+    ownership.markerKey,
+    ownership.jobId,
+    ownership.token,
+    ownership.reservedScore,
+    ownership.previousScore ?? "",
+  );
+}
+
+async function rollbackActiveReservations(
+  reservations: readonly ActiveReservation[],
+): Promise<void> {
+  const results = await Promise.allSettled(
+    reservations.flatMap(reservation =>
+      reservation.ownerships.map(rollbackReservationOwnership),
+    ),
+  );
   const failures = results.filter(
     (result): result is PromiseRejectedResult => result.status === "rejected",
   );
   if (failures.length > 0) {
     throw new AggregateError(
       failures.map(failure => failure.reason),
-      "Failed to roll back PG queue reservations",
+      "Failed to restore PG queue reservations",
     );
+  }
+}
+
+async function commitActiveReservations(
+  reservations: readonly ActiveReservation[],
+): Promise<void> {
+  const redis = getRedisConnection();
+  await Promise.all(
+    reservations.flatMap(reservation =>
+      reservation.ownerships.map(ownership =>
+        redis.eval(
+          `local raw = redis.call('GET', KEYS[1])
+           if not raw then return 0 end
+           local marker = cjson.decode(raw)
+           if marker.token == ARGV[1] then return redis.call('DEL', KEYS[1]) end
+           return 0`,
+          1,
+          ownership.markerKey,
+          ownership.token,
+        ),
+      ),
+    ),
+  );
+}
+
+async function reserveActiveJob(
+  jobId: string,
+  data: ScrapeJobData,
+): Promise<ActiveReservation> {
+  const reservation: ActiveReservation = { jobId, data, ownerships: [] };
+  try {
+    const teamOwnership = await acquireActiveReservation(
+      `concurrency-limiter:${data.team_id}`,
+      `nuq:pg-reservation:team:${data.team_id}:${jobId}`,
+      jobId,
+    );
+    if (teamOwnership) reservation.ownerships.push(teamOwnership);
+    if (data.crawl_id) {
+      const sc = await getCrawl(data.crawl_id);
+      if (sc?.crawlerOptions?.delay || sc?.maxConcurrency) {
+        const crawlOwnership = await acquireActiveReservation(
+          `crawl-concurrency-limiter:${data.crawl_id}`,
+          `nuq:pg-reservation:crawl:${data.crawl_id}:${jobId}`,
+          jobId,
+        );
+        if (crawlOwnership) reservation.ownerships.push(crawlOwnership);
+      }
+    }
+    return reservation;
+  } catch (error) {
+    await rollbackActiveReservations([reservation]);
+    throw error;
   }
 }
 
@@ -344,24 +474,9 @@ async function _addScrapeJobToBullMQPg(
 
   const publication = pgPublication(jobId, webScraperOptions, "active");
   const prepared = await prepareNuQPgPublication([publication]);
-  const reserved = [{ jobId, data: webScraperOptions }];
+  const reserved: ActiveReservation[] = [];
   try {
-    await pushConcurrencyLimitActiveJob(
-      webScraperOptions.team_id,
-      jobId,
-      60 * 1000,
-    );
-
-    if (webScraperOptions.crawl_id) {
-      const sc = await getCrawl(webScraperOptions.crawl_id);
-      if (sc?.crawlerOptions?.delay || sc?.maxConcurrency) {
-        await pushCrawlConcurrencyLimitActiveJob(
-          webScraperOptions.crawl_id,
-          jobId,
-          60 * 1000,
-        );
-      }
-    }
+    reserved.push(await reserveActiveJob(jobId, webScraperOptions));
 
     const job = await scrapeQueue.addJob(jobId, webScraperOptions, {
       priority,
@@ -373,6 +488,7 @@ async function _addScrapeJobToBullMQPg(
       await rollbackActiveReservations(reserved);
     }
     await completePreparedNuQPgPublication(prepared);
+    await commitActiveReservations(reserved);
     return job;
   } catch (error) {
     if (error instanceof NuQPublicationConflictError) {
@@ -420,26 +536,10 @@ async function _addScrapeJobsToBullMQ(
     pgPublication(job.jobId, job.data, "active"),
   );
   const prepared = await prepareNuQPgPublication(publications);
-  const reserved: { jobId: string; data: ScrapeJobData }[] = [];
+  const reserved: ActiveReservation[] = [];
   try {
     for (const job of jobs) {
-      await pushConcurrencyLimitActiveJob(
-        job.data.team_id,
-        job.jobId,
-        60 * 1000,
-      );
-      reserved.push({ jobId: job.jobId, data: job.data });
-
-      if (job.data.crawl_id) {
-        const sc = await getCrawl(job.data.crawl_id);
-        if (sc?.crawlerOptions?.delay || sc?.maxConcurrency) {
-          await pushCrawlConcurrencyLimitActiveJob(
-            job.data.crawl_id,
-            job.jobId,
-            60 * 1000,
-          );
-        }
-      }
+      reserved.push(await reserveActiveJob(job.jobId, job.data));
     }
 
     const result = await scrapeQueue.addJobs(
@@ -463,6 +563,7 @@ async function _addScrapeJobsToBullMQ(
       reserved.filter(job => terminalIds.has(job.jobId.toLowerCase())),
     );
     await completePreparedNuQPgPublication(prepared);
+    await commitActiveReservations(reserved);
     return result;
   } catch (error) {
     if (error instanceof NuQPublicationConflictError) {

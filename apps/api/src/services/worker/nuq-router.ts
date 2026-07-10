@@ -460,7 +460,6 @@ async function cleanPgRedisJobResidue(
   const pipeline = redis.pipeline();
   pipeline.del(`cq-job:${id}`);
   pipeline.del(`cq-claim:${id}`);
-  pipeline.del(pgRemoveResidueKey(id));
   for (const queueKey of queueKeys) pipeline.zrem(queueKey, id);
   if (ownerId) {
     pipeline.zrem(constructConcurrencyLimitKey(ownerId), id);
@@ -478,6 +477,9 @@ async function cleanPgRedisJobResidue(
       `Failed to remove Redis queue residue for ${id}`,
     );
   }
+  // Keep the recovery descriptor until every destructive cleanup command is
+  // known successful. A failed final DEL is harmless and retryable.
+  await redis.del(pgRemoveResidueKey(id));
 }
 
 class RoutedScrapeQueue {
