@@ -1,6 +1,7 @@
 import {
-  mirrorExternalSlotAcquire,
   mirrorExternalSlotRelease,
+  renewExternalSlot,
+  reserveExternalSlot,
 } from "./nuq-router";
 import { isSelfHosted } from "../../lib/deployment";
 import { ScrapeJobTimeoutError, TransportableError } from "../../lib/error";
@@ -53,7 +54,7 @@ async function acquire(
   };
 }
 
-async function acquireBlocking(
+async function acquireAuthoritativeBlocking(
   teamId: string,
   holderId: string,
   limit: number,
@@ -64,63 +65,32 @@ async function acquireBlocking(
     signal: AbortSignal;
   },
 ): Promise<{ limited: boolean; removed: number }> {
-  await ensure();
-
   const deadline = Date.now() + options.timeout_ms;
-  const keys = semaphoreKeys(teamId);
-
   let delay = options.base_delay_ms;
-  let totalRemoved = 0;
-  let failedOnce = false;
-
+  let limited = false;
   const endTimer = semaphoreAcquireDuration.startTimer();
 
-  do {
-    if (options.signal.aborted) {
+  while (true) {
+    if (options.signal.aborted || deadline < Date.now()) {
       throw new ScrapeJobTimeoutError();
     }
-
-    if (deadline < Date.now()) {
-      throw new ScrapeJobTimeoutError();
-    }
-
-    const [granted, _count, _removed] = await runScript<
-      [number, number, number]
-    >(
-      scripts.semaphore.acquire,
-      [keys.leases],
-      [holderId, limit, SEMAPHORE_TTL],
-    );
-
-    totalRemoved++;
-
-    if (granted === 1) {
+    if (await reserveExternalSlot(teamId, holderId, SEMAPHORE_TTL, limit)) {
+      // An unbounded FDB retry can outlive the caller's deadline. Never start
+      // protected work after a late reservation; release the owned holder first.
+      if (options.signal.aborted || deadline < Date.now()) {
+        await mirrorExternalSlotRelease(teamId, holderId);
+        throw new ScrapeJobTimeoutError();
+      }
       endTimer();
-      return { limited: failedOnce, removed: totalRemoved };
+      return { limited, removed: 0 };
     }
-
-    failedOnce = true;
-
+    limited = true;
     const jitter = Math.floor(
       Math.random() * Math.max(1, Math.floor(delay / 4)),
     );
-    await new Promise(r => setTimeout(r, delay + jitter));
-
+    await new Promise(resolve => setTimeout(resolve, delay + jitter));
     delay = Math.min(options.max_delay_ms, Math.floor(delay * 1.5));
-  } while (true);
-}
-
-async function heartbeat(teamId: string, holderId: string): Promise<boolean> {
-  await ensure();
-
-  const keys = semaphoreKeys(teamId);
-  return (
-    (await runScript<number>(
-      scripts.semaphore.heartbeat,
-      [keys.leases],
-      [holderId, SEMAPHORE_TTL],
-    )) === 1
-  );
+  }
 }
 
 async function release(teamId: string, holderId: string): Promise<void> {
@@ -163,30 +133,29 @@ function startHeartbeat(
   const promise = (async () => {
     try {
       while (!stopped) {
-        await mirrorSlotAcquire(teamId, holderId, mirrorState).catch(() => {
-          _logger.warn("Failed to update concurrency limit active job", {
-            teamId,
-            jobId: holderId,
-          });
-        });
-        if (stopped) break;
-
-        const ok = await heartbeat(teamId, holderId);
-        if (!ok) {
+        // This routed holder is the shared queue-capacity authority on both PG
+        // and FDB. A swept/expired holder must never be resurrected from a
+        // stale request limit; losing ownership makes protected work fail closed.
+        const renewed = await renewExternalSlot(
+          teamId,
+          holderId,
+          SEMAPHORE_TTL,
+        );
+        if (!renewed) {
           throw new TransportableError("SCRAPE_TIMEOUT", "heartbeat_failed");
         }
+        mirrorState.acquired = true;
         if (stopped) break;
         await sleep(intervalMs);
       }
     } catch (error) {
       if (!stopped) {
         _logger.error("Error in semaphore heartbeat loop", { error });
+        throw error;
       }
     }
 
-    return Promise.reject(
-      new Error("heartbeat loop stopped unexpectedly"),
-    ) as never;
+    throw new Error("heartbeat loop stopped unexpectedly");
   })();
 
   return {
@@ -202,15 +171,6 @@ function startHeartbeat(
 // Sync scrapes occupy queue capacity so async jobs see the team's real load.
 // Router-owned durable holder pins survive rollout flag changes and remove the
 // old convention that an in-memory backend choice was sufficient authority.
-async function mirrorSlotAcquire(
-  teamId: string,
-  holderId: string,
-  state: MirrorState,
-): Promise<void> {
-  await mirrorExternalSlotAcquire(teamId, holderId, 60 * 1000);
-  state.acquired = true;
-}
-
 async function mirrorSlotRelease(
   teamId: string,
   holderId: string,
@@ -238,20 +198,27 @@ async function withSemaphore<T>(
     return await func(false);
   }
 
-  const { limited } = await acquireBlocking(teamId, holderId, limit, {
-    base_delay_ms: 25,
-    max_delay_ms: 250,
-    timeout_ms: timeoutMs,
-    signal,
-  });
+  // Reserve the backend-specific ledger shared with queue jobs. The legacy
+  // `nuq:semaphore` ZSET counts only sync work and cannot safely govern this
+  // path during normal PG operation or a backend transition.
+  const { limited } = await acquireAuthoritativeBlocking(
+    teamId,
+    holderId,
+    limit,
+    {
+      base_delay_ms: 25,
+      max_delay_ms: 250,
+      timeout_ms: timeoutMs,
+      signal,
+    },
+  );
 
   const endTimer = semaphoreHoldDuration.startTimer();
-  const mirrorState: MirrorState = { acquired: false };
+  const mirrorState: MirrorState = { acquired: true };
   let hb: ReturnType<typeof startHeartbeat> | null = null;
 
   activeSemaphores.inc();
   try {
-    await mirrorSlotAcquire(teamId, holderId, mirrorState);
     hb = startHeartbeat(teamId, holderId, SEMAPHORE_TTL / 2, mirrorState);
 
     const result = await Promise.race([func(limited), hb.promise]);
@@ -268,8 +235,6 @@ async function withSemaphore<T>(
 
     activeSemaphores.dec();
     endTimer();
-
-    await release(teamId, holderId).catch(() => {});
   }
 }
 

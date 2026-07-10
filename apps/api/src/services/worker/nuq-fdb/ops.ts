@@ -139,6 +139,29 @@ export function setTeamActive(
   tn.set(ks.teamLedgerGcIndex(teamId), EMPTY);
 }
 
+// Keep the release/promotion gate synchronized with the limit observed by any
+// authoritative admission path, not only queue ingestion. Returns the current
+// active count from the same conflictful transaction.
+export async function synchronizeTeamLimitInTxn(
+  tn: Transaction,
+  ks: NuqFdbKeyspace,
+  teamId: string,
+  limit: number,
+): Promise<number> {
+  const storedBuf = await tn.get(ks.teamLimit(teamId));
+  const stored = storedBuf ? decodeI64(storedBuf) : null;
+  if (stored !== limit) {
+    tn.set(ks.teamLimit(teamId), encodeI64(limit));
+    // Also indexes teams whose configured limit is zero.
+    tn.add(ks.teamActiveIndex(teamId), encodeI64(0));
+    tn.set(ks.teamLedgerGcIndex(teamId), EMPTY);
+    if (stored !== null && limit > stored) {
+      scheduleRaiseTask(tn, ks.taskTeamRaise(teamId));
+    }
+  }
+  return decodeI64(await tn.get(ks.teamActive(teamId)));
+}
+
 export function bumpKeyActive(
   tn: Transaction,
   ks: NuqFdbKeyspace,

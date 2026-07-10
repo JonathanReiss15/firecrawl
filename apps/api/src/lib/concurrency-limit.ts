@@ -5,10 +5,7 @@ import { getCrawl, StoredCrawl } from "./crawl-redis";
 import { logger } from "./logger";
 import { abTestJob } from "../services/ab-test";
 import { scrapeQueue, type NuQJob } from "../services/worker/nuq";
-import {
-  getCombinedTeamActiveCount,
-  syncFdbLimitToPgOccupancy,
-} from "../services/worker/nuq-router";
+import { syncFdbLimitToPgOccupancy } from "../services/worker/nuq-router";
 export { QueueFullError } from "./queue-full-error";
 export {
   getTeamQueueLimit,
@@ -21,8 +18,8 @@ import {
   getTeamQueueLimit,
   MAX_BACKLOG_TIMEOUT_MS,
   constructConcurrencyLimitKey,
-  pushConcurrencyLimitActiveJob,
   removeConcurrencyLimitActiveJob,
+  reserveConcurrencyLimitActiveJob,
 } from "./concurrency-redis";
 
 const constructKey = constructConcurrencyLimitKey;
@@ -470,12 +467,21 @@ export async function concurrentJobDone(job: NuQJob<any>) {
 
   let staleSkipped = 0;
   while (staleSkipped < 100) {
-    if ((await getCombinedTeamActiveCount(teamId)) >= maxTeamConcurrency) break;
     const claimed = await getNextConcurrentJob(teamId);
     if (claimed === null) break;
 
     try {
-      await pushConcurrencyLimitActiveJob(teamId, claimed.job.id, 60 * 1000);
+      const reservation = await reserveConcurrencyLimitActiveJob(
+        teamId,
+        claimed.job.id,
+        maxTeamConcurrency,
+        60 * 1000,
+      );
+      if (!reservation.reserved) {
+        await restoreConcurrentJob(teamId, claimed);
+        break;
+      }
+
       await syncFdbLimitToPgOccupancy(teamId);
 
       if (claimed.job.data.crawl_id) {

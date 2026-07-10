@@ -8,6 +8,12 @@ vi.mock("../../lib/deployment", () => ({ isSelfHosted: vi.fn(() => false) }));
 vi.mock("../../services/ab-test", () => ({ abTestJob: vi.fn() }));
 
 import { config } from "../../config";
+import {
+  finalizeConcurrencyLimitActiveJobRollback,
+  removeConcurrencyLimitActiveJob,
+  reserveConcurrencyLimitActiveJob,
+  rollbackConcurrencyLimitActiveJob,
+} from "../../lib/concurrency-redis";
 import { _addScrapeJobToBullMQ } from "../../services/queue-jobs";
 import { getRedisConnection } from "../../services/queue-service";
 import { redisEvictConnection } from "../../services/redis";
@@ -100,6 +106,7 @@ describeIf("NuQ PG publication with durable FDB authority", () => {
   const ambiguousGroupTeamId = randomUUID();
   const conflictGroupTeamId = randomUUID();
   const externalTeamId = randomUUID();
+  const capacityTeamId = randomUUID();
 
   beforeAll(async () => {
     config.NUQ_BACKEND = "pg";
@@ -111,6 +118,7 @@ describeIf("NuQ PG publication with durable FDB authority", () => {
       `nuq:job_backend:${jobId}`,
       `concurrency-limiter:${conflictTeamId}`,
       `nuq:pg-reservation:team:${conflictTeamId}:${conflictJobId}`,
+      `concurrency-limiter:${capacityTeamId}`,
     );
     await redisEvictConnection.del(`nuq:job_backend:${jobId}`);
   });
@@ -126,6 +134,7 @@ describeIf("NuQ PG publication with durable FDB authority", () => {
       `nuq:job_backend:${jobId}`,
       `concurrency-limiter:${conflictTeamId}`,
       `nuq:pg-reservation:team:${conflictTeamId}:${conflictJobId}`,
+      `concurrency-limiter:${capacityTeamId}`,
     );
     await redisEvictConnection.del(`nuq:job_backend:${jobId}`);
     await Promise.all([
@@ -139,6 +148,79 @@ describeIf("NuQ PG publication with durable FDB authority", () => {
     config.NUQ_BACKEND = previousBackend;
     config.NUQ_FDB_METRICS_V2_ACTIVATE = previousMetricsActivation;
     await nuqShutdown();
+  });
+
+  test("concurrent Redis holder reservations serialize at the team limit", async () => {
+    const holders = Array.from({ length: 32 }, () => randomUUID());
+    const results = await Promise.all(
+      holders.map(holder =>
+        reserveConcurrencyLimitActiveJob(capacityTeamId, holder, 3, 30_000),
+      ),
+    );
+    const admitted = holders.filter((_, index) => results[index].reserved);
+
+    expect(admitted).toHaveLength(3);
+    expect(results.filter(result => result.newlyAcquired)).toHaveLength(3);
+    await expect(
+      reserveConcurrencyLimitActiveJob(capacityTeamId, admitted[0], 3, 30_000),
+    ).resolves.toEqual({
+      reserved: true,
+      newlyAcquired: false,
+      rollbackToken: null,
+      cleanupToken: null,
+    });
+
+    await Promise.all(
+      admitted.map(holder =>
+        removeConcurrencyLimitActiveJob(capacityTeamId, holder),
+      ),
+    );
+    const replacementHolder = randomUUID();
+    const replacement = await reserveConcurrencyLimitActiveJob(
+      capacityTeamId,
+      replacementHolder,
+      3,
+      30_000,
+    );
+    expect(replacement).toMatchObject({
+      reserved: true,
+      newlyAcquired: true,
+      rollbackToken: expect.any(String),
+    });
+    await expect(
+      rollbackConcurrencyLimitActiveJob(
+        capacityTeamId,
+        replacementHolder,
+        replacement.rollbackToken!,
+      ),
+    ).resolves.toBe(true);
+    await expect(
+      reserveConcurrencyLimitActiveJob(
+        capacityTeamId,
+        replacementHolder,
+        3,
+        30_000,
+      ),
+    ).resolves.toMatchObject({ reserved: false });
+    await expect(
+      finalizeConcurrencyLimitActiveJobRollback(
+        capacityTeamId,
+        replacementHolder,
+        replacement.rollbackToken!,
+      ),
+    ).resolves.toBe(true);
+    const reacquired = await reserveConcurrencyLimitActiveJob(
+      capacityTeamId,
+      replacementHolder,
+      3,
+      30_000,
+    );
+    expect(reacquired).toMatchObject({
+      reserved: true,
+      newlyAcquired: true,
+      rollbackToken: expect.any(String),
+    });
+    await removeConcurrencyLimitActiveJob(capacityTeamId, replacementHolder);
   });
 
   test("a pre-commit PG conflict rolls back owned Redis reservation and its prepared intent", async () => {

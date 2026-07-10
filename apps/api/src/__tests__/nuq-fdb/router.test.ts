@@ -36,6 +36,7 @@ import {
   crawlFinishedQueue,
   mirrorExternalSlotAcquire,
   mirrorExternalSlotRelease,
+  renewExternalSlot,
   reserveExternalSlot,
 } from "../../services/worker/nuq-router";
 import { waitForJob as waitForQueuedJob } from "../../services/queue-jobs";
@@ -47,6 +48,7 @@ import {
   getNuqFdbDatabase,
   getFdb,
 } from "../../services/worker/nuq-fdb/client";
+import { decodeI64 } from "../../services/worker/nuq-fdb/keyspace";
 
 // Exercises the dual-backend router in forced-FDB mode (NUQ_BACKEND=fdb,
 // self-hosted), which needs neither ACUC nor a PG nuq database: everything
@@ -417,5 +419,114 @@ describeIf("NuQ router (forced FDB mode)", () => {
     // double release is a no-op
     await mirrorExternalSlotRelease(teamId, holder);
     expect(await scrapeQueueFdb.getTeamActiveCount(teamId)).toBe(0);
+  });
+
+  test("concurrent FDB external reservations cannot oversubscribe a team", async () => {
+    const teamId = randomUUID();
+    const holders = Array.from({ length: 32 }, () => randomUUID());
+    const results = await Promise.all(
+      holders.map(holder => reserveExternalSlot(teamId, holder, 30_000, 3)),
+    );
+    const admitted = holders.filter((_, index) => results[index]);
+
+    expect(admitted).toHaveLength(3);
+    expect(await scrapeQueueFdb.getTeamActiveCount(teamId)).toBe(3);
+
+    await Promise.all(
+      admitted.map(holder => mirrorExternalSlotRelease(teamId, holder)),
+    );
+    expect(await scrapeQueueFdb.getTeamActiveCount(teamId)).toBe(0);
+  });
+
+  test("existing FDB holder renewal does not overwrite a newer team limit", async () => {
+    const teamId = randomUUID();
+    const firstHolder = randomUUID();
+    const secondHolder = randomUUID();
+    await expect(
+      reserveExternalSlot(teamId, firstHolder, 30_000, 10),
+    ).resolves.toBe(true);
+    await expect(
+      reserveExternalSlot(teamId, secondHolder, 30_000, 2),
+    ).resolves.toBe(true);
+
+    const readStoredLimit = async () =>
+      await getNuqFdbDatabase().doTn(async tn =>
+        decodeI64(await tn.snapshot().get(scrapeQueueFdb.ks.teamLimit(teamId))),
+      );
+    await expect(readStoredLimit()).resolves.toBe(2);
+    await expect(renewExternalSlot(teamId, firstHolder, 30_000)).resolves.toBe(
+      true,
+    );
+    await expect(readStoredLimit()).resolves.toBe(2);
+
+    await Promise.all([
+      mirrorExternalSlotRelease(teamId, firstHolder),
+      mirrorExternalSlotRelease(teamId, secondHolder),
+    ]);
+    expect(await scrapeQueueFdb.getTeamActiveCount(teamId)).toBe(0);
+  });
+
+  test("FDB external reservation includes queue occupancy atomically", async () => {
+    const teamId = randomUUID();
+    const jobIds = [randomUUID(), randomUUID()];
+    await scrapeQueueFdb.addJobs(
+      jobIds.map(jobId => ({
+        id: jobId,
+        data: {
+          mode: "single_urls",
+          url: "https://example.com/capacity",
+          team_id: teamId,
+        } as any,
+        options: { ownerId: teamId },
+      })),
+      { teamLimit: 2, queueCap: 10 },
+    );
+    expect(await scrapeQueueFdb.getTeamActiveCount(teamId)).toBe(2);
+
+    const results = await Promise.all(
+      Array.from({ length: 8 }, () =>
+        reserveExternalSlot(teamId, randomUUID(), 30_000, 2),
+      ),
+    );
+    expect(results).toEqual(Array(8).fill(false));
+    expect(await scrapeQueueFdb.getTeamActiveCount(teamId)).toBe(2);
+
+    await Promise.all(jobIds.map(jobId => scrapeQueueFdb.removeJob(jobId)));
+    expect(await scrapeQueueFdb.getTeamActiveCount(teamId)).toBe(0);
+  });
+
+  test("denied external reservation lowers the FDB promotion gate", async () => {
+    const teamId = randomUUID();
+    const jobIds = [randomUUID(), randomUUID(), randomUUID()];
+    const jobs = await scrapeQueueFdb.addJobs(
+      jobIds.map(jobId => ({
+        id: jobId,
+        data: {
+          mode: "single_urls",
+          url: "https://example.com/lowered-capacity",
+          team_id: teamId,
+        } as any,
+        options: { ownerId: teamId },
+      })),
+      { teamLimit: 2, queueCap: 10 },
+    );
+    const active = jobs.filter(job => job.status !== "backlog");
+    expect(active).toHaveLength(2);
+    expect(await scrapeQueueFdb.getTeamPendingCount(teamId)).toBe(1);
+
+    await expect(
+      reserveExternalSlot(teamId, randomUUID(), 30_000, 1),
+    ).resolves.toBe(false);
+    await scrapeQueueFdb.removeJob(active[0].id);
+    expect(await scrapeQueueFdb.getTeamActiveCount(teamId)).toBe(1);
+    expect(await scrapeQueueFdb.getTeamPendingCount(teamId)).toBe(1);
+
+    await Promise.all(
+      jobIds
+        .filter(jobId => jobId !== active[0].id)
+        .map(jobId => scrapeQueueFdb.removeJob(jobId)),
+    );
+    expect(await scrapeQueueFdb.getTeamActiveCount(teamId)).toBe(0);
+    expect(await scrapeQueueFdb.getTeamPendingCount(teamId)).toBe(0);
   });
 });

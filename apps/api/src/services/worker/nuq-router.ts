@@ -9,9 +9,13 @@ import { getApiKeyConcurrencyLimit } from "../../lib/api-key-concurrency";
 import { getRedisConnection } from "../queue-service";
 import {
   getTeamQueueLimit,
+  finalizeConcurrencyLimitActiveJobRollback,
   getConcurrencyLimitActiveJobsCount,
   pushConcurrencyLimitActiveJob,
   removeConcurrencyLimitActiveJob,
+  renewConcurrencyLimitActiveJob,
+  reserveConcurrencyLimitActiveJob,
+  rollbackConcurrencyLimitActiveJob,
   constructConcurrencyLimitKey,
 } from "../../lib/concurrency-redis";
 import {
@@ -771,7 +775,18 @@ async function acquireExternalSlot(
   ttlMs: number,
 ): Promise<void> {
   const existingPin = await inspectOrRecoverExternalSlotPin(teamId, holderId);
-  if (!existingPin) await authoritativeTeamBackend(teamId);
+  const backend =
+    existingPin?.backend ?? (await authoritativeTeamBackend(teamId));
+  if (backend === "fdb") {
+    // New FDB holders prepare/activate the durable pin together with the slot.
+    await fdbMutation(() =>
+      externalSlotsFdb.acquire(teamId, holderId, ttlMs, {
+        prepareMigrationPin: !existingPin && !fdbForced(),
+      }),
+    );
+    return;
+  }
+
   const pin =
     existingPin ??
     (await prepareRoutingPin({
@@ -779,27 +794,25 @@ async function acquireExternalSlot(
       kind: "external_holder",
       objectId: externalSlotMigrationObjectId(teamId, holderId),
     }));
-  const backend = pin?.backend ?? (await authoritativeTeamBackend(teamId));
-  if (backend === "fdb") {
-    await fdbMutation(() => externalSlotsFdb.acquire(teamId, holderId, ttlMs));
-    await activateRoutingPin(
-      pin,
-      { capacity_external_holders: 1 },
-      "external-holder-active",
+  if (pin && pin.backend !== "pg") {
+    throw new NuQRouterPinMismatchError(
+      pin.kind,
+      pin.objectId,
+      pin.backend,
+      "pg",
     );
-  } else {
-    const now = Date.now();
-    if (pin) {
-      // Publish the durable deadline before crossing the Redis boundary. A
-      // crash or ambiguous Redis result can conservatively overcount only
-      // until this exact generation expires; it cannot strand a prepared pin.
-      await fdbMutation(() =>
-        externalSlotsFdb.renewPg(teamId, holderId, now + ttlMs),
-      );
-    }
-    await pushConcurrencyLimitActiveJob(teamId, holderId, ttlMs, now);
-    await syncFdbLimitToPgOccupancy(teamId);
   }
+  const now = Date.now();
+  if (pin) {
+    // Publish the durable deadline before crossing the Redis boundary. A
+    // crash or ambiguous Redis result can conservatively overcount only until
+    // this exact generation expires; it cannot strand a prepared pin.
+    await fdbMutation(() =>
+      externalSlotsFdb.renewPg(teamId, holderId, now + ttlMs),
+    );
+  }
+  await pushConcurrencyLimitActiveJob(teamId, holderId, ttlMs, now);
+  await syncFdbLimitToPgOccupancy(teamId);
 }
 
 export async function reserveExternalSlot(
@@ -809,11 +822,181 @@ export async function reserveExternalSlot(
   concurrencyLimit: number,
 ): Promise<boolean> {
   return await withTeamMigrationAdmission(teamId, async () => {
-    if ((await getCombinedTeamActiveCount(teamId)) >= concurrencyLimit) {
+    const existingPin = await inspectOrRecoverExternalSlotPin(teamId, holderId);
+    const backend =
+      existingPin?.backend ?? (await authoritativeTeamBackend(teamId));
+
+    if (backend === "fdb") {
+      if (existingPin?.lifecycle === "terminal") return false;
+      return await fdbMutation(() =>
+        externalSlotsFdb.reserve(teamId, holderId, ttlMs, concurrencyLimit, {
+          prepareMigrationPin: !existingPin && !fdbForced(),
+        }),
+      );
+    }
+
+    // Redis is the PG capacity ledger. Its Lua reservation removes expired
+    // holders, checks the limit, and inserts/renews in one atomic operation.
+    // Reserve before preparing a cross-store pin so a definitive denial leaves
+    // no durable intent. The primitive retries one ambiguous reply by stable
+    // holder id, making a committed first attempt observable on the retry.
+    const reservation = await reserveConcurrencyLimitActiveJob(
+      teamId,
+      holderId,
+      concurrencyLimit,
+      ttlMs,
+    );
+    if (existingPin?.lifecycle === "terminal") {
+      if (reservation.cleanupToken) {
+        await finalizeConcurrencyLimitActiveJobRollback(
+          teamId,
+          holderId,
+          reservation.cleanupToken,
+        );
+      } else if (reservation.reserved && reservation.rollbackToken) {
+        if (
+          await rollbackConcurrencyLimitActiveJob(
+            teamId,
+            holderId,
+            reservation.rollbackToken,
+          )
+        ) {
+          await finalizeConcurrencyLimitActiveJobRollback(
+            teamId,
+            holderId,
+            reservation.rollbackToken,
+          );
+        }
+      } else if (reservation.reserved) {
+        // A terminal pin can never authorize a pre-existing unowned member.
+        await removeConcurrencyLimitActiveJob(teamId, holderId);
+      }
       return false;
     }
-    await acquireExternalSlot(teamId, holderId, ttlMs);
-    return true;
+    if (!reservation.reserved) {
+      if (reservation.cleanupToken) {
+        // Recover a process crash between guarded Redis rollback, durable pin
+        // completion, and tombstone finalization. The tombstone keeps new work
+        // out while this idempotent path retires the abandoned attempt.
+        await completeRoutingPin(
+          existingPin,
+          "external-holder-activation-rollback",
+        );
+        if (
+          !(await finalizeConcurrencyLimitActiveJobRollback(
+            teamId,
+            holderId,
+            reservation.cleanupToken,
+          ))
+        ) {
+          throw new Error("Failed to recover PG external-holder rollback");
+        }
+      }
+      return false;
+    }
+
+    let pin = existingPin;
+    try {
+      pin ??= await prepareRoutingPin({
+        teamId,
+        kind: "external_holder",
+        objectId: externalSlotMigrationObjectId(teamId, holderId),
+      });
+      if (pin && pin.backend !== "pg") {
+        throw new NuQRouterPinMismatchError(
+          pin.kind,
+          pin.objectId,
+          pin.backend,
+          "pg",
+        );
+      }
+      await activateRoutingPin(
+        pin,
+        { capacity_external_holders: 1 },
+        "external-holder-active",
+      );
+      return true;
+    } catch (error) {
+      // Do not tear down a pre-existing holder if only its renewal raced a
+      // migration error. A newly inserted PG holder has no valid active pin and
+      // must be removed before its prepared intent can be retired.
+      if (!reservation.newlyAcquired) throw error;
+      let rolledBack: boolean;
+      try {
+        if (!reservation.rollbackToken)
+          throw new Error("Missing rollback token");
+        rolledBack = await rollbackConcurrencyLimitActiveJob(
+          teamId,
+          holderId,
+          reservation.rollbackToken,
+        );
+      } catch (cleanupError) {
+        throw new AggregateError(
+          [error, cleanupError],
+          "PG external-holder activation and Redis rollback both failed",
+        );
+      }
+      // A later attempt now owns this stable holder. Never delete its member or
+      // terminalize the shared durable pin from this stale failure path.
+      if (!rolledBack) throw error;
+      try {
+        const cleanupPin =
+          pin ??
+          (await inspectRoutingPin(
+            "external_holder",
+            externalSlotMigrationObjectId(teamId, holderId),
+          ));
+        await completeRoutingPin(
+          cleanupPin,
+          "external-holder-activation-rollback",
+        );
+        if (
+          !reservation.rollbackToken ||
+          !(await finalizeConcurrencyLimitActiveJobRollback(
+            teamId,
+            holderId,
+            reservation.rollbackToken,
+          ))
+        ) {
+          throw new Error("Failed to finalize PG external-holder rollback");
+        }
+      } catch (cleanupError) {
+        throw new AggregateError(
+          [error, cleanupError],
+          "PG external-holder activation and durable rollback both failed",
+        );
+      }
+      throw error;
+    }
+  });
+}
+
+export async function renewExternalSlot(
+  teamId: string,
+  holderId: string,
+  ttlMs: number,
+): Promise<boolean> {
+  return await withTeamMigrationAdmission(teamId, async () => {
+    const pin = await inspectOrRecoverExternalSlotPin(teamId, holderId);
+    const backend = pin?.backend ?? (await authoritativeTeamBackend(teamId));
+    if (backend === "fdb") {
+      return await fdbMutation(() =>
+        externalSlotsFdb.renew(teamId, holderId, ttlMs),
+      );
+    }
+    const renewed = await renewConcurrencyLimitActiveJob(
+      teamId,
+      holderId,
+      ttlMs,
+    );
+    if (renewed) {
+      await activateRoutingPin(
+        pin,
+        { capacity_external_holders: 1 },
+        "external-holder-active",
+      );
+    }
+    return renewed;
   });
 }
 

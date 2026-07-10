@@ -1,7 +1,14 @@
 import { randomUUID } from "crypto";
 import { vi } from "vitest";
 
-const controls = vi.hoisted(() => ({ fdbFlag: false, pgResidue: 0 }));
+const controls = vi.hoisted(() => ({
+  fdbFlag: false,
+  pgResidue: 0,
+  redisReserve: vi.fn(),
+  redisRemove: vi.fn(),
+  redisRollback: vi.fn(),
+  redisFinalize: vi.fn(),
+}));
 
 vi.mock("../../controllers/auth", () => ({
   getACUCTeam: vi.fn(async () => ({ flags: { nuqFdb: controls.fdbFlag } })),
@@ -31,10 +38,14 @@ vi.mock("../../services/worker/nuq", () => {
   };
 });
 vi.mock("../../lib/concurrency-redis", () => ({
+  finalizeConcurrencyLimitActiveJobRollback: controls.redisFinalize,
   getTeamQueueLimit: vi.fn().mockResolvedValue(100),
   getConcurrencyLimitActiveJobsCount: vi.fn().mockResolvedValue(0),
   pushConcurrencyLimitActiveJob: vi.fn(),
-  removeConcurrencyLimitActiveJob: vi.fn(),
+  removeConcurrencyLimitActiveJob: controls.redisRemove,
+  renewConcurrencyLimitActiveJob: vi.fn().mockResolvedValue(true),
+  reserveConcurrencyLimitActiveJob: controls.redisReserve,
+  rollbackConcurrencyLimitActiveJob: controls.redisRollback,
   constructConcurrencyLimitKey: vi.fn((teamId: string) => `limit:${teamId}`),
 }));
 
@@ -44,6 +55,7 @@ import {
   isFdbTeam,
   mirrorExternalSlotAcquire,
   mirrorExternalSlotRelease,
+  reserveExternalSlot,
   resolveJobBackend,
 } from "../../services/worker/nuq-router";
 import {
@@ -320,6 +332,233 @@ describeIf("NuQ durable migration router", () => {
       const range = crawlGroupFdb.ks.groupRange(groupId);
       tn.clearRange(range.begin, range.end);
       tn.clear(crawlGroupFdb.ks.ongoingGroup(teamId, groupId));
+    });
+  });
+
+  test("denied PG reservations do not create a migration intent", async () => {
+    const teamId = randomUUID();
+    const holderId = randomUUID();
+    teams.add(teamId);
+    controls.fdbFlag = false;
+    controls.pgResidue = 0;
+    controls.redisReserve.mockResolvedValueOnce({
+      reserved: false,
+      newlyAcquired: false,
+      rollbackToken: null,
+      cleanupToken: null,
+    });
+    await makeMetricsReady();
+    await expect(isFdbTeam(teamId)).resolves.toBe(false);
+
+    await expect(
+      reserveExternalSlot(teamId, holderId, 30_000, 1),
+    ).resolves.toBe(false);
+    await expect(
+      nuqFdbMigrationStore.inspectPin(
+        "external_holder",
+        externalSlotMigrationObjectId(teamId, holderId),
+      ),
+    ).resolves.toBeNull();
+  });
+
+  test("failed PG activation removes a new Redis holder and retires its intent", async () => {
+    const teamId = randomUUID();
+    const holderId = randomUUID();
+    const activationError = new Error("activation unavailable");
+    teams.add(teamId);
+    controls.fdbFlag = false;
+    controls.pgResidue = 0;
+    controls.redisReserve.mockResolvedValueOnce({
+      reserved: true,
+      newlyAcquired: true,
+      rollbackToken: "owned-attempt",
+      cleanupToken: null,
+    });
+    controls.redisRollback.mockResolvedValueOnce(true);
+    controls.redisFinalize.mockResolvedValueOnce(true);
+    await makeMetricsReady();
+    await expect(isFdbTeam(teamId)).resolves.toBe(false);
+
+    const transition = vi
+      .spyOn(nuqFdbMigrationStore, "transitionObjectResidue")
+      .mockRejectedValueOnce(activationError);
+    try {
+      await expect(
+        reserveExternalSlot(teamId, holderId, 30_000, 1),
+      ).rejects.toBe(activationError);
+    } finally {
+      transition.mockRestore();
+    }
+    expect(controls.redisRollback).toHaveBeenCalledWith(
+      teamId,
+      holderId,
+      "owned-attempt",
+    );
+    expect(controls.redisFinalize).toHaveBeenCalledWith(
+      teamId,
+      holderId,
+      "owned-attempt",
+    );
+    await expect(
+      nuqFdbMigrationStore.inspectPin(
+        "external_holder",
+        externalSlotMigrationObjectId(teamId, holderId),
+      ),
+    ).resolves.toMatchObject({
+      lifecycle: "terminal",
+      residue: { capacity_external_holders: 0, intent_unresolved: 0 },
+    });
+  });
+
+  test("stale PG activation failure cannot roll back a replacement holder", async () => {
+    const teamId = randomUUID();
+    const holderId = randomUUID();
+    const objectId = externalSlotMigrationObjectId(teamId, holderId);
+    const activationError = new Error("activation unavailable");
+    teams.add(teamId);
+    controls.fdbFlag = false;
+    controls.pgResidue = 0;
+    controls.redisReserve.mockResolvedValueOnce({
+      reserved: true,
+      newlyAcquired: true,
+      rollbackToken: "stale-attempt",
+      cleanupToken: null,
+    });
+    controls.redisRollback.mockResolvedValueOnce(false);
+    controls.redisFinalize.mockClear();
+    await makeMetricsReady();
+    await expect(isFdbTeam(teamId)).resolves.toBe(false);
+
+    const transition = vi
+      .spyOn(nuqFdbMigrationStore, "transitionObjectResidue")
+      .mockRejectedValueOnce(activationError);
+    try {
+      await expect(
+        reserveExternalSlot(teamId, holderId, 30_000, 1),
+      ).rejects.toBe(activationError);
+    } finally {
+      transition.mockRestore();
+    }
+    expect(controls.redisRollback).toHaveBeenCalledWith(
+      teamId,
+      holderId,
+      "stale-attempt",
+    );
+    expect(controls.redisFinalize).not.toHaveBeenCalled();
+    await expect(
+      nuqFdbMigrationStore.inspectPin("external_holder", objectId),
+    ).resolves.toMatchObject({
+      lifecycle: "prepared",
+      residue: { intent_unresolved: 1 },
+    });
+  });
+
+  test("retry recovers an abandoned PG rollback tombstone", async () => {
+    const teamId = randomUUID();
+    const holderId = randomUUID();
+    const objectId = externalSlotMigrationObjectId(teamId, holderId);
+    teams.add(teamId);
+    controls.fdbFlag = false;
+    controls.pgResidue = 0;
+    await makeMetricsReady();
+    await expect(isFdbTeam(teamId)).resolves.toBe(false);
+    await nuqFdbMigrationStore.preparePinnedObject({
+      teamId,
+      kind: "external_holder",
+      objectId,
+      admission: { type: "new-root" },
+      requiredBackend: "pg",
+      residue: { intent_unresolved: 1 },
+    });
+    controls.redisRollback.mockClear();
+    controls.redisFinalize.mockClear();
+    controls.redisReserve.mockResolvedValueOnce({
+      reserved: false,
+      newlyAcquired: false,
+      rollbackToken: null,
+      cleanupToken: "abandoned-attempt",
+    });
+    controls.redisFinalize.mockResolvedValueOnce(true);
+
+    await expect(
+      reserveExternalSlot(teamId, holderId, 30_000, 1),
+    ).resolves.toBe(false);
+    expect(controls.redisFinalize).toHaveBeenCalledWith(
+      teamId,
+      holderId,
+      "abandoned-attempt",
+    );
+    await expect(
+      nuqFdbMigrationStore.inspectPin("external_holder", objectId),
+    ).resolves.toMatchObject({
+      lifecycle: "terminal",
+      residue: { intent_unresolved: 0 },
+    });
+
+    // A finalize commit-unknown retry must not reopen this terminal holder ID.
+    controls.redisReserve.mockResolvedValueOnce({
+      reserved: true,
+      newlyAcquired: true,
+      rollbackToken: "reopened-attempt",
+      cleanupToken: null,
+    });
+    controls.redisRollback.mockResolvedValueOnce(true);
+    controls.redisFinalize.mockResolvedValueOnce(true);
+    await expect(
+      reserveExternalSlot(teamId, holderId, 30_000, 1),
+    ).resolves.toBe(false);
+    expect(controls.redisRollback).toHaveBeenCalledWith(
+      teamId,
+      holderId,
+      "reopened-attempt",
+    );
+    await expect(
+      nuqFdbMigrationStore.inspectPin("external_holder", objectId),
+    ).resolves.toMatchObject({ lifecycle: "terminal" });
+  });
+
+  test("failed PG renewal does not remove or terminalize an existing holder", async () => {
+    const teamId = randomUUID();
+    const holderId = randomUUID();
+    const objectId = externalSlotMigrationObjectId(teamId, holderId);
+    const activationError = new Error("activation unavailable");
+    teams.add(teamId);
+    controls.fdbFlag = false;
+    controls.pgResidue = 0;
+    await makeMetricsReady();
+    await expect(isFdbTeam(teamId)).resolves.toBe(false);
+    await nuqFdbMigrationStore.preparePinnedObject({
+      teamId,
+      kind: "external_holder",
+      objectId,
+      admission: { type: "new-root" },
+      requiredBackend: "pg",
+      residue: { intent_unresolved: 1 },
+    });
+    controls.redisReserve.mockResolvedValueOnce({
+      reserved: true,
+      newlyAcquired: false,
+      rollbackToken: null,
+      cleanupToken: null,
+    });
+    controls.redisRollback.mockClear();
+
+    const transition = vi
+      .spyOn(nuqFdbMigrationStore, "transitionObjectResidue")
+      .mockRejectedValueOnce(activationError);
+    try {
+      await expect(
+        reserveExternalSlot(teamId, holderId, 30_000, 1),
+      ).rejects.toBe(activationError);
+    } finally {
+      transition.mockRestore();
+    }
+    expect(controls.redisRollback).not.toHaveBeenCalled();
+    await expect(
+      nuqFdbMigrationStore.inspectPin("external_holder", objectId),
+    ).resolves.toMatchObject({
+      lifecycle: "prepared",
+      residue: { intent_unresolved: 1 },
     });
   });
 

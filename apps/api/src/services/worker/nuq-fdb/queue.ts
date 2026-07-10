@@ -61,6 +61,7 @@ import {
   setGroupJobIndex,
   bumpGroupStatusCount,
   bumpTeamActive,
+  synchronizeTeamLimitInTxn,
   alignQueueMetricStatus,
   bumpKeyActive,
   scheduleRaiseTask,
@@ -758,21 +759,14 @@ export class NuQFdbQueue<JobData = any, JobReturnValue = any> {
 
       let free = Infinity;
       if (gate.teamLimit !== null && ownerId !== null) {
-        const storedBuf = await tn.get(ks.teamLimit(ownerId));
-        const stored = storedBuf ? decodeI64(storedBuf) : null;
-        if (stored !== gate.teamLimit) {
-          tn.set(ks.teamLimit(ownerId), encodeI64(gate.teamLimit));
-          // Also indexes teams whose configured limit is zero.
-          tn.add(ks.teamActiveIndex(ownerId), encodeI64(0));
-          tn.set(ks.teamLedgerGcIndex(ownerId), EMPTY);
-          if (stored !== null && gate.teamLimit > stored) {
-            scheduleRaiseTask(tn, ks.taskTeamRaise(ownerId));
-          }
-        }
-
         // Strict for every limit, including >=256. The ingest reservation
         // bounds queue admission; this conflicting read bounds active slots.
-        const active = decodeI64(await tn.get(ks.teamActive(ownerId)));
+        const active = await synchronizeTeamLimitInTxn(
+          tn,
+          ks,
+          ownerId,
+          gate.teamLimit,
+        );
         free = Math.max(0, gate.teamLimit - active);
       }
 

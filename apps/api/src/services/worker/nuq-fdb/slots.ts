@@ -15,6 +15,7 @@ import {
   newTxContext,
   releaseSlotsAndPromote,
   runtimeMigrationPin,
+  synchronizeTeamLimitInTxn,
   stampMigrationPin,
 } from "./ops";
 import { nuqFdbMigrationStore } from "./migration-store";
@@ -128,70 +129,111 @@ export class NuqFdbExternalSlots {
     );
   }
 
-  // Acquires (or renews) an external slot. Unconditional: never blocks on the
-  // team limit; the caller's own gate (Lua semaphore, session limits) decides
-  // admission. Re-acquiring an existing holder just extends its expiry.
+  private async acquireInTxn(
+    tn: Transaction,
+    owner: string,
+    holderId: string,
+    ttlMs: number,
+    limit: number | null,
+    prepareMigrationPin: boolean,
+    requireExisting: boolean,
+  ): Promise<boolean> {
+    const existing = decodeJson<ExternalSlotRecord>(
+      await tn.get(this.key(owner, holderId)),
+    );
+
+    if (!existing && requireExisting) return false;
+
+    // A non-snapshot read conflicts with every queue/external active-count
+    // mutation. The capacity check and holder insertion therefore serialize in
+    // FDB instead of relying on a process lock or a second Redis ledger. A
+    // capacity-aware reservation carries the caller's current configured limit;
+    // renew-only heartbeats pass no limit and therefore cannot overwrite it.
+    const active =
+      limit !== null
+        ? await synchronizeTeamLimitInTxn(tn, this.ks, owner, limit)
+        : null;
+    if (!existing && limit !== null && active !== null && active >= limit) {
+      return false;
+    }
+
+    const objectId = externalSlotMigrationObjectId(owner, holderId);
+    if (!existing && prepareMigrationPin) {
+      await nuqFdbMigrationStore.preparePinnedObjectInTxn(tn, {
+        teamId: owner,
+        kind: "external_holder",
+        objectId,
+        admission: { type: "new-root" },
+        requiredBackend: "fdb",
+        residue: { capacity_external_holders: 1 },
+      });
+    }
+
+    const pin = await nuqFdbMigrationStore.reconcileManagedObjectInTxn(tn, {
+      teamId: owner,
+      kind: "external_holder",
+      objectId,
+      ...(existing
+        ? { recordPin: runtimeMigrationPin(existing) }
+        : { allowMissingRecordPin: true }),
+      residue: { capacity_external_holders: 1 },
+    });
+
+    if (existing) {
+      tn.clear(
+        existing.g
+          ? this.expiryKey(
+              timeBucket(`${owner}/${holderId}`),
+              existing.e,
+              owner,
+              holderId,
+              existing.g,
+            )
+          : this.legacyExpiryKey(timeBucket(holderId), existing.e, holderId),
+      );
+    } else {
+      bumpTeamActive(tn, this.ks, owner, 1);
+    }
+
+    const exp = Date.now() + ttlMs;
+    const generation = randomUUID();
+    const record = stampMigrationPin(
+      { e: exp, g: generation } satisfies ExternalSlotRecord,
+      pin,
+    );
+    tn.set(this.key(owner, holderId), encodeJson(record));
+    tn.set(
+      this.expiryKey(
+        timeBucket(`${owner}/${holderId}`),
+        exp,
+        owner,
+        holderId,
+        generation,
+      ),
+      Buffer.alloc(0),
+    );
+    return true;
+  }
+
+  // Acquires (or renews) an external slot unconditionally. Router-owned new
+  // holders prepare their migration pin in this same transaction.
   public async acquire(
     teamId: string,
     holderId: string,
     ttlMs: number,
+    options?: { prepareMigrationPin?: boolean },
   ): Promise<void> {
     const owner = normalizeOwnerId(teamId);
     if (owner === null) return;
-    const now = Date.now();
-    const exp = now + ttlMs;
-    const generation = randomUUID();
     await this.db.doTn(async tn => {
-      const existing = decodeJson<ExternalSlotRecord>(
-        await tn.get(this.key(owner, holderId)),
-      );
-      const existingPin = existing
-        ? await nuqFdbMigrationStore.reconcileManagedObjectInTxn(tn, {
-            teamId: owner,
-            kind: "external_holder",
-            objectId: externalSlotMigrationObjectId(owner, holderId),
-            recordPin: runtimeMigrationPin(existing),
-            residue: { capacity_external_holders: 1 },
-          })
-        : null;
-      if (existing) {
-        tn.clear(
-          existing.g
-            ? this.expiryKey(
-                timeBucket(`${owner}/${holderId}`),
-                existing.e,
-                owner,
-                holderId,
-                existing.g,
-              )
-            : this.legacyExpiryKey(timeBucket(holderId), existing.e, holderId),
-        );
-      } else {
-        bumpTeamActive(tn, this.ks, owner, 1);
-      }
-      const pin = existing
-        ? existingPin
-        : await nuqFdbMigrationStore.reconcileManagedObjectInTxn(tn, {
-            teamId: owner,
-            kind: "external_holder",
-            objectId: externalSlotMigrationObjectId(owner, holderId),
-            allowMissingRecordPin: true,
-            residue: { capacity_external_holders: 1 },
-          });
-      const record = stampMigrationPin(
-        { e: exp, g: generation } satisfies ExternalSlotRecord,
-        pin,
-      );
-      tn.set(this.key(owner, holderId), encodeJson(record));
-      tn.set(
-        this.expiryKey(
-          timeBucket(`${owner}/${holderId}`),
-          exp,
-          owner,
-          holderId,
-          generation,
-        ),
-        Buffer.alloc(0),
+      await this.acquireInTxn(
+        tn,
+        owner,
+        holderId,
+        ttlMs,
+        null,
+        options?.prepareMigrationPin === true,
+        false,
       );
     });
   }
@@ -300,6 +342,44 @@ export class NuqFdbExternalSlots {
         fromLifecycle: pin.lifecycle,
       });
     });
+  }
+
+  // Atomically checks authoritative team occupancy and inserts the holder.
+  // Re-acquiring an existing holder only renews it and never double-counts.
+  public async reserve(
+    teamId: string,
+    holderId: string,
+    ttlMs: number,
+    limit: number,
+    options?: { prepareMigrationPin?: boolean },
+  ): Promise<boolean> {
+    const owner = normalizeOwnerId(teamId);
+    if (owner === null) return false;
+    return await this.db.doTn(async tn =>
+      this.acquireInTxn(
+        tn,
+        owner,
+        holderId,
+        ttlMs,
+        limit,
+        options?.prepareMigrationPin === true,
+        false,
+      ),
+    );
+  }
+
+  // Renews an existing holder without changing the configured team limit or
+  // resurrecting a holder that expiry cleanup has already released.
+  public async renew(
+    teamId: string,
+    holderId: string,
+    ttlMs: number,
+  ): Promise<boolean> {
+    const owner = normalizeOwnerId(teamId);
+    if (owner === null) return false;
+    return await this.db.doTn(async tn =>
+      this.acquireInTxn(tn, owner, holderId, ttlMs, null, false, true),
+    );
   }
 
   // Releases the slot, handing it to a pending job when one exists.
