@@ -1,5 +1,8 @@
 import { randomUUID } from "crypto";
-import { TransactionOptionCode, type Transaction } from "foundationdb";
+import type {
+  Transaction,
+  TransactionOptionCode as FdbTransactionOptionCode,
+} from "foundationdb";
 import { Logger } from "winston";
 import { logger as _logger } from "../../../lib/logger";
 import { config } from "../../../config";
@@ -55,6 +58,12 @@ import {
   GroupJobIndexValue,
 } from "./ops";
 import { NuqFdbGroupOps } from "./groups";
+
+// FDB's stable transaction option code for TIMEOUT. Keep this local so merely
+// importing queue types does not eagerly load libfdb_c in PG-only processes.
+const TransactionOptionCode = {
+  Timeout: 500 as FdbTransactionOptionCode,
+};
 
 const DATA_CHUNK_BYTES = 90 * 1024;
 // FoundationDB caps transactions at 10,000,000 bytes of affected data. Keep
