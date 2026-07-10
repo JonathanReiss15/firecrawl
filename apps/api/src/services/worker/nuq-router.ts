@@ -118,6 +118,7 @@ async function hasAuthoritativeFdbTeamResidue(
     const [
       scrapePending,
       scrapeActive,
+      scrapeIndexedLive,
       crawlFinishedPending,
       crawlFinishedActive,
       crawlFinishedIndexedLive,
@@ -125,6 +126,7 @@ async function hasAuthoritativeFdbTeamResidue(
     ] = await Promise.all([
       scrapeQueueFdb.getTeamPendingCount(teamId),
       scrapeQueueFdb.getTeamActiveCount(teamId),
+      scrapeQueueFdb.hasReadyOrActiveJobForOwner(teamId),
       crawlFinishedQueueFdb.getTeamPendingCount(teamId),
       crawlFinishedQueueFdb.getTeamActiveCount(teamId),
       crawlFinishedQueueFdb.hasReadyOrActiveJobForOwner(teamId),
@@ -133,6 +135,7 @@ async function hasAuthoritativeFdbTeamResidue(
     return hasLegacyFdbTeamResidue({
       scrapePending,
       scrapeActive,
+      scrapeIndexedLive,
       crawlFinishedPending,
       crawlFinishedActive,
       crawlFinishedIndexedLive,
@@ -174,6 +177,50 @@ async function discoverLegacyTeamAuthority(
     // not a fallback after an unavailable FDB probe.
     emptyBackend: "pg",
   });
+}
+
+async function ensureMigrationTeamState(teamId: string) {
+  let state = await optionalFdbRead(() =>
+    nuqFdbMigrationStore.inspectState(teamId),
+  );
+  if (!state) {
+    await requireFdbCoreMetricReadiness();
+    state = await fdbMutation(() =>
+      recoverLegacyTeamState(nuqFdbMigrationStore, teamId, () =>
+        discoverLegacyTeamAuthority(teamId),
+      ),
+    );
+  }
+  return state;
+}
+
+async function legacyGenerationForBackend(
+  teamId: string,
+  backend: QueueBackend,
+  terminal: boolean,
+): Promise<number> {
+  const state = await ensureMigrationTeamState(teamId);
+  if (state.activeBackend === backend) return state.activeGeneration;
+  if (!terminal) {
+    throw new NuQRouterPinMismatchError(
+      "team",
+      teamId,
+      state.activeBackend,
+      backend,
+    );
+  }
+  for (let generation = state.maxGeneration; generation >= 1; generation--) {
+    const record = await optionalFdbRead(() =>
+      nuqFdbMigrationStore.inspectGeneration(teamId, generation),
+    );
+    if (record.generation.backend === backend) return generation;
+  }
+  throw new NuQRouterPinMismatchError(
+    "team",
+    teamId,
+    state.activeBackend,
+    backend,
+  );
 }
 
 async function reconcileTerminalPgPins(teamId: string): Promise<void> {
@@ -432,43 +479,42 @@ async function getCrawlQueueBackend(
     repairMarker: backend =>
       repairBackendMarker(groupBackendKey(crawlId), backend),
   });
-  if (
-    backend === "pg" &&
-    !(await optionalFdbRead(() =>
-      nuqFdbMigrationStore.inspectPin("group", crawlId),
-    ))
-  ) {
+  const existingPin = await optionalFdbRead(() =>
+    nuqFdbMigrationStore.inspectPin("group", crawlId),
+  );
+  if (backend === "fdb" && !existingPin) {
+    const group = await optionalFdbRead(() => crawlGroupFdb.getGroup(crawlId));
+    if (!group) return null;
+    const terminal = group.status !== "active";
+    const generation = await legacyGenerationForBackend(
+      group.ownerId,
+      "fdb",
+      terminal,
+    );
+    await fdbMutation(() =>
+      nuqFdbMigrationStore.preparePinnedObject({
+        teamId: group.ownerId,
+        kind: "group",
+        objectId: crawlId,
+        admission: {
+          type: "legacy-backfill",
+          backend: "fdb",
+          generation,
+          terminal,
+        },
+        requiredBackend: "fdb",
+        residue: { control_groups: terminal ? 0 : 1 },
+      }),
+    );
+  } else if (backend === "pg" && !existingPin) {
     const group = await crawlGroupPg.getGroup(crawlId);
     if (!group) return null;
-    let state = await optionalFdbRead(() =>
-      nuqFdbMigrationStore.inspectState(group.ownerId),
+    const terminal = group.status !== "active";
+    const generation = await legacyGenerationForBackend(
+      group.ownerId,
+      "pg",
+      terminal,
     );
-    if (!state) {
-      state = await fdbMutation(() =>
-        recoverLegacyTeamState(nuqFdbMigrationStore, group.ownerId, () =>
-          discoverLegacyTeamAuthority(group.ownerId),
-        ),
-      );
-    }
-    let generation = state.activeGeneration;
-    if (state.activeBackend !== "pg") {
-      if (group.status === "active") {
-        throw new NuQRouterPinMismatchError("group", crawlId, "fdb", "pg");
-      }
-      generation = 0;
-      for (let candidate = state.maxGeneration; candidate >= 1; candidate--) {
-        const record = await optionalFdbRead(() =>
-          nuqFdbMigrationStore.inspectGeneration(group.ownerId, candidate),
-        );
-        if (record.generation.backend === "pg") {
-          generation = candidate;
-          break;
-        }
-      }
-      if (generation === 0) {
-        throw new NuQRouterPinMismatchError("group", crawlId, "fdb", "pg");
-      }
-    }
     await fdbMutation(() =>
       nuqFdbMigrationStore.preparePinnedObject({
         teamId: group.ownerId,
@@ -478,9 +524,10 @@ async function getCrawlQueueBackend(
           type: "legacy-backfill",
           backend: "pg",
           generation,
-          terminal: group.status !== "active",
+          terminal,
         },
-        residue: { control_groups: group.status === "active" ? 1 : 0 },
+        requiredBackend: "pg",
+        residue: { control_groups: terminal ? 0 : 1 },
       }),
     );
   }
@@ -555,11 +602,9 @@ async function prepareRoutingPin(input: {
             source: { kind: "group", objectId: input.sourceGroupId },
           }
         : { type: "new-root" },
-      // This pre-intent is deliberately durable before a backend mutation.
-      // TODO(corrected-core): queue/group/slot mutations and sweeper lifecycle
-      // generation accounting must compose the exported *InTxn hooks in their
-      // own FDB transaction. Until then an ambiguous outcome remains fenced;
-      // this prototype does not pretend the separate transactions are atomic.
+      // The pre-intent fences an ambiguous call boundary. FDB runtime writers
+      // consume it into exact residue in the same transaction as their record
+      // mutation; PG publication resolves it through the durable saga adapter.
       residue: { intent_unresolved: 1 },
     }),
   );
@@ -640,60 +685,63 @@ async function completeRoutingPin(
 // Non-queue work that occupies team capacity is durably pinned. Renew/release
 // follows that pin even if the rollout flag changes mid-hold.
 
+async function inspectOrRecoverExternalSlotPin(
+  teamId: string,
+  holderId: string,
+): Promise<MigrationObjectPin | null> {
+  if (!fdbQueueEnabled() || fdbForced()) return null;
+  const existing = await optionalFdbRead(() =>
+    nuqFdbMigrationStore.inspectPin("external_holder", holderId),
+  );
+  if (existing) return existing;
+
+  // Query both holder ledgers before interpreting a legacy record. Redis loss
+  // is never evidence for FDB, and simultaneous presence is corruption.
+  const [pgScore, fdbPresent] = await Promise.all([
+    getRedisConnection().zscore(constructConcurrencyLimitKey(teamId), holderId),
+    optionalFdbRead(() => externalSlotsFdb.has(teamId, holderId)),
+  ]);
+  const pgPresent = pgScore !== null;
+  if (pgPresent && fdbPresent) {
+    throw new NuQRouterBothBackendsError("external_holder", holderId);
+  }
+  const backend: QueueBackend | null = pgPresent
+    ? "pg"
+    : fdbPresent
+      ? "fdb"
+      : null;
+  if (!backend) return null;
+  const state = await ensureMigrationTeamState(teamId);
+  if (state.activeBackend !== backend) {
+    throw new NuQRouterPinMismatchError(
+      "external_holder",
+      holderId,
+      state.activeBackend,
+      backend,
+    );
+  }
+  return await fdbMutation(() =>
+    nuqFdbMigrationStore.preparePinnedObject({
+      teamId,
+      kind: "external_holder",
+      objectId: holderId,
+      admission: {
+        type: "legacy-backfill",
+        backend,
+        generation: state.activeGeneration,
+      },
+      requiredBackend: backend,
+      residue: { capacity_external_holders: 1 },
+    }),
+  );
+}
+
 async function acquireExternalSlot(
   teamId: string,
   holderId: string,
   ttlMs: number,
 ): Promise<void> {
-  let existingPin =
-    !fdbQueueEnabled() || fdbForced()
-      ? null
-      : await optionalFdbRead(() =>
-          nuqFdbMigrationStore.inspectPin("external_holder", holderId),
-        );
-  if (!existingPin && fdbQueueEnabled() && !fdbForced()) {
-    let state = await optionalFdbRead(() =>
-      nuqFdbMigrationStore.inspectState(teamId),
-    );
-    if (!state) {
-      state = await fdbMutation(() =>
-        recoverLegacyTeamState(nuqFdbMigrationStore, teamId, () =>
-          discoverLegacyTeamAuthority(teamId),
-        ),
-      );
-    }
-    // Only the legacy PG holder ledger has a directly queryable per-holder
-    // record. Existing FDB holders remain safe through their durable slot TTL;
-    // without a migration pin a transition rejects renewal rather than guessing.
-    const pgPresent = await getRedisConnection().zscore(
-      constructConcurrencyLimitKey(teamId),
-      holderId,
-    );
-    const legacyBackend = pgPresent !== null ? "pg" : null;
-    if (legacyBackend) {
-      if (state.activeBackend !== legacyBackend) {
-        throw new NuQRouterPinMismatchError(
-          "external_holder",
-          holderId,
-          state.activeBackend,
-          legacyBackend,
-        );
-      }
-      existingPin = await fdbMutation(() =>
-        nuqFdbMigrationStore.preparePinnedObject({
-          teamId,
-          kind: "external_holder",
-          objectId: holderId,
-          admission: {
-            type: "legacy-backfill",
-            backend: legacyBackend,
-            generation: state.activeGeneration,
-          },
-          residue: { capacity_external_holders: 1 },
-        }),
-      );
-    }
-  }
+  const existingPin = await inspectOrRecoverExternalSlotPin(teamId, holderId);
   if (!existingPin) await authoritativeTeamBackend(teamId);
   const pin =
     existingPin ??
@@ -746,12 +794,7 @@ export async function mirrorExternalSlotRelease(
   holderId: string,
 ): Promise<void> {
   await withTeamMigrationAdmission(teamId, async () => {
-    const pin =
-      !fdbQueueEnabled() || fdbForced()
-        ? null
-        : await optionalFdbRead(() =>
-            nuqFdbMigrationStore.inspectPin("external_holder", holderId),
-          );
+    const pin = await inspectOrRecoverExternalSlotPin(teamId, holderId);
     const backend = pin?.backend ?? (fdbForced() ? "fdb" : "pg");
     if (backend === "fdb") {
       await fdbMutation(() => externalSlotsFdb.release(teamId, holderId));

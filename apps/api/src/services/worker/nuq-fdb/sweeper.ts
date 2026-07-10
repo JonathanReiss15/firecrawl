@@ -1272,14 +1272,16 @@ export class NuqFdbSweeper {
               await tn.get(ks.jobStatus(id)),
             );
             if (status?.s === "ingesting" && status.op === op) {
-              await nuqFdbMigrationStore.reconcileManagedObjectInTxn(tn, {
-                teamId: meta.o,
-                kind: ks.migrationObjectKind,
-                objectId: id,
-                allowMissingRecordPin: true,
-                residue: {},
-                terminal: true,
-              });
+              if (meta.o) {
+                await nuqFdbMigrationStore.reconcileManagedObjectInTxn(tn, {
+                  teamId: meta.o,
+                  kind: ks.migrationObjectKind,
+                  objectId: id,
+                  allowMissingRecordPin: true,
+                  residue: {},
+                  terminal: true,
+                });
+              }
               deleteJobRecords(tn, ks, id);
               await alignQueueMetricStatus(tn, ks, id);
             }
@@ -1415,8 +1417,10 @@ export class NuqFdbSweeper {
     observedTaskKey: Buffer,
   ): Promise<void> {
     const ks = queue.ks;
-    const startedAt = Date.now();
-    while (Date.now() - startedAt < PARTITION_WORK_BUDGET_MS) {
+    // Once a group task is claimed, finish its resumable pages while renewing
+    // ownership. Yielding at the partition budget can strand the only task
+    // behind its still-live lease, so a concurrent sweeper cannot continue it.
+    while (true) {
       await this.renewClaim(claim);
       const result = await this.db.doTn(async tn => {
         await this.guardClaim(tn, claim);

@@ -156,6 +156,7 @@ export type BackendMarker = MigrationBackend | "corrupt" | null;
 export function hasLegacyFdbTeamResidue(input: {
   scrapePending: number;
   scrapeActive: number;
+  scrapeIndexedLive: boolean;
   crawlFinishedPending: number;
   crawlFinishedActive: number;
   crawlFinishedIndexedLive: boolean;

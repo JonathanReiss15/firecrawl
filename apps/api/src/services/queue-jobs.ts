@@ -455,8 +455,8 @@ export async function _addScrapeJobToBullMQ(
   return await withTeamMigrationAdmission(
     webScraperOptions.team_id,
     async () => {
-      // Direct adds bypass admission but occupy/release a team slot on both
-      // backends.
+      // Direct/kickoff adds bypass the queue gate. The FDB core deliberately
+      // gives bypass jobs no slot; the PG path retains its legacy reservation.
       if ((await resolveJobBackend(webScraperOptions)) === "fdb") {
         if (webScraperOptions.mode === "single_urls") {
           abTestJob(webScraperOptions);

@@ -39,9 +39,17 @@ vi.mock("../../lib/concurrency-redis", () => ({
 }));
 
 import { config } from "../../config";
-import { isFdbTeam } from "../../services/worker/nuq-router";
+import { getRedisConnection } from "../../services/queue-service";
+import {
+  isFdbTeam,
+  mirrorExternalSlotAcquire,
+  mirrorExternalSlotRelease,
+  resolveJobBackend,
+} from "../../services/worker/nuq-router";
 import {
   crawlFinishedQueueFdb,
+  crawlGroupFdb,
+  externalSlotsFdb,
   nuqFdbMigrationStore,
   scrapeQueueFdb,
 } from "../../services/worker/nuq-fdb";
@@ -113,6 +121,159 @@ describeIf("NuQ durable migration router", () => {
       activeGeneration: 1,
       phase: "PG_ONLY",
     });
+  });
+
+  test("discovers and drains an uncounted pre-protocol FDB job without dual authority", async () => {
+    const teamId = randomUUID();
+    const jobId = randomUUID();
+    teams.add(teamId);
+    controls.fdbFlag = false;
+    controls.pgResidue = 0;
+    await scrapeQueueFdb.addJob(
+      jobId,
+      {
+        mode: "single_urls",
+        url: "https://example.com/legacy-direct",
+        team_id: teamId,
+      } as any,
+      { ownerId: teamId, bypassGate: true },
+      { teamLimit: 1, queueCap: 10 },
+    );
+
+    // The owner index catches bypass jobs that intentionally hold no team slot.
+    await expect(isFdbTeam(teamId)).resolves.toBe(true);
+    await expect(
+      nuqFdbMigrationStore.inspectState(teamId),
+    ).resolves.toMatchObject({
+      activeBackend: "fdb",
+      phase: "FDB_ONLY",
+    });
+    await expect(isFdbTeam(teamId)).rejects.toMatchObject({
+      code: "NUQ_MIGRATION_IN_PROGRESS",
+    });
+
+    const active = await scrapeQueueFdb.getJobToProcess();
+    expect(active?.id).toBe(jobId);
+    await scrapeQueueFdb.jobFinish(jobId, active!.lock!, {});
+    await scrapeQueueFdb.removeJob(jobId);
+    await expect(
+      nuqFdbMigrationStore.inspectPin("scrape_job", jobId),
+    ).resolves.toMatchObject({
+      admission: "legacy-backfill",
+      lifecycle: "terminal",
+    });
+
+    await expect(isFdbTeam(teamId)).resolves.toBe(false);
+    await expect(
+      nuqFdbMigrationStore.inspectState(teamId),
+    ).resolves.toMatchObject({
+      activeBackend: "pg",
+      phase: "PG_ONLY",
+    });
+  });
+
+  test("a legacy FDB group pins descendants and crawl-finished control through drain", async () => {
+    const teamId = randomUUID();
+    const groupId = randomUUID();
+    const childId = randomUUID();
+    teams.add(teamId);
+    controls.fdbFlag = false;
+    controls.pgResidue = 0;
+    await crawlGroupFdb.addGroup(groupId, teamId);
+
+    const data = {
+      mode: "single_urls",
+      team_id: teamId,
+      crawl_id: groupId,
+      url: "https://example.com/legacy-group",
+    } as any;
+    await expect(resolveJobBackend(data)).resolves.toBe("fdb");
+    await expect(
+      nuqFdbMigrationStore.inspectPin("group", groupId),
+    ).resolves.toMatchObject({
+      admission: "legacy-backfill",
+      backend: "fdb",
+      lifecycle: "prepared",
+    });
+    await nuqFdbMigrationStore.preparePinnedObject({
+      teamId,
+      kind: "scrape_job",
+      objectId: childId,
+      admission: {
+        type: "pinned-continuation",
+        source: { kind: "group", objectId: groupId },
+      },
+      requiredBackend: "fdb",
+      residue: { intent_unresolved: 1 },
+    });
+    await scrapeQueueFdb.addJob(
+      childId,
+      data,
+      { ownerId: teamId, groupId },
+      { teamLimit: null, queueCap: 10 },
+    );
+
+    await expect(isFdbTeam(teamId)).rejects.toMatchObject({
+      code: "NUQ_MIGRATION_IN_PROGRESS",
+    });
+    const child = await scrapeQueueFdb.getJobToProcess();
+    expect(child?.id).toBe(childId);
+    await scrapeQueueFdb.jobFinish(childId, child!.lock!, {});
+    const finished = await crawlFinishedQueueFdb.getJobToProcess();
+    expect(finished?.groupId).toBe(groupId);
+    await crawlFinishedQueueFdb.jobFinish(finished!.id, finished!.lock!, {});
+    await Promise.all([
+      scrapeQueueFdb.removeJob(childId),
+      crawlFinishedQueueFdb.removeJob(finished!.id),
+    ]);
+
+    await expect(isFdbTeam(teamId)).resolves.toBe(false);
+    await expect(
+      nuqFdbMigrationStore.inspectState(teamId),
+    ).resolves.toMatchObject({
+      activeBackend: "pg",
+      phase: "PG_ONLY",
+    });
+    const db = getNuqFdbDatabase();
+    await db.doTn(async tn => {
+      const range = crawlGroupFdb.ks.groupRange(groupId);
+      tn.clearRange(range.begin, range.end);
+      tn.clear(crawlGroupFdb.ks.ongoingGroup(teamId, groupId));
+    });
+  });
+
+  test("legacy external holders detect dual presence and retain their FDB generation", async () => {
+    const teamId = randomUUID();
+    const holderId = randomUUID();
+    teams.add(teamId);
+    controls.fdbFlag = false;
+    controls.pgResidue = 0;
+    await externalSlotsFdb.acquire(teamId, holderId, 60_000);
+    await getRedisConnection().zadd(
+      `limit:${teamId}`,
+      Date.now() + 60_000,
+      holderId,
+    );
+
+    await expect(
+      mirrorExternalSlotAcquire(teamId, holderId, 120_000),
+    ).rejects.toMatchObject({ code: "NUQ_ROUTER_BOTH_BACKENDS_PRESENT" });
+    await getRedisConnection().zrem(`limit:${teamId}`, holderId);
+
+    await mirrorExternalSlotAcquire(teamId, holderId, 120_000);
+    await expect(
+      nuqFdbMigrationStore.inspectPin("external_holder", holderId),
+    ).resolves.toMatchObject({
+      admission: "legacy-backfill",
+      backend: "fdb",
+      lifecycle: "active",
+      residue: { capacity_external_holders: 1 },
+    });
+    await mirrorExternalSlotRelease(teamId, holderId);
+    await expect(externalSlotsFdb.has(teamId, holderId)).resolves.toBe(false);
+    await expect(
+      nuqFdbMigrationStore.inspectPin("external_holder", holderId),
+    ).resolves.toMatchObject({ lifecycle: "terminal" });
   });
 
   test("durable source residue blocks seal until the authoritative ledger drains", async () => {

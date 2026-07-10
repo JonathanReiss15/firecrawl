@@ -6,6 +6,7 @@ import {
   NuQFdbQueue,
   NuqFdbExternalSlots,
   NuqFdbMigrationStore,
+  NuqFdbSweeper,
 } from "../../services/worker/nuq-fdb";
 import {
   getFdb,
@@ -118,9 +119,16 @@ describeIf("NuQ FDB transaction-scoped migration generation hooks", () => {
       unlimited,
     );
     expect(legacy.migrationGeneration).toBeUndefined();
+    await queue.beginMetricCounterBackfill();
+    while (!(await queue.backfillMetricCounts(100))) {
+      // bounded pages
+    }
+    const metricControl = await queue.getMetricCounterBackfillStatus();
+    expect(metricControl?.phase).toBe("ready");
     await db.doTn(async tn => {
       tn.clear(queue.ks.ownerLiveJob(legacyTeam, legacyId));
-      tn.clear(queue.ks.ownerLiveBackfillCursor());
+      tn.clear(queue.ks.ownerLiveBackfillCursor(metricControl!.generation));
+      tn.clear(queue.ks.ownerLiveBackfillReady(metricControl!.generation));
     });
     await expect(queue.hasReadyOrActiveJobForOwner(legacyTeam)).resolves.toBe(
       true,
@@ -131,6 +139,47 @@ describeIf("NuQ FDB transaction-scoped migration generation hooks", () => {
     await expect(
       queue.addJob(randomUUID(), {}, { ownerId: teamId }, unlimited),
     ).rejects.toMatchObject({ code: "NUQ_MIGRATION_PIN_NOT_FOUND" });
+  });
+
+  test("existing pre-protocol jobs and external holders adopt the source generation while draining", async () => {
+    const teamId = randomUUID();
+    teams.add(teamId);
+    const id = randomUUID();
+    const holderId = randomUUID();
+    await queue.addJob(id, {}, { ownerId: teamId }, unlimited);
+    await slots.acquire(teamId, holderId, 60_000);
+    await store.initializeLegacyTeam(teamId, "fdb", randomUUID());
+    await store.beginTransition({
+      teamId,
+      targetBackend: "pg",
+      operationId: randomUUID(),
+    });
+
+    const active = await queue.getJobToProcess();
+    expect(active?.id).toBe(id);
+    await expect(store.inspectPin("scrape_job", id)).resolves.toMatchObject({
+      admission: "legacy-backfill",
+      backend: "fdb",
+      generation: 1,
+      lifecycle: "active",
+    });
+    await queue.jobFinish(id, active!.lock!, {});
+    await expect(store.inspectPin("scrape_job", id)).resolves.toMatchObject({
+      lifecycle: "terminal",
+    });
+
+    await slots.acquire(teamId, holderId, 120_000);
+    await expect(
+      store.inspectPin("external_holder", holderId),
+    ).resolves.toMatchObject({
+      admission: "legacy-backfill",
+      lifecycle: "active",
+      residue: { capacity_external_holders: 1 },
+    });
+    await slots.release(teamId, holderId);
+    await expect(
+      store.inspectPin("external_holder", holderId),
+    ).resolves.toMatchObject({ lifecycle: "terminal" });
   });
 
   test("ready/active residue is exact and terminal drain remains allowed", async () => {
@@ -223,6 +272,57 @@ describeIf("NuQ FDB transaction-scoped migration generation hooks", () => {
     ).toBe(true);
   });
 
+  test("crawl-pending and delayed residue transition atomically through sweeper promotion", async () => {
+    const teamId = await managedTeam();
+    const gid = randomUUID();
+    const firstId = randomUUID();
+    const delayedId = randomUUID();
+    await prepareGroup(teamId, gid);
+    await groups.addGroup(gid, teamId, undefined, {
+      maxConcurrency: 1,
+      delaySeconds: 1,
+    });
+    for (const id of [firstId, delayedId]) await prepareJob(teamId, id, gid);
+    await queue.addJobs(
+      [firstId, delayedId].map(id => ({
+        id,
+        data: { mode: "single_urls" },
+        options: { ownerId: teamId, groupId: gid },
+      })),
+      { teamLimit: 10, queueCap: 10 },
+    );
+    expect(await residue(teamId)).toMatchObject({
+      capacity_ready_active: 1,
+      capacity_crawl_pending: 1,
+      capacity_delayed: 0,
+    });
+
+    const first = await queue.getJobToProcess();
+    expect(first?.id).toBe(firstId);
+    await queue.jobFinish(firstId, first!.lock!, {});
+    expect(await residue(teamId)).toMatchObject({
+      capacity_ready_active: 0,
+      capacity_crawl_pending: 0,
+      capacity_delayed: 1,
+    });
+
+    await new Promise(resolve => setTimeout(resolve, 1_100));
+    const sweeper = new NuqFdbSweeper([queue, finishedQueue], []);
+    await sweeper.sweepOnce();
+    expect(await residue(teamId)).toMatchObject({
+      capacity_ready_active: 1,
+      capacity_delayed: 0,
+    });
+    const delayed = await queue.getJobToProcess();
+    expect(delayed?.id).toBe(delayedId);
+    await queue.jobFinish(delayedId, delayed!.lock!, {});
+    const finished = await finishedQueue.getJobToProcess();
+    await finishedQueue.jobFinish(finished!.id, finished!.lock!, {});
+    expect(
+      Object.values(await residue(teamId)).every(value => value === 0),
+    ).toBe(true);
+  });
+
   test("external holders and group/crawl_finished controls are exact", async () => {
     const teamId = await managedTeam();
     const holderId = randomUUID();
@@ -280,6 +380,53 @@ describeIf("NuQ FDB transaction-scoped migration generation hooks", () => {
     expect((await residue(teamId)).control_crawl_finished).toBe(0);
   });
 
+  test("a live enqueue transaction and final seal cannot both commit", async () => {
+    const teamId = await managedTeam();
+    const id = randomUUID();
+    await store.preparePinnedObject({
+      teamId,
+      kind: "scrape_job",
+      objectId: id,
+      admission: { type: "new-root" },
+      requiredBackend: "fdb",
+      residue: {},
+    });
+    const transition = await store.beginTransition({
+      teamId,
+      targetBackend: "pg",
+      operationId: randomUUID(),
+    });
+
+    const results = await Promise.allSettled([
+      queue.addJob(id, {}, { ownerId: teamId }, unlimited),
+      store.finalSeal({
+        teamId,
+        transitionOperationId: transition.transitionOperationId!,
+      }),
+    ]);
+    expect(
+      results.filter(result => result.status === "fulfilled"),
+    ).toHaveLength(1);
+    if (results[0].status === "fulfilled") {
+      expect(results[1]).toMatchObject({
+        status: "rejected",
+        reason: { code: "NUQ_MIGRATION_RESIDUE_NOT_EMPTY" },
+      });
+      await queue.removeJob(id);
+      await expect(
+        store.finalSeal({
+          teamId,
+          transitionOperationId: transition.transitionOperationId!,
+        }),
+      ).resolves.toMatchObject({ activeBackend: "pg" });
+    } else {
+      expect(results[0].reason).toMatchObject({
+        code: "NUQ_MIGRATION_STALE_GENERATION",
+      });
+      expect(results[1]).toMatchObject({ status: "fulfilled" });
+    }
+  });
+
   test("sealed generations reject enqueue and active finish mutations", async () => {
     const enqueueTeam = await managedTeam();
     const enqueueId = randomUUID();
@@ -324,6 +471,37 @@ describeIf("NuQ FDB transaction-scoped migration generation hooks", () => {
     await groups.addGroup(gid, groupTeam);
     await forceSealCorruptResidueForStaleGenerationTest(groupTeam);
     await expect(groups.cancelGroup(gid)).rejects.toMatchObject({
+      code: "NUQ_MIGRATION_STALE_GENERATION",
+    });
+  });
+
+  test("sealed generations reject delayed sweeper promotion", async () => {
+    const teamId = await managedTeam();
+    const gid = randomUUID();
+    const firstId = randomUUID();
+    const delayedId = randomUUID();
+    await prepareGroup(teamId, gid);
+    await groups.addGroup(gid, teamId, undefined, {
+      maxConcurrency: 1,
+      delaySeconds: 1,
+    });
+    for (const id of [firstId, delayedId]) await prepareJob(teamId, id, gid);
+    await queue.addJobs(
+      [firstId, delayedId].map(id => ({
+        id,
+        data: { mode: "single_urls" },
+        options: { ownerId: teamId, groupId: gid },
+      })),
+      { teamLimit: 10, queueCap: 10 },
+    );
+    const first = await queue.getJobToProcess();
+    await queue.jobFinish(first!.id, first!.lock!, {});
+    expect((await residue(teamId)).capacity_delayed).toBe(1);
+
+    await forceSealCorruptResidueForStaleGenerationTest(teamId);
+    await new Promise(resolve => setTimeout(resolve, 1_100));
+    const sweeper = new NuqFdbSweeper([queue, finishedQueue], []);
+    await expect(sweeper.sweepOnce()).rejects.toMatchObject({
       code: "NUQ_MIGRATION_STALE_GENERATION",
     });
   });

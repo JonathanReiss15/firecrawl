@@ -591,6 +591,8 @@ jobs:
       FDB_VERSION: 7.3.63
       NUQ_DATABASE_URL: postgres://postgres:postgres@localhost:5432/postgres
       REDIS_URL: redis://localhost:6379
+      REDIS_RATE_LIMIT_URL: redis://localhost:6379
+      REDIS_EVICT_URL: redis://localhost:6379
     steps:
       - uses: actions/checkout@v5
 
@@ -639,7 +641,12 @@ jobs:
           echo "docker:docker@127.0.0.1:4500" > /tmp/fdb.cluster
 
       - name: Run NuQ FDB core tests
-        run: npx vitest run src/__tests__/nuq-fdb --reporter=default
+        shell: bash
+        run: |
+          set -euo pipefail
+          for test in src/__tests__/nuq-fdb/*.test.ts; do
+            npx vitest run "$test" --reporter=default --maxWorkers=1 --no-file-parallelism
+          done
         working-directory: apps/api
         env:
           FDB_CLUSTER_FILE: /tmp/fdb.cluster

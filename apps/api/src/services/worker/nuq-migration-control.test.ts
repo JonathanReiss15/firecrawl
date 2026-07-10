@@ -234,6 +234,7 @@ describe("legacy team authority discovery", () => {
       hasLegacyFdbTeamResidue({
         scrapePending: 0,
         scrapeActive: 0,
+        scrapeIndexedLive: false,
         crawlFinishedPending: 0,
         crawlFinishedActive: 0,
         crawlFinishedIndexedLive: true,

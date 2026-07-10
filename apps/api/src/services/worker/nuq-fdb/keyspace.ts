@@ -226,8 +226,11 @@ export class NuqFdbKeyspace {
   ownerLiveJobRange(ownerId: string) {
     return this.packRange(["oj", ownerId]);
   }
-  ownerLiveBackfillCursor(): Buffer {
-    return this.pack(["ojctl", "cursor"]);
+  ownerLiveBackfillCursor(metricGeneration: string): Buffer {
+    return this.pack(["ojctl", metricGeneration, "cursor"]);
+  }
+  ownerLiveBackfillReady(metricGeneration: string): Buffer {
+    return this.pack(["ojctl", metricGeneration, "ready"]);
   }
 
   // === Resumable enqueue / commit-unknown claim records

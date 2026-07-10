@@ -76,6 +76,8 @@ export async function reconcileJobMigrationInTxn(
   residue: Partial<MigrationResidue>,
   options?: { allowMissingRecordPin?: boolean; terminal?: boolean },
 ): Promise<MigrationObjectPin | null> {
+  // Ownerless operational jobs have no team migration authority or capacity.
+  if (!entry.o) return null;
   const effectiveResidue =
     ks.migrationObjectKind === "crawl_finished" && !options?.terminal
       ? ({ control_crawl_finished: 1 } as const)
@@ -100,6 +102,7 @@ export async function validateJobMigrationInTxn(
   entry: QueueEntry,
   options?: { allowMissingRecordPin?: boolean },
 ): Promise<MigrationObjectPin | null> {
+  if (!entry.o) return null;
   return await nuqFdbMigrationStore.validateManagedObjectInTxn(tn, {
     teamId: entry.o,
     kind: ks.migrationObjectKind,

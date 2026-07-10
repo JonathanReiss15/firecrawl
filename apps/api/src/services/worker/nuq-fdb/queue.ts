@@ -647,6 +647,7 @@ export class NuQFdbQueue<JobData = any, JobReturnValue = any> {
       }
       if (fresh.length === 0) return;
       for (const { job, plan } of fresh) {
+        if (!plan.o) continue;
         await nuqFdbMigrationStore.validateManagedObjectInTxn(tn, {
           teamId: plan.o,
           kind: ks.migrationObjectKind,
@@ -973,14 +974,16 @@ export class NuQFdbQueue<JobData = any, JobReturnValue = any> {
             await tn.get(ks.jobStatus(id)),
           );
           if (status?.s === "ingesting" && status.op === op) {
-            await nuqFdbMigrationStore.reconcileManagedObjectInTxn(tn, {
-              teamId: opMeta.o,
-              kind: ks.migrationObjectKind,
-              objectId: id,
-              allowMissingRecordPin: true,
-              residue: {},
-              terminal: true,
-            });
+            if (opMeta.o) {
+              await nuqFdbMigrationStore.reconcileManagedObjectInTxn(tn, {
+                teamId: opMeta.o,
+                kind: ks.migrationObjectKind,
+                objectId: id,
+                allowMissingRecordPin: true,
+                residue: {},
+                terminal: true,
+              });
+            }
             deleteJobRecords(tn, ks, id);
             await alignQueueMetricStatus(tn, ks, id);
           }
@@ -2007,10 +2010,9 @@ export class NuQFdbQueue<JobData = any, JobReturnValue = any> {
 
   // === Introspection used by status/admin endpoints
 
-  // Maintained transactionally with every live/terminal job transition. A
-  // bounded, durable backfill makes the index rollout-safe for jobs written by
-  // older binaries; callers retry rather than falsely declaring PG authority
-  // while that backfill is incomplete.
+  // Maintained transactionally with every live/terminal job transition. The
+  // backfill marker is scoped to the corrected-core metric generation, so a
+  // rollback invalidation forces the next deployment to rescan legacy writers.
   public async hasReadyOrActiveJobForOwner(ownerId: string): Promise<boolean> {
     const owner = normalizeOwnerId(ownerId);
     if (owner === null) return false;
@@ -2018,19 +2020,37 @@ export class NuQFdbQueue<JobData = any, JobReturnValue = any> {
     const maxBatchesPerCall = 10;
     for (let batch = 0; batch < maxBatchesPerCall; batch++) {
       const result = await this.db.doTn(async tn => {
+        const control = this.decodeMetricControl(
+          await tn.get(this.ks.metricControl()),
+        );
+        if (!control || control.phase !== "ready") {
+          throw new MigrationStoreError(
+            "NUQ_FDB_OWNER_INDEX_NOT_READY",
+            `owner live-job index for ${this.queueName} requires ready metric counters`,
+            true,
+          );
+        }
         const ownerRange = this.ks.ownerLiveJobRange(owner);
-        const indexed = await tn
-          .snapshot()
-          .getRangeAll(ownerRange.begin, ownerRange.end, { limit: 1 });
+        // Normal range reads conflict with a concurrent indexed publication.
+        const indexed = await tn.getRangeAll(ownerRange.begin, ownerRange.end, {
+          limit: 1,
+        });
         if (indexed.length > 0) return { found: true, ready: true };
+        if (await tn.get(this.ks.ownerLiveBackfillReady(control.generation))) {
+          return { found: false, ready: true };
+        }
         const jobs = this.ks.jobRootRange();
-        const cursor = await tn.get(this.ks.ownerLiveBackfillCursor());
+        const cursor = await tn.get(
+          this.ks.ownerLiveBackfillCursor(control.generation),
+        );
         const begin: Buffer | FdbKeySelector = cursor
           ? { key: cursor, orEqual: true, offset: 1, _isKeySelector: true }
           : jobs.begin;
-        const rows = await tn
-          .snapshot()
-          .getRangeAll(begin as any, jobs.end, { limit: batchSize });
+        // A normal scan conflicts with publication by a mixed-version writer
+        // before this generation's completion marker commits.
+        const rows = await tn.getRangeAll(begin as any, jobs.end, {
+          limit: batchSize,
+        });
         let found = false;
         for (const [rawKey, rawValue] of rows) {
           const parts = this.ks.unpack(rawKey as Buffer);
@@ -2048,14 +2068,12 @@ export class NuQFdbQueue<JobData = any, JobReturnValue = any> {
           if (meta.o === owner) found = true;
         }
         if (rows.length < batchSize) {
-          // Do not persist a permanent "complete" marker: during a rolling
-          // deployment an older writer can still publish an unindexed job.
-          // A later negative lookup safely repeats this bounded scan.
-          tn.clear(this.ks.ownerLiveBackfillCursor());
+          tn.clear(this.ks.ownerLiveBackfillCursor(control.generation));
+          tn.set(this.ks.ownerLiveBackfillReady(control.generation), EMPTY);
           return { found, ready: true };
         }
         tn.set(
-          this.ks.ownerLiveBackfillCursor(),
+          this.ks.ownerLiveBackfillCursor(control.generation),
           rows[rows.length - 1][0] as Buffer,
         );
         return { found, ready: false };

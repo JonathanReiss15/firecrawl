@@ -10,6 +10,7 @@ vi.mock("../../services/ab-test", () => ({ abTestJob: vi.fn() }));
 import { config } from "../../config";
 import { _addScrapeJobToBullMQ } from "../../services/queue-jobs";
 import { getRedisConnection } from "../../services/queue-service";
+import { redisEvictConnection } from "../../services/redis";
 import {
   crawlFinishedQueueFdb,
   nuqFdbMigrationStore,
@@ -64,9 +65,11 @@ describeIf("NuQ PG publication with durable FDB authority", () => {
     await getRedisConnection().del(
       `concurrency-limiter:${teamId}`,
       `nuq:pg-reservation:team:${teamId}:${jobId}`,
+      `nuq:job_backend:${jobId}`,
       `concurrency-limiter:${conflictTeamId}`,
       `nuq:pg-reservation:team:${conflictTeamId}:${conflictJobId}`,
     );
+    await redisEvictConnection.del(`nuq:job_backend:${jobId}`);
   });
 
   afterAll(async () => {
@@ -77,9 +80,11 @@ describeIf("NuQ PG publication with durable FDB authority", () => {
     await getRedisConnection().del(
       `concurrency-limiter:${teamId}`,
       `nuq:pg-reservation:team:${teamId}:${jobId}`,
+      `nuq:job_backend:${jobId}`,
       `concurrency-limiter:${conflictTeamId}`,
       `nuq:pg-reservation:team:${conflictTeamId}:${conflictJobId}`,
     );
+    await redisEvictConnection.del(`nuq:job_backend:${jobId}`);
     await Promise.all([
       clearMigrationTeam(teamId),
       clearMigrationTeam(conflictTeamId),
@@ -149,6 +154,18 @@ describeIf("NuQ PG publication with durable FDB authority", () => {
     expect(
       await getRedisConnection().zscore(`concurrency-limiter:${teamId}`, jobId),
     ).not.toBeNull();
+
+    const markerKey = `nuq:job_backend:${jobId}`;
+    await redisEvictConnection.set(markerKey, "corrupt");
+    await expect(routedScrapeQueue.getJob(jobId)).resolves.toMatchObject({
+      id: jobId,
+    });
+    await expect(redisEvictConnection.get(markerKey)).resolves.toBe("pg");
+    await redisEvictConnection.del(markerKey);
+    await expect(routedScrapeQueue.getJob(jobId)).resolves.toMatchObject({
+      id: jobId,
+    });
+    await expect(redisEvictConnection.get(markerKey)).resolves.toBe("pg");
 
     await expect(
       _addScrapeJobToBullMQ(

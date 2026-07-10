@@ -995,8 +995,10 @@ export class NuqFdbMigrationStore {
    * Composes migration accounting with a queue/group/slot mutation. Teams that
    * have never entered the migration control plane remain untouched. Once a
    * team state exists, the durable object pin and the pin copied onto an
-   * existing runtime record are mandatory. Reading the generation and residue
-   * keys here gives finalSeal a conflict with every residue increase.
+   * existing runtime record are mandatory. Explicit legacy-backfill pins are
+   * the sole exception for records written before runtime pins existed.
+   * Reading the generation and residue keys here gives finalSeal a conflict
+   * with every residue increase.
    */
   public async reconcileManagedObjectInTxn(
     tn: Transaction,
@@ -1016,17 +1018,41 @@ export class NuqFdbMigrationStore {
       return null;
     }
     await this.validateTopology(tn, state);
-    if (!input.recordPin && !input.allowMissingRecordPin) {
+    let pin = await this.inspectPinInTxn(tn, kind, objectId);
+    let adoptedLegacyRecord = false;
+    if (!pin) {
+      // Callers set allowMissingRecordPin only while creating a new runtime
+      // record, which must already have a router-prepared intent. Mutations of
+      // an existing pre-protocol record may adopt the active source generation
+      // explicitly; this cannot reopen new-root admission while draining.
+      if (input.recordPin || input.allowMissingRecordPin) {
+        throw new MigrationStoreError(
+          "NUQ_MIGRATION_PIN_NOT_FOUND",
+          `${kind}/${objectId} has no durable pin`,
+        );
+      }
+      pin = await this.preparePinnedObjectInTxn(tn, {
+        teamId,
+        kind,
+        objectId,
+        admission: {
+          type: "legacy-backfill",
+          backend: "fdb",
+          generation: state.activeGeneration,
+        },
+        requiredBackend: "fdb",
+        residue: input.residue,
+      });
+      adoptedLegacyRecord = true;
+    }
+    if (
+      !input.recordPin &&
+      !input.allowMissingRecordPin &&
+      pin.admission !== "legacy-backfill"
+    ) {
       throw new MigrationStoreError(
         "NUQ_MIGRATION_RUNTIME_PIN_MISSING",
         `${kind}/${objectId} is missing its runtime generation pin`,
-      );
-    }
-    const pin = await this.inspectPinInTxn(tn, kind, objectId);
-    if (!pin) {
-      throw new MigrationStoreError(
-        "NUQ_MIGRATION_PIN_NOT_FOUND",
-        `${kind}/${objectId} has no durable pin`,
       );
     }
     if (
@@ -1074,7 +1100,7 @@ export class NuqFdbMigrationStore {
     const terminal = input.terminal === true;
     const targetLifecycle: MigrationObjectLifecycle = terminal
       ? "terminal"
-      : input.activateNonterminal === false
+      : input.activateNonterminal === false && !adoptedLegacyRecord
         ? pin.lifecycle
         : "active";
     if (pin.lifecycle === "terminal") {

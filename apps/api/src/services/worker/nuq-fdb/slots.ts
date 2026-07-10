@@ -77,6 +77,14 @@ export class NuqFdbExternalSlots {
     };
   }
 
+  public async has(teamId: string, holderId: string): Promise<boolean> {
+    const owner = normalizeOwnerId(teamId);
+    if (owner === null) return false;
+    return await this.db.doTn(async tn =>
+      Boolean(await tn.snapshot().get(this.key(owner, holderId))),
+    );
+  }
+
   // Acquires (or renews) an external slot. Unconditional: never blocks on the
   // team limit; the caller's own gate (Lua semaphore, session limits) decides
   // admission. Re-acquiring an existing holder just extends its expiry.
@@ -95,11 +103,12 @@ export class NuqFdbExternalSlots {
         await tn.get(this.key(owner, holderId)),
       );
       const existingPin = existing
-        ? await nuqFdbMigrationStore.validateManagedObjectInTxn(tn, {
+        ? await nuqFdbMigrationStore.reconcileManagedObjectInTxn(tn, {
             teamId: owner,
             kind: "external_holder",
             objectId: holderId,
             recordPin: runtimeMigrationPin(existing),
+            residue: { capacity_external_holders: 1 },
           })
         : null;
       if (existing) {
