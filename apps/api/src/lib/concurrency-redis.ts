@@ -58,6 +58,9 @@ if redis.call('ZSCORE', KEYS[1], ARGV[1]) then
     redis.call('PEXPIRE', KEYS[2], ARGV[3])
     return {1, 1}
   end
+  -- A distinct retry/renewal now owns the stable holder. Fence any older
+  -- insertion token without granting this renewal destructive rollback rights.
+  redis.call('SET', KEYS[2], 'held', 'PX', ARGV[3])
   return {1, 0}
 end
 
@@ -149,7 +152,7 @@ export async function pushConcurrencyLimitActiveJob(
 const removeConcurrencySlotScript = `
 if redis.call('ZREM', KEYS[1], ARGV[1]) == 0 then return 0 end
 local marker = redis.call('GET', KEYS[2])
-if marker and string.sub(marker, 1, 6) == 'owner:' then
+if marker and string.sub(marker, 1, 8) ~= 'cleanup:' then
   redis.call('DEL', KEYS[2])
 end
 return 1
@@ -220,6 +223,8 @@ local now_ms = t[1] * 1000 + math.floor(t[2] / 1000)
 redis.call('ZREMRANGEBYSCORE', KEYS[1], '-inf', now_ms)
 if not redis.call('ZSCORE', KEYS[1], ARGV[1]) then return 0 end
 redis.call('ZADD', KEYS[1], 'XX', now_ms + tonumber(ARGV[2]), ARGV[1])
+-- Heartbeat renewal fences a delayed rollback from the original insertion.
+redis.call('SET', KEYS[2], 'held', 'PX', ARGV[2])
 return 1
 `;
 
@@ -231,8 +236,9 @@ export async function renewConcurrencyLimitActiveJob(
   return (
     (await getRedisConnection().eval(
       renewConcurrencySlotScript,
-      1,
+      2,
       constructConcurrencyLimitKey(teamId),
+      constructConcurrencyReservationKey(teamId, id),
       id,
       timeout,
     )) === 1

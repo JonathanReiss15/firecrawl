@@ -29,7 +29,11 @@ import {
   runtimeMigrationPin,
   stampMigrationPin,
 } from "./ops";
-import { MigrationStoreError, nuqFdbMigrationStore } from "./migration-store";
+import {
+  MigrationCorruptionError,
+  MigrationStoreError,
+  nuqFdbMigrationStore,
+} from "./migration-store";
 
 export type NuQFdbGroupStatus = "active" | "completed" | "cancelled";
 
@@ -240,6 +244,25 @@ export class NuqFdbGroupOps {
       tn.set(this.ks.groupFinishedJob(gid), Buffer.from(fid, "utf8"));
     }
     if (gMeta.s === "cancelled") {
+      // A router from an earlier rollout may have adopted the group before
+      // publishing its continuation in a second transaction. Retire any such
+      // live group pin in this completion transaction so the race cannot leave
+      // permanent source residue.
+      const groupPin = await nuqFdbMigrationStore.inspectPinInTxn(
+        tn,
+        "group",
+        gid,
+      );
+      if (groupPin && groupPin.lifecycle !== "terminal") {
+        await nuqFdbMigrationStore.reconcileManagedObjectInTxn(tn, {
+          teamId: gMeta.o,
+          kind: "group",
+          objectId: gid,
+          recordPin: runtimeMigrationPin(gMeta),
+          residue: {},
+          terminal: true,
+        });
+      }
       await nuqFdbMigrationStore.reconcileManagedObjectInTxn(tn, {
         teamId: gMeta.o,
         kind: "sweeper_task",
@@ -415,7 +438,15 @@ export class NuQFdbJobGroup {
         const group = decodeJson<GroupMeta>(
           await tn.get(this.ks.groupMeta(gid)),
         );
-        if (group?.s === "active" || group?.s === "cancelled") return true;
+        if (group?.s === "active" || group?.s === "cancelled") {
+          if (group.o !== owner) {
+            throw new MigrationCorruptionError(
+              `group owner index ${owner}/${gid}`,
+              "live group owner mismatch",
+            );
+          }
+          return true;
+        }
         tn.clear(key as Buffer);
       }
       const control = decodeJson<{ generation: string; phase: string }>(
@@ -461,14 +492,22 @@ export class NuQFdbJobGroup {
     if (owner === null) return [];
     return await this.db.doTn(async tn => {
       const r = this.ks.ongoingGroupRange(owner);
-      const rows = await tn.snapshot().getRangeAll(r.begin, r.end);
+      const rows = await tn.getRangeAll(r.begin, r.end);
       const out: NuQFdbJobGroupInstance[] = [];
       for (const [key] of rows) {
         const gid = this.ks.unpackId(key as Buffer);
-        const g = decodeJson<GroupMeta>(
-          await tn.snapshot().get(this.ks.groupMeta(gid)),
-        );
-        if (g && g.s === "active") out.push(this.toInstance(gid, g));
+        const g = decodeJson<GroupMeta>(await tn.get(this.ks.groupMeta(gid)));
+        if (g && (g.s === "active" || g.s === "cancelled")) {
+          if (g.o !== owner) {
+            throw new MigrationCorruptionError(
+              `group owner index ${owner}/${gid}`,
+              "live group owner mismatch",
+            );
+          }
+          if (g.s === "active") out.push(this.toInstance(gid, g));
+        } else if (!g || g.s === "completed") {
+          tn.clear(key as Buffer);
+        }
       }
       return out;
     });
@@ -488,6 +527,8 @@ export class NuQFdbJobGroup {
           kind: "group",
           objectId: id,
           residue: { control_groups: 1 },
+          terminal: true,
+          cancelledGroupContinuation: true,
           activateNonterminal: false,
         }));
       if (!groupPin) throw new Error(`Legacy group ${id} was not adopted`);
@@ -547,12 +588,32 @@ export class NuQFdbJobGroup {
         return taskPin !== null;
       }
 
-      await prepareGroupSweepTaskInTxn(tn, id, group);
+      const taskPin = await nuqFdbMigrationStore.inspectPinInTxn(
+        tn,
+        "sweeper_task",
+        groupSweepTaskId(id),
+      );
+      if (!taskPin) {
+        throw new MigrationCorruptionError(
+          `cancelled group ${id}`,
+          "legacy adoption committed without its sweeper continuation",
+        );
+      }
+      await nuqFdbMigrationStore.validatePinnedObjectInTxn(tn, {
+        teamId: group.o,
+        kind: "sweeper_task",
+        objectId: groupSweepTaskId(id),
+        backend: groupPin.backend,
+        generation: groupPin.generation,
+      });
       await nuqFdbMigrationStore.reconcileManagedObjectInTxn(tn, {
         teamId: group.o,
         kind: "group",
         objectId: id,
-        recordPin: runtimeMigrationPin(group),
+        recordPin: {
+          backend: groupPin.backend,
+          generation: groupPin.generation,
+        },
         residue: {},
         terminal: true,
       });

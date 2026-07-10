@@ -2277,6 +2277,18 @@ export class NuQFdbQueue<JobData = any, JobReturnValue = any> {
     );
   }
 
+  private syncCoreReadinessInTxn(
+    tn: Transaction,
+    control: NuqFdbMetricControl | null,
+  ): void {
+    if (this.queueName !== "scrape" && this.queueName !== "crawl_finished") {
+      return;
+    }
+    const key = nuqFdbMigrationStore.coreReadinessKey(this.queueName);
+    if (control) tn.set(key, encodeJson(control));
+    else tn.clear(key);
+  }
+
   private decodeMetricControl(
     value: Buffer | undefined | null,
   ): NuqFdbMetricControl | null {
@@ -2306,8 +2318,12 @@ export class NuQFdbQueue<JobData = any, JobReturnValue = any> {
       const current = this.decodeMetricControl(
         await tn.get(this.ks.metricControl()),
       );
-      if (current) return current;
+      if (current) {
+        this.syncCoreReadinessInTxn(tn, current);
+        return current;
+      }
       tn.set(this.ks.metricControl(), encodeJson(requested));
+      this.syncCoreReadinessInTxn(tn, requested);
       return requested;
     });
   }
@@ -2329,7 +2345,10 @@ export class NuQFdbQueue<JobData = any, JobReturnValue = any> {
       const control = this.decodeMetricControl(
         await tn.get(this.ks.metricControl()),
       );
-      if (!control) return true;
+      if (!control) {
+        this.syncCoreReadinessInTxn(tn, null);
+        return true;
+      }
       if (
         expectedGeneration !== undefined &&
         control.generation !== expectedGeneration
@@ -2337,6 +2356,7 @@ export class NuQFdbQueue<JobData = any, JobReturnValue = any> {
         return false;
       }
       tn.clear(this.ks.metricControl());
+      this.syncCoreReadinessInTxn(tn, null);
       return true;
     });
   }
@@ -2355,7 +2375,11 @@ export class NuQFdbQueue<JobData = any, JobReturnValue = any> {
       const control = this.decodeMetricControl(
         await tn.get(this.ks.metricControl()),
       );
-      if (!control) return false;
+      if (!control) {
+        this.syncCoreReadinessInTxn(tn, null);
+        return false;
+      }
+      this.syncCoreReadinessInTxn(tn, control);
       if (control.phase === "ready") return true;
 
       if (control.phase === "backfill-jobs") {
@@ -2381,10 +2405,9 @@ export class NuQFdbQueue<JobData = any, JobReturnValue = any> {
         }
         if (rows.length < pageSize) {
           tn.clear(this.ks.metricJobsCursor(control.generation));
-          tn.set(
-            this.ks.metricControl(),
-            encodeJson({ ...control, phase: "backfill-ledger" }),
-          );
+          const next = { ...control, phase: "backfill-ledger" } as const;
+          tn.set(this.ks.metricControl(), encodeJson(next));
+          this.syncCoreReadinessInTxn(tn, next);
         } else {
           tn.set(
             this.ks.metricJobsCursor(control.generation),
@@ -2413,10 +2436,9 @@ export class NuQFdbQueue<JobData = any, JobReturnValue = any> {
       }
       if (rows.length < pageSize) {
         tn.clear(this.ks.metricLedgerCursor(control.generation));
-        tn.set(
-          this.ks.metricControl(),
-          encodeJson({ ...control, phase: "ready" }),
-        );
+        const next = { ...control, phase: "ready" } as const;
+        tn.set(this.ks.metricControl(), encodeJson(next));
+        this.syncCoreReadinessInTxn(tn, next);
         return true;
       }
       tn.set(

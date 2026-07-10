@@ -116,10 +116,13 @@ type ActiveReservation = {
   ownerships: ReservationOwnership[];
 };
 
+class PgCapacityReservationDeniedError extends Error {}
+
 async function acquireActiveReservation(
   zsetKey: string,
   markerKey: string,
   jobId: string,
+  limit: number | null,
 ): Promise<ReservationOwnership | null> {
   const token = crypto.randomUUID();
   const now = Date.now();
@@ -132,6 +135,9 @@ async function acquireActiveReservation(
      if current and tonumber(current) > tonumber(ARGV[2]) then
        return {0, current, ''}
      end
+     if not current and tonumber(ARGV[6]) >= 0 and redis.call('ZCARD', KEYS[1]) >= tonumber(ARGV[6]) then
+       return {3, '', ''}
+     end
      redis.call('ZADD', KEYS[1], ARGV[3], ARGV[1])
      redis.call('SET', KEYS[2], cjson.encode({token=ARGV[4], previous=current or '', reserved=ARGV[3]}), 'PX', ARGV[5])
      return {1, current or '', ARGV[3]}`,
@@ -143,8 +149,10 @@ async function acquireActiveReservation(
     reservedScore,
     token,
     2 * 60 * 1000,
+    limit ?? -1,
   )) as [number, string, string];
   const status = Number(result[0]);
+  if (status === 3) throw new PgCapacityReservationDeniedError();
   if (status === 2) {
     throw new Error(`PG active reservation is already pending for ${jobId}`);
   }
@@ -231,6 +239,7 @@ async function commitActiveReservations(
 async function reserveActiveJob(
   jobId: string,
   data: ScrapeJobData,
+  teamLimit: number | null,
 ): Promise<ActiveReservation> {
   const reservation: ActiveReservation = { jobId, data, ownerships: [] };
   try {
@@ -238,6 +247,7 @@ async function reserveActiveJob(
       `concurrency-limiter:${data.team_id}`,
       `nuq:pg-reservation:team:${data.team_id}:${jobId}`,
       jobId,
+      teamLimit,
     );
     if (teamOwnership) reservation.ownerships.push(teamOwnership);
     if (data.crawl_id) {
@@ -247,6 +257,7 @@ async function reserveActiveJob(
           `crawl-concurrency-limiter:${data.crawl_id}`,
           `nuq:pg-reservation:crawl:${data.crawl_id}:${jobId}`,
           jobId,
+          sc.maxConcurrency ?? 1,
         );
         if (crawlOwnership) reservation.ownerships.push(crawlOwnership);
       }
@@ -492,6 +503,7 @@ async function _addScrapeJobToBullMQPg(
   jobId: string,
   priority: number = 0,
   listenable: boolean = false,
+  teamLimit: number | null = null,
 ): Promise<NuQJob<ScrapeJobData>> {
   if (webScraperOptions.mode === "single_urls") {
     abTestJob(webScraperOptions);
@@ -501,7 +513,7 @@ async function _addScrapeJobToBullMQPg(
   const prepared = await prepareNuQPgPublication([publication]);
   const reserved: ActiveReservation[] = [];
   try {
-    reserved.push(await reserveActiveJob(jobId, webScraperOptions));
+    reserved.push(await reserveActiveJob(jobId, webScraperOptions, teamLimit));
 
     const job = await scrapeQueue.addJob(jobId, webScraperOptions, {
       priority,
@@ -516,6 +528,12 @@ async function _addScrapeJobToBullMQPg(
     await commitActiveReservations(reserved);
     return job;
   } catch (error) {
+    if (error instanceof PgCapacityReservationDeniedError) {
+      await rollbackActiveReservations(reserved);
+      // Preserve the prepared generation intent: the caller republishes the
+      // same stable id into the PG backlog after losing atomic admission.
+      throw error;
+    }
     if (error instanceof NuQPublicationConflictError) {
       await rollbackActiveReservations(reserved);
       await completePreparedNuQPgPublication(prepared, "compensated");
@@ -552,6 +570,7 @@ async function _addScrapeJobsToBullMQ(
     priority: number;
     listenable?: boolean;
   }[],
+  teamLimit: number | null = null,
 ): Promise<NuQJob<ScrapeJobData>[]> {
   for (const job of jobs) {
     if (job.data.mode === "single_urls") abTestJob(job.data);
@@ -564,7 +583,7 @@ async function _addScrapeJobsToBullMQ(
   const reserved: ActiveReservation[] = [];
   try {
     for (const job of jobs) {
-      reserved.push(await reserveActiveJob(job.jobId, job.data));
+      reserved.push(await reserveActiveJob(job.jobId, job.data, teamLimit));
     }
 
     const result = await scrapeQueue.addJobs(
@@ -591,6 +610,12 @@ async function _addScrapeJobsToBullMQ(
     await commitActiveReservations(reserved);
     return result;
   } catch (error) {
+    if (error instanceof PgCapacityReservationDeniedError) {
+      await rollbackActiveReservations(reserved);
+      // Preserve prepared intents for atomic fallback of the whole candidate
+      // partition into backlog placement.
+      throw error;
+    }
     if (error instanceof NuQPublicationConflictError) {
       await rollbackActiveReservations(reserved);
       await completePreparedNuQPgPublication(prepared, "compensated");
@@ -845,12 +870,30 @@ async function addScrapeJobRaw(
     );
     return null;
   } else {
-    return await _addScrapeJobToBullMQPg(
-      webScraperOptions,
-      jobId,
-      priority,
-      listenable,
-    );
+    try {
+      return await _addScrapeJobToBullMQPg(
+        webScraperOptions,
+        jobId,
+        priority,
+        listenable,
+        !isSelfHosted() && !directToBullMQ ? maxConcurrency : null,
+      );
+    } catch (error) {
+      if (!(error instanceof PgCapacityReservationDeniedError)) throw error;
+      const pending = await getCombinedTeamPendingCount(
+        webScraperOptions.team_id,
+      );
+      const queueLimit = getTeamQueueLimit(maxConcurrency);
+      if (pending >= queueLimit) throw new QueueFullError(pending, queueLimit);
+      webScraperOptions.concurrencyLimited = true;
+      await _addScrapeJobToConcurrencyQueue(
+        webScraperOptions,
+        jobId,
+        priority,
+        listenable,
+      );
+      return null;
+    }
   }
 }
 
@@ -1185,14 +1228,26 @@ export async function addScrapeJobs(
         })),
       );
 
-      await _addScrapeJobsToBullMQ(
-        addToBull.map(job => ({
-          jobId: job.jobId,
-          data: { ...job.data, traceContext },
-          priority: job.priority,
-          listenable: job.listenable,
-        })),
-      );
+      const activeCandidates = addToBull.map(job => ({
+        jobId: job.jobId,
+        data: { ...job.data, traceContext },
+        priority: job.priority,
+        listenable: job.listenable,
+      }));
+      try {
+        await _addScrapeJobsToBullMQ(
+          activeCandidates,
+          isSelfHosted() ? null : maxConcurrency,
+        );
+      } catch (error) {
+        if (!(error instanceof PgCapacityReservationDeniedError)) throw error;
+        const pending = await getCombinedTeamPendingCount(teamId);
+        const queueLimit = getTeamQueueLimit(maxConcurrency);
+        if (pending + activeCandidates.length > queueLimit) {
+          throw new QueueFullError(pending, queueLimit);
+        }
+        await _addScrapeJobsToConcurrencyQueue(activeCandidates);
+      }
     });
   }
 }

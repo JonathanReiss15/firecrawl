@@ -10,11 +10,12 @@ vi.mock("../../services/ab-test", () => ({ abTestJob: vi.fn() }));
 import { config } from "../../config";
 import {
   finalizeConcurrencyLimitActiveJobRollback,
+  getConcurrencyLimitActiveJobsCount,
   removeConcurrencyLimitActiveJob,
   reserveConcurrencyLimitActiveJob,
   rollbackConcurrencyLimitActiveJob,
 } from "../../lib/concurrency-redis";
-import { _addScrapeJobToBullMQ } from "../../services/queue-jobs";
+import { _addScrapeJobToBullMQ, addScrapeJob } from "../../services/queue-jobs";
 import { getRedisConnection } from "../../services/queue-service";
 import { redisEvictConnection } from "../../services/redis";
 import {
@@ -48,6 +49,7 @@ import {
   mirrorExternalSlotAcquire,
   mirrorExternalSlotRelease,
   renewExternalSlot,
+  reserveExternalSlot,
   scrapeQueue as routedScrapeQueue,
 } from "../../services/worker/nuq-router";
 
@@ -225,7 +227,56 @@ describeIf("NuQ PG publication with durable FDB authority", () => {
       newlyAcquired: true,
       rollbackToken: expect.any(String),
     });
+    await expect(
+      reserveConcurrencyLimitActiveJob(
+        capacityTeamId,
+        replacementHolder,
+        3,
+        30_000,
+      ),
+    ).resolves.toMatchObject({ newlyAcquired: false });
+    await expect(
+      rollbackConcurrencyLimitActiveJob(
+        capacityTeamId,
+        replacementHolder,
+        reacquired.rollbackToken!,
+      ),
+    ).resolves.toBe(false);
     await removeConcurrencyLimitActiveJob(capacityTeamId, replacementHolder);
+  });
+
+  test("PG queue and external admissions share one atomic capacity ledger", async () => {
+    const capacityTeam = randomUUID();
+    const firstId = randomUUID();
+    const secondId = randomUUID();
+    const holderId = randomUUID();
+    await makeMetricsReady();
+    await expect(isFdbTeam(capacityTeam)).resolves.toBe(false);
+    const data = (id: string) =>
+      ({
+        mode: "single_urls",
+        url: `https://example.com/${id}`,
+        team_id: capacityTeam,
+        scrapeOptions: { formats: [] },
+      }) as any;
+
+    const [first, second, external] = await Promise.all([
+      addScrapeJob(data(firstId), firstId),
+      addScrapeJob(data(secondId), secondId),
+      reserveExternalSlot(capacityTeam, holderId, 60_000, 2),
+    ]);
+    expect(await getConcurrencyLimitActiveJobsCount(capacityTeam)).toBe(2);
+    expect([first, second].filter(Boolean).length + Number(external)).toBe(2);
+
+    if (external) await mirrorExternalSlotRelease(capacityTeam, holderId);
+    await scrapeQueuePg.removeJobs([firstId, secondId]);
+    await getRedisConnection().del(
+      `concurrency-limiter:${capacityTeam}`,
+      `concurrency-limit-queue:${capacityTeam}`,
+      `cq-job:${firstId}`,
+      `cq-job:${secondId}`,
+    );
+    await clearMigrationTeam(capacityTeam);
   });
 
   test("a pre-commit PG conflict rolls back owned Redis reservation and its prepared intent", async () => {

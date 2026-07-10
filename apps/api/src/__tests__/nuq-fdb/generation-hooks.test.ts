@@ -197,6 +197,31 @@ describeIf("NuQ FDB transaction-scoped migration generation hooks", () => {
     ).rejects.toMatchObject({ code: "NUQ_MIGRATION_PIN_NOT_FOUND" });
   });
 
+  test("group owner discovery rejects cross-tenant live index rows", async () => {
+    const owner = randomUUID();
+    const wrongOwner = randomUUID();
+    const groupId = randomUUID();
+    await groups.addGroup(groupId, owner);
+    await queue.beginMetricCounterBackfill();
+    while (!(await queue.backfillMetricCounts(100))) {
+      // bounded pages
+    }
+    while (!(await groups.backfillLegacyOwnerIndex(100))) {
+      // bounded pages
+    }
+    await db.doTn(async tn => {
+      tn.set(queue.ks.ongoingGroup(wrongOwner, groupId), Buffer.alloc(0));
+    });
+    await expect(groups.hasUnfinishedByOwner(wrongOwner)).rejects.toMatchObject(
+      {
+        code: "NUQ_MIGRATION_CORRUPT",
+      },
+    );
+    await db.doTn(async tn => {
+      tn.clear(queue.ks.ongoingGroup(wrongOwner, groupId));
+    });
+  });
+
   test("existing pre-protocol jobs and external holders adopt the source generation while draining", async () => {
     const teamId = randomUUID();
     teams.add(teamId);
@@ -237,6 +262,56 @@ describeIf("NuQ FDB transaction-scoped migration generation hooks", () => {
     await expect(
       store.inspectPin("external_holder", externalObjectId),
     ).resolves.toMatchObject({ lifecycle: "terminal" });
+  });
+
+  test("cancelled completion retires a group pin adopted before its continuation", async () => {
+    const teamId = randomUUID();
+    teams.add(teamId);
+    const groupId = randomUUID();
+    await groups.addGroup(groupId, teamId);
+    await groups.cancelGroup(groupId);
+    await store.initializeLegacyTeam(teamId, "fdb", randomUUID());
+    await db.doTn(async tn =>
+      store.reconcileManagedObjectInTxn(tn, {
+        teamId,
+        kind: "group",
+        objectId: groupId,
+        residue: { control_groups: 1 },
+      }),
+    );
+    const sweeper = new NuqFdbSweeper([queue, finishedQueue], []);
+    for (let attempt = 0; attempt < 20; attempt++) {
+      if ((await groups.getGroup(groupId))?.status === "completed") break;
+      await sweeper.sweepOnce();
+    }
+    await expect(groups.getGroup(groupId)).resolves.toMatchObject({
+      status: "completed",
+    });
+    await expect(store.inspectPin("group", groupId)).resolves.toMatchObject({
+      lifecycle: "terminal",
+      residue: { control_groups: 0 },
+    });
+  });
+
+  test("legacy cancelled-group adoption commits its sweeper continuation atomically", async () => {
+    const teamId = randomUUID();
+    teams.add(teamId);
+    const groupId = randomUUID();
+    await groups.addGroup(groupId, teamId);
+    await groups.cancelGroup(groupId);
+    await store.initializeLegacyTeam(teamId, "fdb", randomUUID());
+
+    await expect(groups.adoptLegacyCancelledGroup(groupId)).resolves.toBe(true);
+    await expect(store.inspectPin("group", groupId)).resolves.toMatchObject({
+      lifecycle: "terminal",
+      residue: { control_groups: 0 },
+    });
+    await expect(
+      store.inspectPin("sweeper_task", `group-cancel/${groupId}`),
+    ).resolves.toMatchObject({
+      lifecycle: "active",
+      residue: { control_sweeper_tasks: 1 },
+    });
   });
 
   test("terminal cancelled-group pins repair a missing sweeper continuation", async () => {
@@ -445,8 +520,16 @@ describeIf("NuQ FDB transaction-scoped migration generation hooks", () => {
 
     await new Promise(resolve => setTimeout(resolve, 1_100));
     const sweeper = new NuqFdbSweeper([queue, finishedQueue], []);
-    await sweeper.sweepOnce();
-    expect(await residue(teamId)).toMatchObject({
+    let promotedResidue = await residue(teamId);
+    for (
+      let attempt = 0;
+      attempt < 20 && promotedResidue.capacity_delayed !== 0;
+      attempt++
+    ) {
+      await sweeper.sweepOnce();
+      promotedResidue = await residue(teamId);
+    }
+    expect(promotedResidue).toMatchObject({
       capacity_ready_active: 1,
       capacity_delayed: 0,
     });

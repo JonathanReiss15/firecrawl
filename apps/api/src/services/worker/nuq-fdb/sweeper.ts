@@ -628,7 +628,11 @@ export class NuqFdbSweeper {
       ) {
         return;
       }
-      await queue.backfillMetricCounts(100, config.NUQ_FDB_METRICS_V2_ACTIVATE);
+      if (!config.NUQ_FDB_METRICS_V2_ACTIVATE) {
+        await queue.invalidateMetricCounterGeneration();
+      } else {
+        await queue.backfillMetricCounts(100, true);
+      }
       if (
         lifecycleGeneration !== undefined &&
         lifecycleGeneration !== this.runGeneration

@@ -245,6 +245,7 @@ export class NuqFdbExternalSlots {
     teamId: string,
     holderId: string,
     expiresAt: number,
+    options?: { prepareMigrationPin?: boolean },
   ): Promise<void> {
     const owner = normalizeOwnerId(teamId);
     if (owner === null) return;
@@ -254,12 +255,28 @@ export class NuqFdbExternalSlots {
     const generation = randomUUID();
     const objectId = externalSlotMigrationObjectId(owner, holderId);
     await this.db.doTn(async tn => {
-      const pin = await nuqFdbMigrationStore.validatePinnedObjectInTxn(tn, {
-        teamId: owner,
-        kind: "external_holder",
+      let pin = await nuqFdbMigrationStore.inspectPinInTxn(
+        tn,
+        "external_holder",
         objectId,
-        backend: "pg",
-      });
+      );
+      if (!pin && options?.prepareMigrationPin) {
+        pin = await nuqFdbMigrationStore.preparePinnedObjectInTxn(tn, {
+          teamId: owner,
+          kind: "external_holder",
+          objectId,
+          admission: { type: "new-root" },
+          requiredBackend: "pg",
+          residue: { intent_unresolved: 1 },
+        });
+      } else {
+        pin = await nuqFdbMigrationStore.validatePinnedObjectInTxn(tn, {
+          teamId: owner,
+          kind: "external_holder",
+          objectId,
+          backend: "pg",
+        });
+      }
       const prior = decodeJson<PgExternalSlotExpiryRecord>(
         await tn.get(this.pgExpiryRecordKey(owner, holderId)),
       );

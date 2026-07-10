@@ -136,11 +136,21 @@ function startHeartbeat(
         // This routed holder is the shared queue-capacity authority on both PG
         // and FDB. A swept/expired holder must never be resurrected from a
         // stale request limit; losing ownership makes protected work fail closed.
-        const renewed = await renewExternalSlot(
-          teamId,
-          holderId,
-          SEMAPHORE_TTL,
-        );
+        let renewalTimer: NodeJS.Timeout | undefined;
+        const renewed = await Promise.race([
+          renewExternalSlot(teamId, holderId, SEMAPHORE_TTL),
+          new Promise<never>((_, reject) => {
+            renewalTimer = setTimeout(
+              () =>
+                reject(
+                  new TransportableError("SCRAPE_TIMEOUT", "heartbeat_timeout"),
+                ),
+              intervalMs,
+            );
+          }),
+        ]).finally(() => {
+          if (renewalTimer) clearTimeout(renewalTimer);
+        });
         if (!renewed) {
           throw new TransportableError("SCRAPE_TIMEOUT", "heartbeat_failed");
         }

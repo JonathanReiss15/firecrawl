@@ -576,7 +576,12 @@ async function getCrawlQueueBackend(
         crawlGroupFdb.restoreLegacyCancelledGroupOwnerIndex(crawlId),
       );
     }
-    if (!existingPin) {
+    if (group.status === "cancelled") {
+      // Adopt the group, establish its sweeper continuation, and terminalize
+      // group residue in one FDB transaction. Splitting generic adoption from
+      // continuation publication lets completion race between the two commits.
+      await fdbMutation(() => crawlGroupFdb.adoptLegacyCancelledGroup(crawlId));
+    } else if (!existingPin) {
       await adoptLegacyFdbObject({
         teamId: group.ownerId,
         kind: "group",
@@ -584,11 +589,6 @@ async function getCrawlQueueBackend(
         terminal: group.status === "completed",
         residue: { control_groups: group.status === "completed" ? 0 : 1 },
       });
-    }
-    // Always ensure the cancelled continuation. This repairs process death
-    // after group adoption but before sweeper work was published.
-    if (group.status === "cancelled") {
-      await fdbMutation(() => crawlGroupFdb.adoptLegacyCancelledGroup(crawlId));
     }
   } else if (backend === "pg" && !existingPin) {
     const group = await crawlGroupPg.getGroup(crawlId);
@@ -860,30 +860,24 @@ async function acquireExternalSlot(
     return;
   }
 
-  const pin =
-    existingPin ??
-    (await prepareRoutingPin({
-      teamId,
-      kind: "external_holder",
-      objectId: externalSlotMigrationObjectId(teamId, holderId),
-    }));
-  if (pin && pin.backend !== "pg") {
+  if (existingPin && existingPin.backend !== "pg") {
     throw new NuQRouterPinMismatchError(
-      pin.kind,
-      pin.objectId,
-      pin.backend,
+      existingPin.kind,
+      existingPin.objectId,
+      existingPin.backend,
       "pg",
     );
   }
   const now = Date.now();
-  if (pin) {
-    // Publish the durable deadline before crossing the Redis boundary. A
-    // crash or ambiguous Redis result can conservatively overcount only until
-    // this exact generation expires; it cannot strand a prepared pin.
-    await fdbMutation(() =>
-      externalSlotsFdb.renewPg(teamId, holderId, now + ttlMs),
-    );
-  }
+  // Prepare/adopt, activate, and publish the durable deadline in one FDB
+  // transaction before crossing the Redis boundary. A crash can conservatively
+  // overcount only until this exact generation expires; no prepared intent is
+  // left without a cleanup deadline.
+  await fdbMutation(() =>
+    externalSlotsFdb.renewPg(teamId, holderId, now + ttlMs, {
+      prepareMigrationPin: !existingPin,
+    }),
+  );
   await pushConcurrencyLimitActiveJob(teamId, holderId, ttlMs);
   await syncFdbLimitToPgOccupancy(teamId);
 }
@@ -970,11 +964,6 @@ export async function reserveExternalSlot(
 
     let pin = existingPin;
     try {
-      pin ??= await prepareRoutingPin({
-        teamId,
-        kind: "external_holder",
-        objectId: externalSlotMigrationObjectId(teamId, holderId),
-      });
       if (pin && pin.backend !== "pg") {
         throw new NuQRouterPinMismatchError(
           pin.kind,
@@ -983,14 +972,14 @@ export async function reserveExternalSlot(
           "pg",
         );
       }
-      if (pin) {
-        // Couple every successful Redis reservation/renewal to a durable,
-        // generation-fenced expiry. Redis disappearance alone is never
-        // terminal evidence; this deadline is the crash-recovery authority.
-        await fdbMutation(() =>
-          externalSlotsFdb.renewPg(teamId, holderId, Date.now() + ttlMs),
-        );
-      }
+      // The pin intent and its durable expiry are one FDB commit. Process death
+      // before this call leaves only an expiring Redis member; death afterward
+      // leaves an active generation-fenced deadline, never a prepared orphan.
+      await fdbMutation(() =>
+        externalSlotsFdb.renewPg(teamId, holderId, Date.now() + ttlMs, {
+          prepareMigrationPin: !pin,
+        }),
+      );
       return true;
     } catch (error) {
       // Do not tear down a pre-existing holder if only its renewal raced a

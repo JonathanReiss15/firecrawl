@@ -407,10 +407,7 @@ describeIf("NuQ durable migration router", () => {
         "external_holder",
         externalSlotMigrationObjectId(teamId, holderId),
       ),
-    ).resolves.toMatchObject({
-      lifecycle: "terminal",
-      residue: { capacity_external_holders: 0, intent_unresolved: 0 },
-    });
+    ).resolves.toBeNull();
   });
 
   test("stale PG durable-expiry failure cannot roll back a replacement holder", async () => {
@@ -450,10 +447,7 @@ describeIf("NuQ durable migration router", () => {
     expect(controls.redisFinalize).not.toHaveBeenCalled();
     await expect(
       nuqFdbMigrationStore.inspectPin("external_holder", objectId),
-    ).resolves.toMatchObject({
-      lifecycle: "prepared",
-      residue: { intent_unresolved: 1 },
-    });
+    ).resolves.toBeNull();
   });
 
   test("retry recovers an abandoned PG rollback tombstone", async () => {

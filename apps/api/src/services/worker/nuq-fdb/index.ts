@@ -1,3 +1,4 @@
+import { config } from "../../../config";
 import type { ScrapeJobData } from "../../../types";
 import {
   NuQFdbQueue,
@@ -100,6 +101,9 @@ export async function nuqFdbGetMetrics(): Promise<string> {
 # TYPE firecrawl_nuq_fdb_pending_jobs gauge
 firecrawl_nuq_fdb_pending_jobs ${workerLoad}
 `;
+  if (!config.NUQ_FDB_METRICS_V2_ACTIVATE) {
+    return `${readiness}firecrawl_nuq_fdb_metrics_ready 0\n`;
+  }
   try {
     const [scrapeQueueMetrics, crawlFinishedQueueMetrics, workerLoad] =
       await Promise.all([

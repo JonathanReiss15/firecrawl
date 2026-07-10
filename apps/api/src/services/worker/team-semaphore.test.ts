@@ -2,7 +2,7 @@ import { vi } from "vitest";
 
 const controls = vi.hoisted(() => ({
   reserveResults: [] as (boolean | Error)[],
-  renewResult: true as boolean | Error,
+  renewResult: true as boolean | Error | Promise<boolean>,
   reserve: vi.fn(),
   renew: vi.fn(),
   release: vi.fn(),
@@ -25,7 +25,7 @@ vi.mock("./nuq-router", () => ({
   }),
   renewExternalSlot: controls.renew.mockImplementation(async () => {
     if (controls.renewResult instanceof Error) throw controls.renewResult;
-    return controls.renewResult;
+    return await controls.renewResult;
   }),
   mirrorExternalSlotRelease: controls.release.mockResolvedValue(undefined),
 }));
@@ -94,6 +94,42 @@ describe("team semaphore authoritative routed capacity", () => {
     expect(controls.renew).toHaveBeenCalledTimes(1);
     expect(controls.release).toHaveBeenCalledWith("team", "holder");
     expect(controls.redisScript).not.toHaveBeenCalled();
+  });
+
+  test("aborts protected work when an authoritative renewal hangs", async () => {
+    vi.useFakeTimers();
+    try {
+      controls.reserveResults = [true];
+      controls.renewResult = new Promise<boolean>(() => {});
+      let callbackAborted = false;
+      const work = teamConcurrencySemaphore.withSemaphore(
+        "team",
+        "hung-renewal",
+        1,
+        new AbortController().signal,
+        60_000,
+        async (_limited, signal) =>
+          await new Promise<never>((_resolve, reject) => {
+            signal.addEventListener(
+              "abort",
+              () => {
+                callbackAborted = true;
+                reject(signal.reason);
+              },
+              { once: true },
+            );
+          }),
+      );
+      const rejection = expect(work).rejects.toMatchObject({
+        code: "SCRAPE_TIMEOUT",
+      });
+      await vi.advanceTimersByTimeAsync(15_001);
+      await rejection;
+      expect(callbackAborted).toBe(true);
+      expect(controls.release).toHaveBeenCalledWith("team", "hung-renewal");
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   test("retries the authoritative reservation and reports capacity limiting", async () => {

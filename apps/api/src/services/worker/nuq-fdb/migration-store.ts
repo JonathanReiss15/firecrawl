@@ -150,6 +150,9 @@ export type ReconcileManagedObjectInput = {
   allowMissingRecordPin?: boolean;
   residue: Partial<MigrationResidue>;
   terminal?: boolean;
+  /** Legacy cancelled groups must adopt their sweeper continuation in the
+   * same transaction before the group itself becomes terminal. */
+  cancelledGroupContinuation?: boolean;
   /** Validation-only callers suppress the prepared->active transition. */
   activateNonterminal?: boolean;
 };
@@ -664,6 +667,8 @@ function validateLegacyObjectOperation(
 }
 
 export class NuqFdbMigrationStore {
+  constructor(private readonly requireCoreReadiness = false) {}
+
   private get db() {
     return getNuqFdbDatabase();
   }
@@ -672,6 +677,29 @@ export class NuqFdbMigrationStore {
   // ("nuq", queueName) subspace.
   public pack(parts: any[]): Buffer {
     return getFdb().tuple.pack(["nuq-migration", 1, ...parts]) as Buffer;
+  }
+
+  public coreReadinessKey(queueName: "scrape" | "crawl_finished"): Buffer {
+    return this.pack(["core-readiness", queueName]);
+  }
+
+  private async assertCoreReadinessInTxn(tn: Transaction): Promise<void> {
+    if (!this.requireCoreReadiness) return;
+    for (const queueName of ["scrape", "crawl_finished"] as const) {
+      const raw = await tn.get(this.coreReadinessKey(queueName));
+      const readiness = raw
+        ? (parseJson(raw, `${queueName} core readiness`) as {
+            phase?: unknown;
+          })
+        : null;
+      if (readiness?.phase !== "ready") {
+        throw new MigrationStoreError(
+          "NUQ_FDB_CORE_METRICS_NOT_READY",
+          `${queueName} corrected-core generation is not ready`,
+          true,
+        );
+      }
+    }
   }
 
   public teamStateKey(teamId: string): Buffer {
@@ -1130,6 +1158,71 @@ export class NuqFdbMigrationStore {
     const terminal = input.terminal === true;
     let pin = await this.inspectPinInTxn(tn, kind, objectId);
     let adoptedLegacyRecord = false;
+    if (
+      !pin &&
+      kind === "group" &&
+      terminal &&
+      input.cancelledGroupContinuation === true &&
+      !input.recordPin &&
+      !input.allowMissingRecordPin
+    ) {
+      // A cancelled legacy group is not terminal migration residue until its
+      // sweeper continuation has completed. Adopt both controls atomically so
+      // a crash cannot strand an active group pin without discoverable work.
+      pin = await this.preparePinnedObjectInTxn(tn, {
+        teamId,
+        kind,
+        objectId,
+        admission: {
+          type: "legacy-backfill",
+          backend: "fdb",
+          generation: state.activeGeneration,
+        },
+        requiredBackend: "fdb",
+        residue,
+      });
+      pin = (await this.reconcileManagedObjectInTxn(tn, {
+        teamId,
+        kind,
+        objectId,
+        recordPin: { backend: pin.backend, generation: pin.generation },
+        residue,
+      }))!;
+      const taskObjectId = `group-cancel/${objectId}`;
+      await this.preparePinnedObjectInTxn(tn, {
+        teamId,
+        kind: "sweeper_task",
+        objectId: taskObjectId,
+        admission: {
+          type: "pinned-continuation",
+          source: { kind: "group", objectId },
+        },
+        requiredBackend: "fdb",
+        residue: { control_sweeper_tasks: 1 },
+      });
+      const taskPin = await this.inspectPinInTxn(
+        tn,
+        "sweeper_task",
+        taskObjectId,
+      );
+      if (!taskPin) {
+        throw new MigrationCorruptionError(
+          `object sweeper_task/${taskObjectId}`,
+          "prepared continuation disappeared in its transaction",
+        );
+      }
+      await this.reconcileManagedObjectInTxn(tn, {
+        teamId,
+        kind: "sweeper_task",
+        objectId: taskObjectId,
+        recordPin: {
+          backend: taskPin.backend,
+          generation: taskPin.generation,
+        },
+        residue: { control_sweeper_tasks: 1 },
+      });
+      return pin;
+    }
     if (!pin) {
       // Callers set allowMissingRecordPin only while creating a new runtime
       // record, which must already have a router-prepared intent. Mutations of
@@ -1302,6 +1395,7 @@ export class NuqFdbMigrationStore {
     assertNonempty(teamId, "teamId");
     assertNonempty(operationId, "operationId");
     return await this.db.doTn(async tn => {
+      await this.assertCoreReadinessInTxn(tn);
       const opKey = this.controlOperationKey(teamId, operationId);
       const rawOp = await tn.get(opKey);
       if (rawOp) {
@@ -1444,6 +1538,7 @@ export class NuqFdbMigrationStore {
     assertNonempty(teamId, "teamId");
     assertNonempty(operationId, "operationId");
     return await this.db.doTn(async tn => {
+      await this.assertCoreReadinessInTxn(tn);
       const opKey = this.controlOperationKey(teamId, operationId);
       const rawOp = await tn.get(opKey);
       if (rawOp) {
@@ -2073,6 +2168,7 @@ export class NuqFdbMigrationStore {
     assertNonempty(teamId, "teamId");
     assertNonempty(transitionOperationId, "transitionOperationId");
     return await this.db.doTn(async tn => {
+      await this.assertCoreReadinessInTxn(tn);
       const opKey = this.controlOperationKey(teamId, transitionOperationId);
       const rawOp = await tn.get(opKey);
       if (!rawOp) {
@@ -2190,4 +2286,4 @@ export class NuqFdbMigrationStore {
   }
 }
 
-export const nuqFdbMigrationStore = new NuqFdbMigrationStore();
+export const nuqFdbMigrationStore = new NuqFdbMigrationStore(true);
