@@ -1,7 +1,13 @@
 import { describe, expect, it } from "vitest";
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
-import { groundCitations, locateQuote, type GroundingBlockPage } from "../citations";
+import {
+  groundCitations,
+  locateQuote,
+  splitCitedExtraction,
+  wrapSchemaWithCitations,
+  type GroundingBlockPage,
+} from "../citations";
 
 // Real fire-pdf response (include_blocks) for a 3-page document assembled
 // from public SEC-filing pages in the ParseBench corpus (Home Depot,
@@ -97,31 +103,26 @@ describe("groundCitations", () => {
 });
 
 describe("wrapSchemaWithCitations / splitCitedExtraction", () => {
-  it("wraps a user schema under data and adds the citations map", async () => {
-    const { wrapSchemaWithCitations } = await import("../citations");
+  it("wraps a user schema under data and adds the citations map", () => {
     const wrapped = wrapSchemaWithCitations({
       type: "object",
       properties: { total_revenue: { type: "string" } },
     }) as any;
     expect(wrapped.properties.data.properties.total_revenue.type).toBe("string");
-    expect(wrapped.properties.citations.additionalProperties.items.type).toBe("string");
-    expect(wrapped.required).toEqual(["data"]);
+    // OpenAI strict mode: no free-form maps, additionalProperties false.
+    expect(wrapped.additionalProperties).toBe(false);
+    expect(wrapped.properties.citations.type).toBe("array");
+    expect(wrapped.properties.citations.items.additionalProperties).toBe(false);
+    expect(wrapped.required).toEqual(["data", "citations"]);
   });
 
-  it("wraps schema-less extraction with a permissive data object", async () => {
-    const { wrapSchemaWithCitations } = await import("../citations");
-    const wrapped = wrapSchemaWithCitations(undefined) as any;
-    expect(wrapped.properties.data).toEqual({ type: "object" });
-  });
-
-  it("splits a wrapped result and normalizes quote shapes", async () => {
-    const { splitCitedExtraction } = await import("../citations");
+  it("splits a wrapped result and normalizes quote shapes", () => {
     const split = splitCitedExtraction({
       data: { total_revenue: "$391B" },
-      citations: {
-        total_revenue: "net sales of $391 billion",
-        fiscal_year: ["ended September 27, 2025", 42 as any],
-      },
+      citations: [
+        { field: "total_revenue", quotes: "net sales of $391 billion" },
+        { field: "fiscal_year", quotes: ["ended September 27, 2025", 42 as any] },
+      ],
     });
     expect(split).not.toBeNull();
     expect((split!.data as any).total_revenue).toBe("$391B");
@@ -129,8 +130,7 @@ describe("wrapSchemaWithCitations / splitCitedExtraction", () => {
     expect(split!.quotesByField.fiscal_year).toEqual(["ended September 27, 2025"]);
   });
 
-  it("returns null when the wrapper shape is missing (model ignored it)", async () => {
-    const { splitCitedExtraction } = await import("../citations");
+  it("returns null when the wrapper shape is missing (model ignored it)", () => {
     expect(splitCitedExtraction({ total_revenue: "$391B" })).toBeNull();
     expect(splitCitedExtraction(null)).toBeNull();
     expect(splitCitedExtraction("just a string")).toBeNull();

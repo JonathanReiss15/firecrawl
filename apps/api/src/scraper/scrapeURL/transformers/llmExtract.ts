@@ -994,10 +994,21 @@ export async function performLLMExtract(
     // the untouched user shape; quotes are grounded to page + bbox through
     // fire-pdf block spans after extraction. Requires blocks (PDF via
     // fire-pdf) — otherwise extraction proceeds unwrapped and ungrounded.
+    // Requires a user schema: OpenAI strict structured outputs cannot
+    // express a schema-less wrapped shape. Schema-less citeSources
+    // degrades to a normal ungrounded extraction with a warning.
     const citing =
       jsonFormat.citeSources === true &&
+      jsonFormat.schema !== undefined &&
       !!document.blocks?.length &&
       typeof document.markdown === "string";
+    if (jsonFormat.citeSources === true && !citing) {
+      document.warning =
+        "citeSources was requested but citations are unavailable for this document" +
+        (jsonFormat.schema === undefined ? " (a JSON schema is required)" : "") +
+        "; extraction proceeded ungrounded." +
+        (document.warning ? " " + document.warning : "");
+    }
     const effectiveFormat = citing
       ? {
           ...jsonFormat,

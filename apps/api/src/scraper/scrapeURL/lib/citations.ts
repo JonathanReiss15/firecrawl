@@ -176,29 +176,42 @@ export function groundCitations(
 // ---------------------------------------------------------------------------
 
 export const CITATIONS_PROMPT_ADDENDUM =
-  "Additionally, for every field you extract, record in `citations` the exact verbatim quote(s) " +
-  "from the content that support that field's value, keyed by the field's JSON path within `data` " +
-  '(e.g. "total_revenue" or "items[2].name"). Quotes must be copied character-for-character from ' +
-  "the content — do not paraphrase, translate, or normalize them. If no supporting text exists for " +
-  "a field, omit that field from `citations`.";
+  "Additionally, for every field you extract, add an entry to `citations` with the field's JSON " +
+  'path within `data` (e.g. "total_revenue" or "items[2].name") and the exact verbatim quote(s) ' +
+  "from the content that support that field's value. Quotes must be copied character-for-character " +
+  "from the content — do not paraphrase, translate, or normalize them. If no supporting text " +
+  "exists for a field, omit that field from `citations`.";
 
-/** Wrap the user's extraction schema so the model returns data + quotes. */
+/**
+ * Wrap the user's extraction schema so the model returns data + quotes.
+ * OpenAI strict structured outputs forbid free-form maps
+ * (`additionalProperties` must be false everywhere), so citations are an
+ * array of { field, quotes } entries rather than a keyed object. The user
+ * schema itself already passed the OpenAI-strictness validation at request
+ * parse time.
+ */
 export function wrapSchemaWithCitations(userSchema: unknown): Record<string, unknown> {
   return {
     type: "object",
     properties: {
-      data: userSchema ?? { type: "object" },
+      data: userSchema,
       citations: {
-        type: "object",
+        type: "array",
         description:
-          "Per extracted field (keyed by its JSON path in `data`), the exact verbatim quotes from the content supporting the value.",
-        additionalProperties: {
-          type: "array",
-          items: { type: "string" },
+          "One entry per extracted field: its JSON path in `data` and the exact verbatim quotes from the content supporting the value.",
+        items: {
+          type: "object",
+          properties: {
+            field: { type: "string" },
+            quotes: { type: "array", items: { type: "string" } },
+          },
+          required: ["field", "quotes"],
+          additionalProperties: false,
         },
       },
     },
-    required: ["data"],
+    required: ["data", "citations"],
+    additionalProperties: false,
   };
 }
 
@@ -215,10 +228,18 @@ export function splitCitedExtraction(
   const obj = raw as Record<string, unknown>;
   const quotesByField: Record<string, string[]> = {};
   const citations = obj.citations;
-  if (citations && typeof citations === "object" && !Array.isArray(citations)) {
-    for (const [field, value] of Object.entries(citations as Record<string, unknown>)) {
-      if (typeof value === "string") quotesByField[field] = [value];
-      else if (Array.isArray(value)) quotesByField[field] = value.filter((q): q is string => typeof q === "string");
+  if (Array.isArray(citations)) {
+    for (const entry of citations) {
+      if (entry === null || typeof entry !== "object") continue;
+      const { field, quotes } = entry as Record<string, unknown>;
+      if (typeof field !== "string") continue;
+      const list =
+        typeof quotes === "string"
+          ? [quotes]
+          : Array.isArray(quotes)
+            ? quotes.filter((q): q is string => typeof q === "string")
+            : [];
+      quotesByField[field] = [...(quotesByField[field] ?? []), ...list];
     }
   }
   return { data: obj.data, quotesByField };
