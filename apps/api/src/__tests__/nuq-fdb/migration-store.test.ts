@@ -62,6 +62,19 @@ describeIf("NuQ global FDB migration control plane", () => {
     for (const item of objects) {
       await db.doTn(async tn => tn.clear(store.objectKey(item.kind, item.id)));
     }
+    // GC indexes are global by design; test identities are run-qualified.
+    const gcRange = fdb.tuple.range(["nuq-migration", 1, "gc"]);
+    const gcRows = await db.doTn(async tn =>
+      tn.snapshot().getRangeAll(gcRange.begin as Buffer, gcRange.end as Buffer),
+    );
+    await db.doTn(async tn => {
+      for (const [key] of gcRows) {
+        const parts = fdb.tuple.unpack(key as Buffer);
+        if (parts.some(part => String(part).includes(RUN))) {
+          tn.clear(key as Buffer);
+        }
+      }
+    });
   });
 
   test("legacy teams require explicit authority and steady resolution is durable", async () => {
@@ -1121,6 +1134,200 @@ describeIf("NuQ global FDB migration control plane", () => {
       });
     } finally {
       doTn.mockRestore();
+    }
+  });
+
+  test("bounded terminal GC retains canonical rows and resumes its durable cursor", async () => {
+    const base = 1_800_000_000_000;
+    const clock = vi.spyOn(Date, "now").mockReturnValue(base);
+    try {
+      const teamId = team();
+      await initialize(teamId, "fdb");
+      const ids = Array.from({ length: 150 }, () => object());
+      await store.preparePinnedObjects(
+        ids.map(objectId => ({
+          teamId,
+          kind: "scrape_job" as const,
+          objectId,
+          admission: { type: "new-root" as const },
+        })),
+      );
+      for (const objectId of ids) {
+        await store.completePinnedObject({
+          teamId,
+          kind: "scrape_job",
+          objectId,
+          operationId: randomUUID(),
+          fromLifecycle: "prepared",
+        });
+      }
+
+      const retainedId = ids[0];
+      const runtimeKey = store.pack(["test-runtime", retainedId]);
+      await getNuqFdbDatabase().doTn(async tn =>
+        tn.set(runtimeKey, Buffer.from("live")),
+      );
+      clock.mockReturnValue(base + 46 * 24 * 60 * 60 * 1000);
+      const authority = {
+        pgObjectExists: vi.fn(async () => false),
+        fdbReferenceExistsInTxn: vi.fn(
+          async (
+            tn: import("foundationdb").Transaction,
+            pin: { objectId: string },
+          ) =>
+            Boolean(
+              pin.objectId === retainedId ? await tn.get(runtimeKey) : false,
+            ),
+        ),
+      };
+
+      const firstStore = new NuqFdbMigrationStore();
+      const first = await firstStore.sweepTerminalPins(authority, { limit: 7 });
+      const restartedStore = new NuqFdbMigrationStore();
+      const second = await restartedStore.sweepTerminalPins(authority, {
+        limit: 7,
+      });
+      expect(first?.read).toBeLessThanOrEqual(7);
+      expect(second?.read).toBeLessThanOrEqual(7);
+      expect(second?.partition).not.toBe(first?.partition);
+
+      for (let pass = 0; pass < 3; pass++) {
+        for (let partition = 0; partition < 32; partition++) {
+          const result = await restartedStore.sweepTerminalPins(authority);
+          expect(result?.read ?? 0).toBeLessThanOrEqual(100);
+        }
+      }
+      await expect(
+        store.inspectPin("scrape_job", retainedId),
+      ).resolves.toMatchObject({ lifecycle: "terminal" });
+      for (const objectId of ids.slice(1)) {
+        await expect(
+          store.inspectPin("scrape_job", objectId),
+        ).resolves.toBeNull();
+      }
+
+      await getNuqFdbDatabase().doTn(async tn => tn.clear(runtimeKey));
+      clock.mockReturnValue(
+        base + 46 * 24 * 60 * 60 * 1000 + 2 * 60 * 60 * 1000,
+      );
+      for (let partition = 0; partition < 32; partition++) {
+        await restartedStore.sweepTerminalPins(authority);
+      }
+      await expect(
+        store.inspectPin("scrape_job", retainedId),
+      ).resolves.toBeNull();
+      expect(authority.pgObjectExists).not.toHaveBeenCalled();
+    } finally {
+      clock.mockRestore();
+    }
+  });
+
+  test("PG canonical check is followed by FDB CAS and marker loss cannot authorize early GC", async () => {
+    const base = 1_850_000_000_000;
+    const clock = vi.spyOn(Date, "now").mockReturnValue(base);
+    try {
+      const teamId = team();
+      const objectId = object();
+      await initialize(teamId, "pg");
+      await store.preparePinnedObject({
+        teamId,
+        kind: "scrape_job",
+        objectId,
+        admission: { type: "new-root" },
+      });
+      await store.completePinnedObject({
+        teamId,
+        kind: "scrape_job",
+        objectId,
+        operationId: randomUUID(),
+        fromLifecycle: "prepared",
+      });
+      let pgPresent = true;
+      const authority = {
+        pgObjectExists: vi.fn(async () => pgPresent),
+        fdbReferenceExistsInTxn: vi.fn(async () => false),
+      };
+      clock.mockReturnValue(base + 46 * 24 * 60 * 60 * 1000);
+      for (let partition = 0; partition < 32; partition++) {
+        await store.sweepTerminalPins(authority);
+      }
+      await expect(
+        store.inspectPin("scrape_job", objectId),
+      ).resolves.toMatchObject({ lifecycle: "terminal" });
+      expect(authority.pgObjectExists).toHaveBeenCalled();
+      expect(authority.fdbReferenceExistsInTxn).toHaveBeenCalled();
+
+      // This models a lost Redis routing hint: it is not part of the authority
+      // contract. Only the bounded PG adapter becoming empty permits removal.
+      pgPresent = false;
+      clock.mockReturnValue(
+        base + 46 * 24 * 60 * 60 * 1000 + 2 * 60 * 60 * 1000,
+      );
+      for (let partition = 0; partition < 32; partition++) {
+        await store.sweepTerminalPins(authority);
+      }
+      await expect(
+        store.inspectPin("scrape_job", objectId),
+      ).resolves.toBeNull();
+    } finally {
+      clock.mockRestore();
+    }
+  });
+
+  test("sealed history waits for pins and GC removes controls before generations", async () => {
+    const base = 1_900_000_000_000;
+    const clock = vi.spyOn(Date, "now").mockReturnValue(base);
+    try {
+      const teamId = team();
+      const pinId = object();
+      await initialize(teamId, "pg");
+      await store.preparePinnedObject({
+        teamId,
+        kind: "scrape_job",
+        objectId: pinId,
+        admission: { type: "new-root" },
+      });
+      await store.completePinnedObject({
+        teamId,
+        kind: "scrape_job",
+        objectId: pinId,
+        operationId: randomUUID(),
+        fromLifecycle: "prepared",
+      });
+      const transitionOperationId = randomUUID();
+      await begin(teamId, transitionOperationId);
+      await store.finalSeal({ teamId, transitionOperationId });
+      clock.mockReturnValue(base + 46 * 24 * 60 * 60 * 1000);
+
+      for (let partition = 0; partition < 32; partition++) {
+        await store.sweepClosedGenerations();
+      }
+      await expect(
+        store.inspectGenerationIfPresent(teamId, 1),
+      ).resolves.not.toBeNull();
+
+      const authority = {
+        pgObjectExists: async () => false,
+        fdbReferenceExistsInTxn: async () => false,
+      };
+      for (let partition = 0; partition < 32; partition++) {
+        await store.sweepTerminalPins(authority);
+        await store.sweepControlHistory();
+      }
+      clock.mockReturnValue(
+        base + 46 * 24 * 60 * 60 * 1000 + 2 * 60 * 60 * 1000,
+      );
+      for (let partition = 0; partition < 32; partition++) {
+        await store.sweepClosedGenerations();
+      }
+      await expect(
+        store.inspectGenerationIfPresent(teamId, 1),
+      ).resolves.toBeNull();
+      await expect(
+        store.inspectGenerationIfPresent(teamId, 2),
+      ).resolves.toMatchObject({ generation: { status: "open" } });
+    } finally {
+      clock.mockRestore();
     }
   });
 

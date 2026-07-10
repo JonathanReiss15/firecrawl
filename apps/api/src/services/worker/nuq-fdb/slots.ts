@@ -129,6 +129,22 @@ export class NuqFdbExternalSlots {
     );
   }
 
+  /** Conflict-safe point reads used by migration tombstone GC. The durable PG
+   * expiry intent remains authoritative when Redis has been flushed. */
+  public async hasMigrationReferenceInTxn(
+    tn: Transaction,
+    teamId: string,
+    holderId: string,
+  ): Promise<boolean> {
+    const owner = normalizeOwnerId(teamId);
+    if (owner === null) return false;
+    const [fdb, pg] = await Promise.all([
+      tn.get(this.key(owner, holderId)),
+      tn.get(this.pgExpiryRecordKey(owner, holderId)),
+    ]);
+    return Boolean(fdb || pg);
+  }
+
   private async acquireInTxn(
     tn: Transaction,
     owner: string,

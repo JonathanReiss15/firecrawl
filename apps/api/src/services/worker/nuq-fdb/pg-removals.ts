@@ -1,3 +1,4 @@
+import type { Transaction } from "foundationdb";
 import { getFdb, getNuqFdbDatabase } from "./client";
 import { decodeJson, encodeJson } from "./keyspace";
 import { NuqFdbMigrationStore } from "./migration-store";
@@ -55,6 +56,10 @@ export class NuqFdbPgJobRemovals {
         stableId,
       ),
     );
+  }
+
+  public async hasInTxn(tn: Transaction, jobId: string): Promise<boolean> {
+    return Boolean(await tn.get(this.key(jobId.toLowerCase())));
   }
 
   public async begin(descriptor: DurablePgJobRemoval): Promise<void> {

@@ -1,3 +1,4 @@
+import { randomUUID } from "crypto";
 import type { Transaction } from "foundationdb";
 import { getFdb, getNuqFdbDatabase } from "./client";
 import { encodeI64 } from "./keyspace";
@@ -42,6 +43,11 @@ export type MigrationGeneration = {
   backend: MigrationBackend;
   generation: number;
   status: MigrationGenerationStatus;
+  /** Present on generations created by the bounded-GC protocol. Older
+   * generations deliberately remain ineligible until explicitly backfilled. */
+  gcIndexed?: true;
+  terminalAt?: number;
+  terminalVersion?: number;
 };
 
 export type MigrationTeamState = {
@@ -83,6 +89,37 @@ export type MigrationObjectPin = {
   /** Single bounded commit-unknown reconciliation token. A later mutation
    * supersedes it; no per-transition ledger rows are accumulated. */
   lastOperation?: MigrationObjectLastOperation;
+  /** Immutable identity of the terminal incarnation. It fences delayed GC
+   * entries from a newer/replaced record with the same object id. */
+  terminalAt?: number;
+  terminalVersion?: number;
+};
+
+export const MIGRATION_GC_PARTITIONS = 32;
+export const MIGRATION_GC_PAGE_LIMIT = 100;
+// Longer than the 30-day Redis routing hint TTL, so a tombstone can never be
+// collected while a surviving hint is still expected to route callers.
+export const MIGRATION_GC_MIN_RETENTION_MS = 45 * 24 * 60 * 60 * 1000;
+export const MIGRATION_GC_RECHECK_MS = 60 * 60 * 1000;
+
+export type MigrationGcAuthority = {
+  /** Must use only bounded point reads. This is run before the FDB CAS for PG
+   * objects, and must return true whenever the canonical PG object may live. */
+  pgObjectExists(pin: MigrationObjectPin): Promise<boolean>;
+  /** Conflict-safe FDB point reads for runtime rows, task rows, durable PG
+   * holder intents and deletion intents. */
+  fdbReferenceExistsInTxn(
+    tn: Transaction,
+    pin: MigrationObjectPin,
+  ): Promise<boolean>;
+};
+
+export type MigrationGcSweepResult = {
+  partition: number;
+  read: number;
+  removed: number;
+  retained: number;
+  stale: number;
 };
 
 export type MigrationPinAdmission =
@@ -287,6 +324,15 @@ function isNonnegativeInteger(value: unknown): value is number {
   return typeof value === "number" && Number.isSafeInteger(value) && value >= 0;
 }
 
+function migrationGcPartition(identity: string): number {
+  let hash = 0x811c9dc5;
+  for (let index = 0; index < identity.length; index++) {
+    hash ^= identity.charCodeAt(index);
+    hash = Math.imul(hash, 0x01000193);
+  }
+  return (hash >>> 0) % MIGRATION_GC_PARTITIONS;
+}
+
 function encodeJson(value: unknown): Buffer {
   return Buffer.from(JSON.stringify(value), "utf8");
 }
@@ -416,7 +462,15 @@ function validateGeneration(
     !isPositiveInteger(generation.generation) ||
     !GENERATION_STATUSES.includes(
       generation.status as MigrationGenerationStatus,
-    )
+    ) ||
+    (generation.gcIndexed !== undefined && generation.gcIndexed !== true) ||
+    (generation.terminalAt !== undefined &&
+      !isNonnegativeInteger(generation.terminalAt)) ||
+    (generation.terminalVersion !== undefined &&
+      !isPositiveInteger(generation.terminalVersion)) ||
+    (generation.terminalAt === undefined) !==
+      (generation.terminalVersion === undefined) ||
+    (generation.status !== "closed" && generation.terminalAt !== undefined)
   ) {
     throw new MigrationCorruptionError(record, "invalid generation fields");
   }
@@ -452,6 +506,16 @@ function validatePin(value: unknown, record: string): MigrationObjectPin {
         pin.sourceObjectId.length === 0))
   ) {
     throw new MigrationCorruptionError(record, "invalid source pin fields");
+  }
+  if (
+    (pin.terminalAt !== undefined && !isNonnegativeInteger(pin.terminalAt)) ||
+    (pin.terminalVersion !== undefined &&
+      !isPositiveInteger(pin.terminalVersion)) ||
+    (pin.terminalAt === undefined) !== (pin.terminalVersion === undefined) ||
+    (pin.lifecycle !== "terminal" && pin.terminalAt !== undefined) ||
+    (pin.terminalVersion !== undefined && pin.terminalVersion !== pin.revision)
+  ) {
+    throw new MigrationCorruptionError(record, "invalid terminal GC fields");
   }
   const initialResidue = validateStoredResidue(
     pin.initialResidue,
@@ -561,6 +625,8 @@ type ControlOperation = {
   backend: MigrationBackend;
   outcome: "completed" | "pending" | "cancelled";
   state: MigrationTeamState;
+  terminalAt?: number;
+  terminalVersion?: number;
 };
 
 // Read-only compatibility with operation rows produced by the prototype before
@@ -593,7 +659,12 @@ function validateControlOperation(
     !BACKENDS.includes(op.backend as MigrationBackend) ||
     (op.outcome !== "completed" &&
       op.outcome !== "pending" &&
-      op.outcome !== "cancelled")
+      op.outcome !== "cancelled") ||
+    (op.terminalAt !== undefined && !isNonnegativeInteger(op.terminalAt)) ||
+    (op.terminalVersion !== undefined &&
+      !isPositiveInteger(op.terminalVersion)) ||
+    (op.terminalAt === undefined) !== (op.terminalVersion === undefined) ||
+    (op.outcome === "pending" && op.terminalAt !== undefined)
   ) {
     throw new MigrationCorruptionError(
       record,
@@ -730,8 +801,131 @@ export class NuqFdbMigrationStore {
     return this.pack(["team", teamId, "object", kind, objectId]);
   }
 
+  private generationObjectKey(pin: MigrationObjectPin): Buffer {
+    return this.pack([
+      "team",
+      pin.teamId,
+      "generation-object",
+      pin.generation,
+      pin.kind,
+      pin.objectId,
+    ]);
+  }
+
+  private generationObjectRange(teamId: string, generation: number) {
+    return getFdb().tuple.range([
+      "nuq-migration",
+      1,
+      "team",
+      teamId,
+      "generation-object",
+      generation,
+    ]);
+  }
+
+  private terminalPinGcKey(
+    pin: MigrationObjectPin,
+    dueAt: number = pin.terminalAt! + MIGRATION_GC_MIN_RETENTION_MS,
+  ): Buffer {
+    return this.pack([
+      "gc",
+      "pin",
+      migrationGcPartition(`${pin.kind}/${pin.objectId}`),
+      dueAt,
+      pin.kind,
+      pin.objectId,
+      pin.generation,
+      pin.terminalVersion!,
+      pin.terminalAt!,
+    ]);
+  }
+
+  private terminalPinGcRange(partition: number, through: number) {
+    return {
+      begin: this.pack(["gc", "pin", partition]),
+      end: this.pack(["gc", "pin", partition, through]),
+    };
+  }
+
+  private gcCursorKey(category: string): Buffer {
+    return this.pack(["gc", "cursor", category]);
+  }
+
+  private gcLeaseKey(category: string, partition: number): Buffer {
+    return this.pack(["gc", "lease", category, partition]);
+  }
+
   private controlOperationKey(teamId: string, operationId: string): Buffer {
     return this.pack(["team", teamId, "control-operation", operationId]);
+  }
+
+  private controlGenerationRefKey(
+    teamId: string,
+    generation: number,
+    operationId: string,
+  ): Buffer {
+    return this.pack([
+      "team",
+      teamId,
+      "generation-control",
+      generation,
+      operationId,
+    ]);
+  }
+
+  private controlGenerationRefRange(teamId: string, generation: number) {
+    return getFdb().tuple.range([
+      "nuq-migration",
+      1,
+      "team",
+      teamId,
+      "generation-control",
+      generation,
+    ]);
+  }
+
+  private controlGcKey(
+    teamId: string,
+    operation: ControlOperation,
+    dueAt = operation.terminalAt! + MIGRATION_GC_MIN_RETENTION_MS,
+  ): Buffer {
+    return this.pack([
+      "gc",
+      "control",
+      migrationGcPartition(`${teamId}/${operation.operationId}`),
+      dueAt,
+      teamId,
+      operation.operationId,
+      operation.terminalVersion!,
+      operation.terminalAt!,
+    ]);
+  }
+
+  private generationGcKey(
+    generation: MigrationGeneration,
+    dueAt = generation.terminalAt! + MIGRATION_GC_MIN_RETENTION_MS,
+  ): Buffer {
+    return this.pack([
+      "gc",
+      "generation",
+      migrationGcPartition(`${generation.teamId}/${generation.generation}`),
+      dueAt,
+      generation.teamId,
+      generation.generation,
+      generation.terminalVersion!,
+      generation.terminalAt!,
+    ]);
+  }
+
+  private gcRange(
+    category: "control" | "generation",
+    partition: number,
+    through: number,
+  ) {
+    return {
+      begin: this.pack(["gc", category, partition]),
+      end: this.pack(["gc", category, partition, through]),
+    };
   }
 
   private legacyObjectOperationKey(
@@ -748,6 +942,98 @@ export class NuqFdbMigrationStore {
       objectId,
       operationId,
     ]);
+  }
+
+  private writeGenerationInTxn(
+    tn: Transaction,
+    previous: MigrationGeneration | null,
+    generation: MigrationGeneration,
+  ): void {
+    tn.set(
+      this.generationKey(generation.teamId, generation.generation),
+      encodeJson(generation),
+    );
+    if (generation.status === "closed" && generation.terminalAt !== undefined) {
+      tn.set(this.generationGcKey(generation), Buffer.alloc(0));
+    }
+    if (
+      previous?.status === "closed" &&
+      previous.terminalAt !== undefined &&
+      (generation.status !== "closed" ||
+        previous.terminalAt !== generation.terminalAt ||
+        previous.terminalVersion !== generation.terminalVersion)
+    ) {
+      tn.clear(this.generationGcKey(previous));
+    }
+  }
+
+  private controlReferencedGenerations(operation: ControlOperation): number[] {
+    return [
+      operation.state.activeGeneration,
+      ...(operation.state.targetGeneration === undefined
+        ? []
+        : [operation.state.targetGeneration]),
+    ];
+  }
+
+  private writeControlOperationInTxn(
+    tn: Transaction,
+    teamId: string,
+    previous: ControlOperation | null,
+    operation: ControlOperation,
+  ): void {
+    if (previous) {
+      for (const generation of this.controlReferencedGenerations(previous)) {
+        tn.clear(
+          this.controlGenerationRefKey(
+            teamId,
+            generation,
+            previous.operationId,
+          ),
+        );
+      }
+      if (previous.terminalAt !== undefined) {
+        tn.clear(this.controlGcKey(teamId, previous));
+      }
+    }
+    tn.set(
+      this.controlOperationKey(teamId, operation.operationId),
+      encodeJson(operation),
+    );
+    for (const generation of this.controlReferencedGenerations(operation)) {
+      tn.set(
+        this.controlGenerationRefKey(teamId, generation, operation.operationId),
+        Buffer.alloc(0),
+      );
+    }
+    if (operation.terminalAt !== undefined) {
+      tn.set(this.controlGcKey(teamId, operation), Buffer.alloc(0));
+    }
+  }
+
+  private writePinInTxn(
+    tn: Transaction,
+    previous: MigrationObjectPin | null,
+    pin: MigrationObjectPin,
+  ): void {
+    const encoded = encodeJson(pin);
+    tn.set(this.objectKey(pin.kind, pin.objectId), encoded);
+    tn.set(this.generationObjectKey(pin), Buffer.alloc(0));
+    if (pin.lifecycle === "terminal") {
+      tn.clear(this.teamObjectKey(pin.teamId, pin.kind, pin.objectId));
+      tn.set(this.terminalPinGcKey(pin), Buffer.alloc(0));
+    } else {
+      tn.set(this.teamObjectKey(pin.teamId, pin.kind, pin.objectId), encoded);
+    }
+    if (
+      previous?.lifecycle === "terminal" &&
+      previous.terminalAt !== undefined &&
+      (previous.terminalAt !== pin.terminalAt ||
+        previous.terminalVersion !== pin.terminalVersion ||
+        previous.generation !== pin.generation)
+    ) {
+      tn.clear(this.terminalPinGcKey(previous));
+    }
   }
 
   private async readState(
@@ -906,6 +1192,31 @@ export class NuqFdbMigrationStore {
       const state = await this.readState(tn, teamId);
       if (state) await this.validateTopology(tn, state);
       return state;
+    });
+  }
+
+  public async inspectGenerationIfPresent(
+    teamId: string,
+    generation: number,
+  ): Promise<{
+    generation: MigrationGeneration;
+    residue: MigrationResidue;
+  } | null> {
+    assertNonempty(teamId, "teamId");
+    if (!isPositiveInteger(generation)) {
+      throw new MigrationStoreError(
+        "NUQ_MIGRATION_INVALID_ARGUMENT",
+        "generation must be a positive safe integer",
+      );
+    }
+    return await this.db.doTn(async tn => {
+      const record = await this.readGeneration(tn, teamId, generation);
+      return record
+        ? {
+            generation: record,
+            residue: await this.readResidue(tn, teamId, generation),
+          }
+        : null;
     });
   }
 
@@ -1332,14 +1643,11 @@ export class NuqFdbMigrationStore {
       lifecycle: targetLifecycle,
       revision,
       residue,
+      ...(targetLifecycle === "terminal"
+        ? { terminalAt: Date.now(), terminalVersion: revision }
+        : {}),
     };
-    const encoded = encodeJson(next);
-    tn.set(this.objectKey(kind, objectId), encoded);
-    if (next.lifecycle === "terminal") {
-      tn.clear(this.teamObjectKey(teamId, kind, objectId));
-    } else {
-      tn.set(this.teamObjectKey(teamId, kind, objectId), encoded);
-    }
+    this.writePinInTxn(tn, pin, next);
     return next;
   }
 
@@ -1449,6 +1757,7 @@ export class NuqFdbMigrationStore {
         backend,
         generation: 1,
         status: "open",
+        gcIndexed: true,
       };
       const op: ControlOperation = {
         schemaVersion: 1,
@@ -1457,10 +1766,12 @@ export class NuqFdbMigrationStore {
         backend,
         outcome: "completed",
         state,
+        terminalAt: Date.now(),
+        terminalVersion: state.revision,
       };
       tn.set(this.teamStateKey(teamId), encodeJson(state));
-      tn.set(this.generationKey(teamId, 1), encodeJson(generation));
-      tn.set(opKey, encodeJson(op));
+      this.writeGenerationInTxn(tn, null, generation);
+      this.writeControlOperationInTxn(tn, teamId, null, op);
       return state;
     });
   }
@@ -1473,8 +1784,8 @@ export class NuqFdbMigrationStore {
     const { teamId } = state;
     if (state.activeBackend === backend) return state.activeGeneration;
     for (let candidate = state.maxGeneration; candidate >= 1; candidate--) {
-      const generation = await this.requireGeneration(tn, teamId, candidate);
-      if (generation.backend === backend) return candidate;
+      const generation = await this.readGeneration(tn, teamId, candidate);
+      if (generation?.backend === backend) return candidate;
     }
     if (state.phase !== "PG_ONLY" && state.phase !== "FDB_ONLY") {
       throw new MigrationInProgressError(teamId);
@@ -1498,16 +1809,16 @@ export class NuqFdbMigrationStore {
       backend,
       generation: generationNumber,
       status: "closed",
+      gcIndexed: true,
+      terminalAt: Date.now(),
+      terminalVersion: nextRevision(state),
     };
     const next: MigrationTeamState = {
       ...state,
       revision: nextRevision(state),
       maxGeneration: generationNumber,
     };
-    tn.set(
-      this.generationKey(teamId, generationNumber),
-      encodeJson(generation),
-    );
+    this.writeGenerationInTxn(tn, null, generation);
     tn.set(this.teamStateKey(teamId), encodeJson(next));
     return generationNumber;
   }
@@ -1577,8 +1888,10 @@ export class NuqFdbMigrationStore {
           backend: targetBackend,
           outcome: "completed",
           state,
+          terminalAt: Date.now(),
+          terminalVersion: state.revision,
         };
-        tn.set(opKey, encodeJson(op));
+        this.writeControlOperationInTxn(tn, teamId, null, op);
         return state;
       }
 
@@ -1610,6 +1923,7 @@ export class NuqFdbMigrationStore {
         ...source,
         status: "draining",
       };
+      const transitionRevision = nextRevision(state);
       const target: MigrationGeneration = {
         schemaVersion: 1,
         teamId,
@@ -1618,10 +1932,13 @@ export class NuqFdbMigrationStore {
         // A target remains closed until the source reaches exact zero. If the
         // transition is cancelled this generation stays closed forever.
         status: "closed",
+        gcIndexed: true,
+        terminalAt: Date.now(),
+        terminalVersion: transitionRevision,
       };
       const next: MigrationTeamState = {
         ...state,
-        revision: nextRevision(state),
+        revision: transitionRevision,
         maxGeneration: targetGeneration,
         phase: drainingPhase(targetBackend),
         targetBackend,
@@ -1636,13 +1953,10 @@ export class NuqFdbMigrationStore {
         outcome: "pending",
         state: next,
       };
-      tn.set(
-        this.generationKey(teamId, source.generation),
-        encodeJson(drainingSource),
-      );
-      tn.set(this.generationKey(teamId, targetGeneration), encodeJson(target));
+      this.writeGenerationInTxn(tn, source, drainingSource);
+      this.writeGenerationInTxn(tn, null, target);
       tn.set(this.teamStateKey(teamId), encodeJson(next));
-      tn.set(opKey, encodeJson(op));
+      this.writeControlOperationInTxn(tn, teamId, null, op);
       return next;
     });
   }
@@ -1722,7 +2036,12 @@ export class NuqFdbMigrationStore {
           "transition generations cannot be cancelled",
         );
       }
-      const reopened: MigrationGeneration = { ...source, status: "open" };
+      const reopened: MigrationGeneration = {
+        ...source,
+        status: "open",
+        terminalAt: undefined,
+        terminalVersion: undefined,
+      };
       const next: MigrationTeamState = {
         schemaVersion: 1,
         teamId,
@@ -1736,13 +2055,12 @@ export class NuqFdbMigrationStore {
         ...op,
         outcome: "cancelled",
         state: next,
+        terminalAt: Date.now(),
+        terminalVersion: next.revision,
       };
-      tn.set(
-        this.generationKey(teamId, source.generation),
-        encodeJson(reopened),
-      );
+      this.writeGenerationInTxn(tn, source, reopened);
       tn.set(this.teamStateKey(teamId), encodeJson(next));
-      tn.set(opKey, encodeJson(cancelledOp));
+      this.writeControlOperationInTxn(tn, teamId, op, cancelledOp);
       return next;
     });
   }
@@ -1926,6 +2244,9 @@ export class NuqFdbMigrationStore {
           : undefined,
       initialResidue,
       residue: initialResidue,
+      ...(terminalLegacyBackfill
+        ? { terminalAt: Date.now(), terminalVersion: 1 }
+        : {}),
     };
     await this.applyResidueDelta(
       tn,
@@ -1934,9 +2255,7 @@ export class NuqFdbMigrationStore {
       normalizeResidue(undefined),
       initialResidue,
     );
-    const encoded = encodeJson(pin);
-    tn.set(key, encoded);
-    if (!terminalLegacyBackfill) tn.set(indexKey, encoded);
+    this.writePinInTxn(tn, null, pin);
     return pin;
   }
 
@@ -2064,11 +2383,7 @@ export class NuqFdbMigrationStore {
             resultRevision: legacyOperation.result.revision,
           },
         };
-        const migratedEncoded = encodeJson(migratedPin);
-        tn.set(key, migratedEncoded);
-        if (migratedPin.lifecycle !== "terminal") {
-          tn.set(this.teamObjectKey(teamId, kind, objectId), migratedEncoded);
-        }
+        this.writePinInTxn(tn, pin, migratedPin);
         tn.clear(legacyOperationKey);
       }
       return legacyOperation.result;
@@ -2119,6 +2434,9 @@ export class NuqFdbMigrationStore {
       lifecycle: toLifecycle,
       revision,
       residue,
+      ...(toLifecycle === "terminal"
+        ? { terminalAt: Date.now(), terminalVersion: revision }
+        : {}),
       lastOperation: {
         schemaVersion: 1,
         operationId,
@@ -2128,13 +2446,7 @@ export class NuqFdbMigrationStore {
         resultRevision: revision,
       },
     };
-    const encoded = encodeJson(next);
-    tn.set(key, encoded);
-    if (next.lifecycle === "terminal") {
-      tn.clear(this.teamObjectKey(teamId, kind, objectId));
-    } else {
-      tn.set(this.teamObjectKey(teamId, kind, objectId), encoded);
-    }
+    this.writePinInTxn(tn, pin, next);
     return next;
   }
 
@@ -2157,6 +2469,365 @@ export class NuqFdbMigrationStore {
       toLifecycle: "terminal",
       residue: {},
     });
+  }
+
+  private async claimGcPartition(
+    category: string,
+    now: number,
+  ): Promise<{ partition: number; token: string } | null> {
+    for (let attempt = 0; attempt < MIGRATION_GC_PARTITIONS; attempt++) {
+      const token = randomUUID();
+      const claim = await this.db.doTn(async tn => {
+        const cursorKey = this.gcCursorKey(category);
+        const cursor = Number(
+          parseJson(await tn.get(cursorKey), `GC ${category} cursor`) ?? 0,
+        );
+        if (!isNonnegativeInteger(cursor)) {
+          throw new MigrationCorruptionError(
+            `GC ${category} cursor`,
+            "invalid partition",
+          );
+        }
+        const partition = cursor % MIGRATION_GC_PARTITIONS;
+        tn.set(
+          cursorKey,
+          encodeJson((partition + 1) % MIGRATION_GC_PARTITIONS),
+        );
+        const leaseKey = this.gcLeaseKey(category, partition);
+        const lease = parseJson(
+          await tn.get(leaseKey),
+          `GC ${category} lease`,
+        ) as { token?: unknown; expiresAt?: unknown } | null;
+        if (
+          lease &&
+          typeof lease.token === "string" &&
+          isNonnegativeInteger(lease.expiresAt) &&
+          lease.expiresAt > now
+        ) {
+          return null;
+        }
+        tn.set(leaseKey, encodeJson({ token, expiresAt: now + 5 * 60 * 1000 }));
+        return { partition, token };
+      });
+      if (claim) return claim;
+    }
+    return null;
+  }
+
+  private async releaseGcPartition(
+    category: string,
+    partition: number,
+    token: string,
+  ): Promise<void> {
+    await this.db.doTn(async tn => {
+      const key = this.gcLeaseKey(category, partition);
+      const lease = parseJson(await tn.get(key), `GC ${category} lease`) as {
+        token?: unknown;
+      } | null;
+      if (lease?.token === token) tn.clear(key);
+    });
+  }
+
+  /**
+   * Process one durably selected shard and at most one bounded page. PG is
+   * probed first; deletion then re-reads the pin and every FDB canonical key in
+   * one conflict-safe transaction. A missing Redis hint is intentionally not
+   * an input to this decision.
+   */
+  public async sweepTerminalPins(
+    authority: MigrationGcAuthority,
+    options: {
+      now?: number;
+      limit?: number;
+      recheckMs?: number;
+    } = {},
+  ): Promise<MigrationGcSweepResult | null> {
+    const now = options.now ?? Date.now();
+    const limit = options.limit ?? MIGRATION_GC_PAGE_LIMIT;
+    const recheckMs = options.recheckMs ?? MIGRATION_GC_RECHECK_MS;
+    if (!isPositiveInteger(limit) || limit > MIGRATION_GC_PAGE_LIMIT) {
+      throw new MigrationStoreError(
+        "NUQ_MIGRATION_INVALID_ARGUMENT",
+        `GC page limit must be between 1 and ${MIGRATION_GC_PAGE_LIMIT}`,
+      );
+    }
+    if (!isPositiveInteger(recheckMs)) {
+      throw new MigrationStoreError(
+        "NUQ_MIGRATION_INVALID_ARGUMENT",
+        "GC recheck must be a positive safe integer",
+      );
+    }
+    const claim = await this.claimGcPartition("pin", now);
+    if (!claim) return null;
+    const result: MigrationGcSweepResult = {
+      partition: claim.partition,
+      read: 0,
+      removed: 0,
+      retained: 0,
+      stale: 0,
+    };
+    try {
+      const range = this.terminalPinGcRange(claim.partition, now + 1);
+      const rows = (await this.db.doTn(async tn =>
+        tn.snapshot().getRangeAll(range.begin, range.end, { limit }),
+      )) as [Buffer, Buffer][];
+      result.read = rows.length;
+      for (const [indexKey] of rows) {
+        const parts = getFdb().tuple.unpack(indexKey);
+        const kind = String(parts[6]) as MigrationObjectKind;
+        const objectId = String(parts[7]);
+        const generation = Number(parts[8]);
+        const terminalVersion = Number(parts[9]);
+        const terminalAt = Number(parts[10]);
+        if (
+          !OBJECT_KINDS.includes(kind) ||
+          !isPositiveInteger(generation) ||
+          !isPositiveInteger(terminalVersion) ||
+          !isNonnegativeInteger(terminalAt)
+        ) {
+          throw new MigrationCorruptionError(
+            "terminal pin GC index",
+            "invalid identity",
+          );
+        }
+        const observed = await this.inspectPin(kind, objectId);
+        const matches =
+          observed?.lifecycle === "terminal" &&
+          observed.generation === generation &&
+          observed.terminalVersion === terminalVersion &&
+          observed.terminalAt === terminalAt;
+        if (!matches) {
+          await this.db.doTn(async tn => tn.clear(indexKey));
+          result.stale++;
+          continue;
+        }
+
+        const pgExists =
+          observed.backend === "pg"
+            ? await authority.pgObjectExists(observed)
+            : false;
+        const outcome = await this.db.doTn(async tn => {
+          const current = await this.inspectPinInTxn(tn, kind, objectId);
+          if (
+            !current ||
+            current.lifecycle !== "terminal" ||
+            current.generation !== generation ||
+            current.terminalVersion !== terminalVersion ||
+            current.terminalAt !== terminalAt
+          ) {
+            tn.clear(indexKey);
+            return "stale" as const;
+          }
+          const teamIndex = await tn.get(
+            this.teamObjectKey(current.teamId, current.kind, current.objectId),
+          );
+          const hasFdbReference = await authority.fdbReferenceExistsInTxn(
+            tn,
+            current,
+          );
+          if (
+            pgExists ||
+            hasFdbReference ||
+            teamIndex ||
+            Object.values(current.residue).some(value => value !== 0)
+          ) {
+            tn.clear(indexKey);
+            tn.set(
+              this.terminalPinGcKey(current, now + recheckMs),
+              Buffer.alloc(0),
+            );
+            return "retained" as const;
+          }
+          tn.clear(this.objectKey(kind, objectId));
+          tn.clear(this.generationObjectKey(current));
+          tn.clear(indexKey);
+          return "removed" as const;
+        });
+        result[outcome]++;
+      }
+      return result;
+    } finally {
+      await this.releaseGcPartition("pin", claim.partition, claim.token);
+    }
+  }
+
+  public async sweepControlHistory(
+    options: { now?: number; limit?: number } = {},
+  ): Promise<MigrationGcSweepResult | null> {
+    const now = options.now ?? Date.now();
+    const limit = options.limit ?? MIGRATION_GC_PAGE_LIMIT;
+    if (!isPositiveInteger(limit) || limit > MIGRATION_GC_PAGE_LIMIT) {
+      throw new MigrationStoreError(
+        "NUQ_MIGRATION_INVALID_ARGUMENT",
+        `GC page limit must be between 1 and ${MIGRATION_GC_PAGE_LIMIT}`,
+      );
+    }
+    const claim = await this.claimGcPartition("control", now);
+    if (!claim) return null;
+    const result: MigrationGcSweepResult = {
+      partition: claim.partition,
+      read: 0,
+      removed: 0,
+      retained: 0,
+      stale: 0,
+    };
+    try {
+      const range = this.gcRange("control", claim.partition, now + 1);
+      const rows = (await this.db.doTn(async tn =>
+        tn.snapshot().getRangeAll(range.begin, range.end, { limit }),
+      )) as [Buffer, Buffer][];
+      result.read = rows.length;
+      for (const [indexKey] of rows) {
+        const parts = getFdb().tuple.unpack(indexKey);
+        const teamId = String(parts[6]);
+        const operationId = String(parts[7]);
+        const version = Number(parts[8]);
+        const terminalAt = Number(parts[9]);
+        const outcome = await this.db.doTn(async tn => {
+          const raw = await tn.get(
+            this.controlOperationKey(teamId, operationId),
+          );
+          if (!raw) {
+            tn.clear(indexKey);
+            return "stale" as const;
+          }
+          const operation = validateControlOperation(
+            parseJson(raw, `control operation ${operationId}`),
+            `control operation ${operationId}`,
+          );
+          if (
+            operation.terminalVersion !== version ||
+            operation.terminalAt !== terminalAt ||
+            operation.outcome === "pending"
+          ) {
+            tn.clear(indexKey);
+            return "stale" as const;
+          }
+          const state = await this.readState(tn, teamId);
+          if (state?.transitionOperationId === operationId) {
+            return "retained" as const;
+          }
+          tn.clear(this.controlOperationKey(teamId, operationId));
+          for (const generation of this.controlReferencedGenerations(
+            operation,
+          )) {
+            tn.clear(
+              this.controlGenerationRefKey(teamId, generation, operationId),
+            );
+          }
+          tn.clear(indexKey);
+          return "removed" as const;
+        });
+        result[outcome]++;
+      }
+      return result;
+    } finally {
+      await this.releaseGcPartition("control", claim.partition, claim.token);
+    }
+  }
+
+  public async sweepClosedGenerations(
+    options: { now?: number; limit?: number; recheckMs?: number } = {},
+  ): Promise<MigrationGcSweepResult | null> {
+    const now = options.now ?? Date.now();
+    const limit = options.limit ?? MIGRATION_GC_PAGE_LIMIT;
+    const recheckMs = options.recheckMs ?? MIGRATION_GC_RECHECK_MS;
+    if (!isPositiveInteger(limit) || limit > MIGRATION_GC_PAGE_LIMIT) {
+      throw new MigrationStoreError(
+        "NUQ_MIGRATION_INVALID_ARGUMENT",
+        `GC page limit must be between 1 and ${MIGRATION_GC_PAGE_LIMIT}`,
+      );
+    }
+    const claim = await this.claimGcPartition("generation", now);
+    if (!claim) return null;
+    const result: MigrationGcSweepResult = {
+      partition: claim.partition,
+      read: 0,
+      removed: 0,
+      retained: 0,
+      stale: 0,
+    };
+    try {
+      const range = this.gcRange("generation", claim.partition, now + 1);
+      const rows = (await this.db.doTn(async tn =>
+        tn.snapshot().getRangeAll(range.begin, range.end, { limit }),
+      )) as [Buffer, Buffer][];
+      result.read = rows.length;
+      for (const [indexKey] of rows) {
+        const parts = getFdb().tuple.unpack(indexKey);
+        const teamId = String(parts[6]);
+        const generationNumber = Number(parts[7]);
+        const version = Number(parts[8]);
+        const terminalAt = Number(parts[9]);
+        const outcome = await this.db.doTn(async tn => {
+          const generation = await this.readGeneration(
+            tn,
+            teamId,
+            generationNumber,
+          );
+          if (
+            !generation ||
+            generation.status !== "closed" ||
+            generation.gcIndexed !== true ||
+            generation.terminalVersion !== version ||
+            generation.terminalAt !== terminalAt
+          ) {
+            tn.clear(indexKey);
+            return "stale" as const;
+          }
+          const state = await this.readState(tn, teamId);
+          const residue = await this.readResidue(tn, teamId, generationNumber);
+          const objectRange = this.generationObjectRange(
+            teamId,
+            generationNumber,
+          );
+          const controlRange = this.controlGenerationRefRange(
+            teamId,
+            generationNumber,
+          );
+          const [objects, controls] = await Promise.all([
+            tn.getRangeAll(
+              objectRange.begin as Buffer,
+              objectRange.end as Buffer,
+              {
+                limit: 1,
+              },
+            ),
+            tn.getRangeAll(
+              controlRange.begin as Buffer,
+              controlRange.end as Buffer,
+              {
+                limit: 1,
+              },
+            ),
+          ]);
+          if (
+            state?.activeGeneration === generationNumber ||
+            state?.targetGeneration === generationNumber ||
+            Object.values(residue).some(value => value !== 0) ||
+            objects.length > 0 ||
+            controls.length > 0
+          ) {
+            tn.clear(indexKey);
+            tn.set(
+              this.generationGcKey(generation, now + recheckMs),
+              Buffer.alloc(0),
+            );
+            return "retained" as const;
+          }
+          tn.clear(this.generationKey(teamId, generationNumber));
+          for (const counter of MIGRATION_RESIDUE_COUNTERS) {
+            tn.clear(this.residueKey(teamId, generationNumber, counter));
+          }
+          tn.clear(indexKey);
+          return "removed" as const;
+        });
+        result[outcome]++;
+      }
+      return result;
+    } finally {
+      await this.releaseGcPartition("generation", claim.partition, claim.token);
+    }
   }
 
   public async finalSeal(input: {
@@ -2252,11 +2923,6 @@ export class NuqFdbMigrationStore {
           "closed target has residue",
         );
       }
-      const closedSource: MigrationGeneration = {
-        ...source,
-        status: "closed",
-      };
-      const openTarget: MigrationGeneration = { ...target, status: "open" };
       const next: MigrationTeamState = {
         schemaVersion: 1,
         teamId,
@@ -2266,21 +2932,30 @@ export class NuqFdbMigrationStore {
         activeGeneration: target.generation,
         phase: stablePhase(target.backend),
       };
+      const closedSource: MigrationGeneration = {
+        ...source,
+        status: "closed",
+        ...(source.gcIndexed
+          ? { terminalAt: Date.now(), terminalVersion: next.revision }
+          : {}),
+      };
+      const openTarget: MigrationGeneration = {
+        ...target,
+        status: "open",
+        terminalAt: undefined,
+        terminalVersion: undefined,
+      };
       const completedOp: ControlOperation = {
         ...op,
         outcome: "completed",
         state: next,
+        terminalAt: Date.now(),
+        terminalVersion: next.revision,
       };
-      tn.set(
-        this.generationKey(teamId, source.generation),
-        encodeJson(closedSource),
-      );
-      tn.set(
-        this.generationKey(teamId, target.generation),
-        encodeJson(openTarget),
-      );
+      this.writeGenerationInTxn(tn, source, closedSource);
+      this.writeGenerationInTxn(tn, target, openTarget);
       tn.set(this.teamStateKey(teamId), encodeJson(next));
-      tn.set(opKey, encodeJson(completedOp));
+      this.writeControlOperationInTxn(tn, teamId, op, completedOp);
       return next;
     });
   }
