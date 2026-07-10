@@ -260,12 +260,6 @@ export function authMiddleware(
 
       req.auth = { team_id, org_id };
       req.acuc = chunk ?? undefined;
-      if (chunk) {
-        // ACUC credit fields are zeroed out (Autumn is the source of truth).
-        // checkCreditsMiddleware does the real gating; keep req.account defined
-        // and non-clamping for routes that read it (e.g. crawl).
-        req.account = { remainingCredits: Infinity };
-      }
       next();
     })().catch(err => next(err));
   };
