@@ -68,7 +68,7 @@ export async function prepareGroupSweepTaskInTxn(
     recordPin: runtimeMigrationPin(group),
   });
   if (!groupPin) return null;
-  return await nuqFdbMigrationStore.preparePinnedObjectInTxn(tn, {
+  const taskPin = await nuqFdbMigrationStore.preparePinnedObjectInTxn(tn, {
     teamId: group.o,
     kind: "sweeper_task",
     objectId: groupSweepTaskId(gid),
@@ -77,6 +77,16 @@ export async function prepareGroupSweepTaskInTxn(
       source: { kind: "group", objectId: gid },
     },
     requiredBackend: "fdb",
+    residue: { control_sweeper_tasks: 1 },
+  });
+  return await nuqFdbMigrationStore.reconcileManagedObjectInTxn(tn, {
+    teamId: group.o,
+    kind: "sweeper_task",
+    objectId: groupSweepTaskId(gid),
+    recordPin: {
+      backend: taskPin.backend,
+      generation: taskPin.generation,
+    },
     residue: { control_sweeper_tasks: 1 },
   });
 }

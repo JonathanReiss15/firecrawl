@@ -142,6 +142,8 @@ export type ReconcileManagedObjectInput = {
   allowMissingRecordPin?: boolean;
   residue: Partial<MigrationResidue>;
   terminal?: boolean;
+  /** Validation-only callers suppress the prepared->active transition. */
+  activateNonterminal?: boolean;
 };
 
 export type MigrationSteadyResolution =
@@ -1070,6 +1072,11 @@ export class NuqFdbMigrationStore {
 
     const residue = normalizeResidue(input.residue);
     const terminal = input.terminal === true;
+    const targetLifecycle: MigrationObjectLifecycle = terminal
+      ? "terminal"
+      : input.activateNonterminal === false
+        ? pin.lifecycle
+        : "active";
     if (pin.lifecycle === "terminal") {
       if (!terminal || Object.values(residue).some(value => value !== 0)) {
         throw new MigrationStoreError(
@@ -1079,7 +1086,12 @@ export class NuqFdbMigrationStore {
       }
       return pin;
     }
-    if (!terminal && residueEqual(pin.residue, residue)) return pin;
+    if (
+      pin.lifecycle === targetLifecycle &&
+      residueEqual(pin.residue, residue)
+    ) {
+      return pin;
+    }
     await this.applyResidueDelta(
       tn,
       teamId,
@@ -1096,7 +1108,7 @@ export class NuqFdbMigrationStore {
     }
     const next: MigrationObjectPin = {
       ...pin,
-      lifecycle: terminal ? "terminal" : pin.lifecycle,
+      lifecycle: targetLifecycle,
       revision,
       residue,
     };
@@ -1114,6 +1126,7 @@ export class NuqFdbMigrationStore {
     return await this.reconcileManagedObjectInTxn(tn, {
       ...input,
       residue: pin?.residue ?? {},
+      activateNonterminal: false,
     });
   }
 

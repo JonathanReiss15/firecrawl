@@ -148,6 +148,10 @@ describeIf("NuQ FDB transaction-scoped migration generation hooks", () => {
       capacity_ready_active: 1,
       intent_unresolved: 0,
     });
+    await expect(store.inspectPin("scrape_job", id)).resolves.toMatchObject({
+      lifecycle: "active",
+      residue: { capacity_ready_active: 1 },
+    });
 
     const transition = await store.beginTransition({
       teamId,
@@ -231,6 +235,9 @@ describeIf("NuQ FDB transaction-scoped migration generation hooks", () => {
       residue: { intent_unresolved: 1 },
     });
     await slots.acquire(teamId, holderId, 60_000);
+    await expect(
+      store.inspectPin("external_holder", holderId),
+    ).resolves.toMatchObject({ lifecycle: "active" });
     expect(await residue(teamId)).toMatchObject({
       capacity_external_holders: 1,
       intent_unresolved: 0,
@@ -244,6 +251,9 @@ describeIf("NuQ FDB transaction-scoped migration generation hooks", () => {
     const child = randomUUID();
     await prepareGroup(teamId, gid);
     await groups.addGroup(gid, teamId);
+    await expect(store.inspectPin("group", gid)).resolves.toMatchObject({
+      lifecycle: "active",
+    });
     expect((await residue(teamId)).control_groups).toBe(1);
     await prepareJob(teamId, child, gid);
     await queue.addJob(
@@ -263,6 +273,9 @@ describeIf("NuQ FDB transaction-scoped migration generation hooks", () => {
       migrationBackend: "fdb",
       migrationGeneration: 1,
     });
+    await expect(
+      store.inspectPin("crawl_finished", finished!.id),
+    ).resolves.toMatchObject({ lifecycle: "active" });
     await finishedQueue.jobFinish(finished!.id, finished!.lock!, {});
     expect((await residue(teamId)).control_crawl_finished).toBe(0);
   });
@@ -325,5 +338,8 @@ describeIf("NuQ FDB transaction-scoped migration generation hooks", () => {
       control_groups: 0,
       control_sweeper_tasks: 1,
     });
+    await expect(
+      store.inspectPin("sweeper_task", `group-cancel/${gid}`),
+    ).resolves.toMatchObject({ lifecycle: "active" });
   });
 });

@@ -579,17 +579,21 @@ async function activateRoutingPin(
   operation: string,
 ): Promise<void> {
   if (!pin || pin.lifecycle === "active") return;
-  if (pin.lifecycle === "terminal") {
-    throw new Error(
-      `Cannot reactivate terminal migration pin ${pin.kind}/${pin.objectId}`,
-    );
+  const current = await optionalFdbRead(() =>
+    nuqFdbMigrationStore.inspectPin(pin.kind, pin.objectId),
+  );
+  if (current?.lifecycle === "active" || current?.lifecycle === "terminal") {
+    return;
+  }
+  if (!current) {
+    throw new Error(`Missing migration pin ${pin.kind}/${pin.objectId}`);
   }
   await fdbMutation(() =>
     nuqFdbMigrationStore.transitionObjectResidue({
-      teamId: pin.teamId,
-      kind: pin.kind,
-      objectId: pin.objectId,
-      operationId: `nuq-router/v1/${operation}/${pin.objectId}`,
+      teamId: current.teamId,
+      kind: current.kind,
+      objectId: current.objectId,
+      operationId: `nuq-router/v1/${operation}/${current.objectId}`,
       fromLifecycle: "prepared",
       toLifecycle: "active",
       residue,
