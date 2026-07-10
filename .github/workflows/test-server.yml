@@ -245,7 +245,7 @@ jobs:
           PORT: 3003
 
       - name: Run Docker Postgres
-        if: matrix.nuq == 'postgres'
+        if: matrix.nuq == 'postgres' || matrix.nuq == 'fdb'
         run: |
           docker build -t firecrawl/nuq-postgres:latest ./apps/nuq-postgres
           docker run -d -p 5432:5432 -e POSTGRES_USER=postgres -e POSTGRES_PASSWORD=postgres -e POSTGRES_DB=postgres --name postgres firecrawl/nuq-postgres:latest
@@ -582,8 +582,15 @@ jobs:
   nuq-fdb-core:
     name: NuQ FoundationDB core tests
     runs-on: blacksmith-4vcpu-ubuntu-2404
+    services:
+      redis:
+        image: redis
+        ports:
+          - 6379:6379
     env:
       FDB_VERSION: 7.3.63
+      NUQ_DATABASE_URL: postgres://postgres:postgres@localhost:5432/postgres
+      REDIS_URL: redis://localhost:6379
     steps:
       - uses: actions/checkout@v5
 
@@ -611,6 +618,15 @@ jobs:
           curl -fsSL -o /tmp/fdb-clients.deb \
             "https://github.com/apple/foundationdb/releases/download/${FDB_VERSION}/foundationdb-clients_${FDB_VERSION}-1_amd64.deb"
           sudo dpkg -i /tmp/fdb-clients.deb
+
+      - name: Start NuQ Postgres
+        run: |
+          docker build -t firecrawl/nuq-postgres:latest ./apps/nuq-postgres
+          docker run -d -p 5432:5432 -e POSTGRES_USER=postgres -e POSTGRES_PASSWORD=postgres -e POSTGRES_DB=postgres --name postgres firecrawl/nuq-postgres:latest
+          for i in $(seq 1 30); do
+            if docker exec postgres pg_isready -U postgres 2>/dev/null; then break; fi
+            sleep 1
+          done
 
       - name: Start FoundationDB
         run: |
