@@ -40,6 +40,7 @@ import { serializeTraceContext } from "../lib/otel-tracer";
 import { isSelfHosted } from "../lib/deployment";
 import { MONITOR_CHECK_STALE_TIMEOUT_MS } from "./monitoring/stale";
 import { getRedisConnection } from "./queue-service";
+import { NuQRouterBothBackendsError } from "./worker/nuq-migration-control";
 import {
   completePreparedNuQPgPublication,
   completePreparedNuQPgPublicationSubset,
@@ -954,9 +955,12 @@ export async function addScrapeJobs(
       const pgJobs = allTeamJobs.filter(
         j => backendByJob.get(j.jobId) === "pg",
       );
-      // Deterministic combined-cap failures must happen before either ledger
-      // commits. Stable ids then make transient second-ledger failures safe to
-      // retry without duplicating the already-committed partition.
+      // Pause/drain never publishes one batch into both ledgers. Mixed pins
+      // indicate corrupt or incompletely migrated source state and must fail
+      // before either backend commits.
+      if (fdbJobs.length > 0 && pgJobs.length > 0) {
+        throw new NuQRouterBothBackendsError("team_batch", teamId);
+      }
       await preflightPgPartition(teamId, pgJobs);
       if (fdbJobs.length > 0) {
         const { backloggedCount, teamLimit } = await fdbEnqueueScrapeJobs(
@@ -968,10 +972,6 @@ export async function addScrapeJobs(
             backlogTimeoutMs: backlogTimeoutMs(job.data),
           })),
           teamId,
-          // Reserve the worst-case future PG backlog before FDB commits. This
-          // makes deterministic combined-cap failure happen before either
-          // partition is visible; the exact PG planner may consume less.
-          { reservedExternalPending: pgJobs.length },
         );
         if (backloggedCount > 0) {
           await maybeSendConcurrencyNotificationFdb(

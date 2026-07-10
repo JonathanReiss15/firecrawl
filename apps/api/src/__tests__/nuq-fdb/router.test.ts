@@ -313,38 +313,6 @@ describeIf("NuQ router (forced FDB mode)", () => {
     expect(await scrapeQueueFdb.getTeamActiveCount(teamId)).toBe(0);
   });
 
-  test("PG occupancy reduces FDB admission and direct jobs keep occupancy parity", async () => {
-    const teamId = randomUUID();
-    const blockedId = randomUUID();
-    const directId = randomUUID();
-    const data = {
-      mode: "single_urls",
-      url: "https://example.com",
-      team_id: teamId,
-    } as any;
-
-    const blocked = await scrapeQueueFdb.addJob(
-      blockedId,
-      data,
-      { ownerId: teamId, priority: 0 },
-      { teamLimit: 2, externalActive: 2, queueCap: 10 },
-    );
-    expect(blocked.status).toBe("backlog");
-    expect(await scrapeQueueFdb.getTeamActiveCount(teamId)).toBe(0);
-    await scrapeQueueFdb.removeJob(blockedId);
-
-    const direct = await scrapeQueueFdb.addJob(
-      directId,
-      data,
-      { ownerId: teamId, priority: 0, bypassGate: true },
-      { teamLimit: 1, queueCap: 10 },
-    );
-    expect(direct.status).toBe("queued");
-    expect(await scrapeQueueFdb.getTeamActiveCount(teamId)).toBe(1);
-    await scrapeQueueFdb.removeJob(directId);
-    expect(await scrapeQueueFdb.getTeamActiveCount(teamId)).toBe(0);
-  });
-
   test("optional router never attempts an FDB dequeue before PG fallback", async () => {
     const forcedBackend = config.NUQ_BACKEND;
     const fdbTake = vi.spyOn(scrapeQueueFdb, "getJobToProcess");

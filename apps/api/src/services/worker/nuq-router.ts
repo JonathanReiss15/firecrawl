@@ -590,17 +590,14 @@ async function acquireExternalSlot(
         ),
       );
     }
-    const [fdbPresent, pgPresent] = await Promise.all([
-      optionalFdbRead(() => externalSlotsFdb.has(teamId, holderId)),
-      getRedisConnection().zscore(
-        constructConcurrencyLimitKey(teamId),
-        holderId,
-      ),
-    ]);
-    if (fdbPresent && pgPresent !== null) {
-      throw new NuQRouterBothBackendsError("external_holder", holderId);
-    }
-    const legacyBackend = fdbPresent ? "fdb" : pgPresent !== null ? "pg" : null;
+    // Only the legacy PG holder ledger has a directly queryable per-holder
+    // record. Existing FDB holders remain safe through their durable slot TTL;
+    // without a migration pin a transition rejects renewal rather than guessing.
+    const pgPresent = await getRedisConnection().zscore(
+      constructConcurrencyLimitKey(teamId),
+      holderId,
+    );
+    const legacyBackend = pgPresent !== null ? "pg" : null;
     if (legacyBackend) {
       if (state.activeBackend !== legacyBackend) {
         throw new NuQRouterPinMismatchError(
@@ -694,50 +691,41 @@ export async function mirrorExternalSlotRelease(
   });
 }
 
-// Active count across both ledgers; a migrating team has load on both while
-// its old PG crawls drain.
-export async function syncFdbLimitToPgOccupancy(teamId: string): Promise<void> {
-  if (!(await teamUsesFdbLedger(teamId)) || isSelfHosted()) return;
-  const acuc = await getACUCTeam(teamId, false, true, RateLimiterMode.Crawl);
-  await reconcileFdbTeamLimit(teamId, acuc?.concurrency ?? 2);
-}
+// Compatibility hook for PG-only call sites. Pause/drain guarantees that PG
+// and FDB never admit concurrently, so no cross-ledger limit mirroring exists.
+export async function syncFdbLimitToPgOccupancy(
+  _teamId: string,
+): Promise<void> {}
 
-export async function reconcileFdbTeamLimit(
-  teamId: string,
-  teamLimit: number,
-): Promise<void> {
-  if (!fdbQueueEnabled()) return;
-  const externalActive = await getConcurrencyLimitActiveJobsCount(teamId);
-  await fdbMutation(() =>
-    scrapeQueueFdb.setTeamLimit(teamId, teamLimit, externalActive),
+async function activeTeamBackend(teamId: string): Promise<QueueBackend> {
+  if (!fdbQueueEnabled()) return "pg";
+  if (fdbForced()) return "fdb";
+  const state = await optionalFdbRead(() =>
+    nuqFdbMigrationStore.inspectState(teamId),
   );
+  return state?.activeBackend ?? (await authoritativeTeamBackend(teamId));
 }
 
 export async function getCombinedTeamPendingCount(
   teamId: string,
 ): Promise<number> {
-  const pgPending = await getRedisConnection().zcard(
-    `concurrency-limit-queue:${teamId}`,
-  );
-  if (!(await teamUsesFdbLedger(teamId))) return pgPending;
-  return (
-    pgPending +
-    (await optionalFdbRead(() => scrapeQueueFdb.getTeamPendingCount(teamId)))
-  );
+  if ((await activeTeamBackend(teamId)) === "fdb") {
+    return await optionalFdbRead(() =>
+      scrapeQueueFdb.getTeamPendingCount(teamId),
+    );
+  }
+  return await getRedisConnection().zcard(`concurrency-limit-queue:${teamId}`);
 }
 
 export async function getCombinedTeamActiveCount(
   teamId: string,
 ): Promise<number> {
-  const redisCount = await getConcurrencyLimitActiveJobsCount(teamId);
-  if (!(await teamUsesFdbLedger(teamId))) return redisCount;
-  // Always include FDB for migrated teams, even after the rollout flag is
-  // switched off. Pinned FDB crawls and standalone jobs keep draining and
-  // remain part of the team's one combined limit.
-  return (
-    redisCount +
-    (await optionalFdbRead(() => scrapeQueueFdb.getTeamActiveCount(teamId)))
-  );
+  if ((await activeTeamBackend(teamId)) === "fdb") {
+    return await optionalFdbRead(() =>
+      scrapeQueueFdb.getTeamActiveCount(teamId),
+    );
+  }
+  return await getConcurrencyLimitActiveJobsCount(teamId);
 }
 
 // === FDB enqueue (the whole gating block of queue-jobs collapses into this)
@@ -775,7 +763,7 @@ export async function fdbEnqueueScrapeJobs(
     backlogTimeoutMs: number;
   }[],
   teamId: string,
-  options?: { bypassGate?: boolean; reservedExternalPending?: number },
+  options?: { bypassGate?: boolean },
 ): Promise<{
   jobs: (NuQJob<ScrapeJobData> & { backend: "fdb" })[];
   backloggedCount: number;
@@ -841,14 +829,6 @@ export async function fdbEnqueueScrapeJobs(
     }
   }
 
-  const externalActive =
-    teamLimit === null ? 0 : await getConcurrencyLimitActiveJobsCount(teamId);
-  const externalPending =
-    teamLimit === null
-      ? 0
-      : (await getRedisConnection().zcard(
-          `concurrency-limit-queue:${teamId}`,
-        )) + (options?.reservedExternalPending ?? 0);
   const results = await fdbMutation(() =>
     scrapeQueueFdb.addJobs(
       jobs.map(j => ({
@@ -866,13 +846,7 @@ export async function fdbEnqueueScrapeJobs(
           timesOutAt: new Date(Date.now() + j.backlogTimeoutMs),
         },
       })),
-      {
-        teamLimit,
-        queueCap,
-        externalActive,
-        externalPending,
-        key: keyGate,
-      },
+      { teamLimit, queueCap, key: keyGate },
     ),
   );
 
