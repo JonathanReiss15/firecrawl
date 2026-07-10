@@ -10,7 +10,14 @@ import {
   F_GATED,
   normalizeOwnerId,
 } from "./keyspace";
-import { bumpTeamActive, newTxContext, releaseSlotsAndPromote } from "./ops";
+import {
+  bumpTeamActive,
+  newTxContext,
+  releaseSlotsAndPromote,
+  runtimeMigrationPin,
+  stampMigrationPin,
+} from "./ops";
+import { nuqFdbMigrationStore } from "./migration-store";
 
 // External slots: capacity consumed by things that are not queue jobs (sync
 // scrapes via the team semaphore, browser sessions). They unconditionally bump
@@ -18,9 +25,11 @@ import { bumpTeamActive, newTxContext, releaseSlotsAndPromote } from "./ops";
 // behavior where sync holders were mirrored into the same ZSET -- and hand
 // their slot through the normal promotion chain on release.
 
-type ExternalSlotRecord = {
+export type ExternalSlotRecord = {
   e: number; // expiry ms
   g?: string; // renewal generation (absent on pre-generation records)
+  mb?: "pg" | "fdb"; // migration backend pin
+  mg?: number; // never-reused migration generation
 };
 
 export type ExternalSlotSweepGuard = (tn: Transaction) => Promise<void>;
@@ -85,6 +94,14 @@ export class NuqFdbExternalSlots {
       const existing = decodeJson<ExternalSlotRecord>(
         await tn.get(this.key(owner, holderId)),
       );
+      const existingPin = existing
+        ? await nuqFdbMigrationStore.validateManagedObjectInTxn(tn, {
+            teamId: owner,
+            kind: "external_holder",
+            objectId: holderId,
+            recordPin: runtimeMigrationPin(existing),
+          })
+        : null;
       if (existing) {
         tn.clear(
           existing.g
@@ -100,10 +117,20 @@ export class NuqFdbExternalSlots {
       } else {
         bumpTeamActive(tn, this.ks, owner, 1);
       }
-      tn.set(
-        this.key(owner, holderId),
-        encodeJson({ e: exp, g: generation } satisfies ExternalSlotRecord),
+      const pin = existing
+        ? existingPin
+        : await nuqFdbMigrationStore.reconcileManagedObjectInTxn(tn, {
+            teamId: owner,
+            kind: "external_holder",
+            objectId: holderId,
+            allowMissingRecordPin: true,
+            residue: { capacity_external_holders: 1 },
+          });
+      const record = stampMigrationPin(
+        { e: exp, g: generation } satisfies ExternalSlotRecord,
+        pin,
       );
+      tn.set(this.key(owner, holderId), encodeJson(record));
       tn.set(
         this.expiryKey(
           timeBucket(`${owner}/${holderId}`),
@@ -135,6 +162,14 @@ export class NuqFdbExternalSlots {
       await tn.get(this.key(owner, holderId)),
     );
     if (!existing) return false;
+    await nuqFdbMigrationStore.reconcileManagedObjectInTxn(tn, {
+      teamId: owner,
+      kind: "external_holder",
+      objectId: holderId,
+      recordPin: runtimeMigrationPin(existing),
+      residue: {},
+      terminal: true,
+    });
     tn.clear(this.key(owner, holderId));
     tn.clear(
       existing.g

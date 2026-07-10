@@ -25,7 +25,11 @@ import {
   setGroupJobIndex,
   bumpGroupStatusCount,
   alignQueueMetricStatus,
+  reconcileJobMigrationInTxn,
+  runtimeMigrationPin,
+  stampMigrationPin,
 } from "./ops";
+import { nuqFdbMigrationStore } from "./migration-store";
 
 export type NuQFdbGroupStatus = "active" | "completed" | "cancelled";
 
@@ -38,6 +42,8 @@ export type NuQFdbJobGroupInstance = {
   expiresAt?: Date;
   maxConcurrency?: number;
   delaySeconds?: number;
+  migrationBackend?: "pg" | "fdb";
+  migrationGeneration?: number;
 };
 
 const DEFAULT_GROUP_TTL_MS = 86400000;
@@ -45,6 +51,35 @@ const DEFAULT_GROUP_TTL_MS = 86400000;
 // never reaches normal completion must not live forever. This deadline is
 // independent of the post-completion retention TTL.
 export const ACTIVE_GROUP_MAX_AGE_MS = 7 * 24 * 60 * 60 * 1000;
+
+export function groupSweepTaskId(gid: string): string {
+  return `group-cancel/${gid}`;
+}
+
+export async function prepareGroupSweepTaskInTxn(
+  tn: Transaction,
+  gid: string,
+  group: GroupMeta,
+): Promise<import("./migration-store").MigrationObjectPin | null> {
+  const groupPin = await nuqFdbMigrationStore.validateManagedObjectInTxn(tn, {
+    teamId: group.o,
+    kind: "group",
+    objectId: gid,
+    recordPin: runtimeMigrationPin(group),
+  });
+  if (!groupPin) return null;
+  return await nuqFdbMigrationStore.preparePinnedObjectInTxn(tn, {
+    teamId: group.o,
+    kind: "sweeper_task",
+    objectId: groupSweepTaskId(gid),
+    admission: {
+      type: "pinned-continuation",
+      source: { kind: "group", objectId: gid },
+    },
+    requiredBackend: "fdb",
+    residue: { control_sweeper_tasks: 1 },
+  });
+}
 
 export class NuqFdbGroupOps {
   constructor(
@@ -115,6 +150,20 @@ export class NuqFdbGroupOps {
       tn.clear(this.ks.taskGroupFinish(gid));
       return false;
     }
+    const continuationPin =
+      gMeta.s === "cancelled"
+        ? await nuqFdbMigrationStore.validateManagedObjectInTxn(tn, {
+            teamId: gMeta.o,
+            kind: "sweeper_task",
+            objectId: groupSweepTaskId(gid),
+            recordPin: runtimeMigrationPin(gMeta),
+          })
+        : await nuqFdbMigrationStore.validateManagedObjectInTxn(tn, {
+            teamId: gMeta.o,
+            kind: "group",
+            objectId: gid,
+            recordPin: runtimeMigrationPin(gMeta),
+          });
     const expiresAt = now + gMeta.t;
     const expiryGeneration = randomUUID();
     const updated: GroupMeta = {
@@ -133,22 +182,66 @@ export class NuqFdbGroupOps {
 
     if (this.finishedKs) {
       const fid = randomUUID();
-      const meta: JobMeta = { c: now, p: 0, o: gMeta.o, g: gid, f: 0, dc: 1 };
+      const finishedPin = continuationPin
+        ? await nuqFdbMigrationStore.preparePinnedObjectInTxn(tn, {
+            teamId: gMeta.o,
+            kind: "crawl_finished",
+            objectId: fid,
+            admission: {
+              type: "pinned-continuation",
+              source: {
+                kind: gMeta.s === "cancelled" ? "sweeper_task" : "group",
+                objectId: gMeta.s === "cancelled" ? groupSweepTaskId(gid) : gid,
+              },
+            },
+            requiredBackend: "fdb",
+            residue: { control_crawl_finished: 1 },
+          })
+        : null;
+      const meta: JobMeta = stampMigrationPin(
+        { c: now, p: 0, o: gMeta.o, g: gid, f: 0, dc: 1 },
+        finishedPin,
+      );
       tn.set(this.finishedKs.jobMeta(fid), encodeJson(meta));
       tn.set(this.finishedKs.jobData(fid, 0), encodeJson({}));
-      const entry: QueueEntry = {
-        i: fid,
-        o: gMeta.o,
-        g: gid,
-        p: 0,
-        f: 0,
-        c: now,
-      };
+      const entry: QueueEntry = stampMigrationPin(
+        {
+          i: fid,
+          o: gMeta.o,
+          g: gid,
+          p: 0,
+          f: 0,
+          c: now,
+        },
+        finishedPin,
+      );
       pushReady(tn, this.finishedKs, entry, txc);
+      await reconcileJobMigrationInTxn(tn, this.finishedKs, entry, {
+        control_crawl_finished: 1,
+      });
       setStatusQueued(tn, this.finishedKs, fid);
       await alignQueueMetricStatus(tn, this.finishedKs, fid);
       // pointer for group TTL cleanup to find the finished job's records
       tn.set(this.ks.groupFinishedJob(gid), Buffer.from(fid, "utf8"));
+    }
+    if (gMeta.s === "cancelled") {
+      await nuqFdbMigrationStore.reconcileManagedObjectInTxn(tn, {
+        teamId: gMeta.o,
+        kind: "sweeper_task",
+        objectId: groupSweepTaskId(gid),
+        recordPin: runtimeMigrationPin(gMeta),
+        residue: {},
+        terminal: true,
+      });
+    } else {
+      await nuqFdbMigrationStore.reconcileManagedObjectInTxn(tn, {
+        teamId: gMeta.o,
+        kind: "group",
+        objectId: gid,
+        recordPin: runtimeMigrationPin(gMeta),
+        residue: {},
+        terminal: true,
+      });
     }
     return true;
   }
@@ -174,6 +267,8 @@ export class NuQFdbJobGroup {
       expiresAt: g.x !== undefined ? new Date(g.x) : undefined,
       maxConcurrency: g.m,
       delaySeconds: g.d,
+      migrationBackend: g.mb,
+      migrationGeneration: g.mg,
     };
   }
 
@@ -189,20 +284,38 @@ export class NuQFdbJobGroup {
     return await this.db.doTn(async tn => {
       const existingBuf = await tn.get(this.ks.groupMeta(id));
       const existing = decodeJson<GroupMeta>(existingBuf);
-      if (existing) return this.toInstance(id, existing);
+      if (existing) {
+        await nuqFdbMigrationStore.validateManagedObjectInTxn(tn, {
+          teamId: owner,
+          kind: "group",
+          objectId: id,
+          recordPin: runtimeMigrationPin(existing),
+        });
+        return this.toInstance(id, existing);
+      }
       const now = Date.now();
       const abandonmentDeadline = now + ACTIVE_GROUP_MAX_AGE_MS;
       const expiryGeneration = randomUUID();
-      const g: GroupMeta = {
-        o: owner,
-        c: now,
-        t: ttl ?? DEFAULT_GROUP_TTL_MS,
-        s: "active",
-        m: opts?.maxConcurrency,
-        d: opts?.delaySeconds,
-        a: abandonmentDeadline,
-        eg: expiryGeneration,
-      };
+      const pin = await nuqFdbMigrationStore.reconcileManagedObjectInTxn(tn, {
+        teamId: owner,
+        kind: "group",
+        objectId: id,
+        allowMissingRecordPin: true,
+        residue: { control_groups: 1 },
+      });
+      const g: GroupMeta = stampMigrationPin(
+        {
+          o: owner,
+          c: now,
+          t: ttl ?? DEFAULT_GROUP_TTL_MS,
+          s: "active",
+          m: opts?.maxConcurrency,
+          d: opts?.delaySeconds,
+          a: abandonmentDeadline,
+          eg: expiryGeneration,
+        },
+        pin,
+      );
       tn.set(this.ks.groupMeta(id), encodeJson(g));
       tn.set(
         this.ks.groupExpiry(abandonmentDeadline, id, expiryGeneration),
@@ -253,6 +366,15 @@ export class NuQFdbJobGroup {
     return await this.db.doTn(async tn => {
       const g = decodeJson<GroupMeta>(await tn.get(this.ks.groupMeta(id)));
       if (!g || g.s !== "active") return false;
+      await prepareGroupSweepTaskInTxn(tn, id, g);
+      await nuqFdbMigrationStore.reconcileManagedObjectInTxn(tn, {
+        teamId: g.o,
+        kind: "group",
+        objectId: id,
+        recordPin: runtimeMigrationPin(g),
+        residue: {},
+        terminal: true,
+      });
       tn.set(
         this.ks.groupMeta(id),
         encodeJson({ ...g, s: "cancelled" } satisfies GroupMeta),

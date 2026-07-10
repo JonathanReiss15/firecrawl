@@ -115,6 +115,23 @@ export type CompletePinnedObjectInput = {
   fromLifecycle: "prepared" | "active";
 };
 
+export type MigrationRecordPin = {
+  backend: MigrationBackend;
+  generation: number;
+};
+
+export type ReconcileManagedObjectInput = {
+  teamId: string;
+  kind: MigrationObjectKind;
+  objectId: string;
+  /** Pin copied onto the runtime record. It may be omitted only while creating
+   * that record; existing managed records must always carry it. */
+  recordPin?: MigrationRecordPin;
+  allowMissingRecordPin?: boolean;
+  residue: Partial<MigrationResidue>;
+  terminal?: boolean;
+};
+
 export type MigrationSteadyResolution =
   | { status: "legacy-uninitialized" }
   | { status: "steady"; state: MigrationTeamState }
@@ -903,6 +920,134 @@ export class NuqFdbMigrationStore {
       );
     }
     return pin;
+  }
+
+  /**
+   * Composes migration accounting with a queue/group/slot mutation. Teams that
+   * have never entered the migration control plane remain untouched. Once a
+   * team state exists, the durable object pin and the pin copied onto an
+   * existing runtime record are mandatory. Reading the generation and residue
+   * keys here gives finalSeal a conflict with every residue increase.
+   */
+  public async reconcileManagedObjectInTxn(
+    tn: Transaction,
+    input: ReconcileManagedObjectInput,
+  ): Promise<MigrationObjectPin | null> {
+    const { teamId, kind, objectId } = input;
+    assertNonempty(teamId, "teamId");
+    assertNonempty(objectId, "objectId");
+    const state = await this.readState(tn, teamId);
+    if (!state) {
+      if (input.recordPin) {
+        throw new MigrationCorruptionError(
+          `object ${kind}/${objectId}`,
+          "runtime generation pin exists without team migration state",
+        );
+      }
+      return null;
+    }
+    await this.validateTopology(tn, state);
+    if (!input.recordPin && !input.allowMissingRecordPin) {
+      throw new MigrationStoreError(
+        "NUQ_MIGRATION_RUNTIME_PIN_MISSING",
+        `${kind}/${objectId} is missing its runtime generation pin`,
+      );
+    }
+    const pin = await this.inspectPinInTxn(tn, kind, objectId);
+    if (!pin) {
+      throw new MigrationStoreError(
+        "NUQ_MIGRATION_PIN_NOT_FOUND",
+        `${kind}/${objectId} has no durable pin`,
+      );
+    }
+    if (
+      pin.teamId !== teamId ||
+      pin.backend !== "fdb" ||
+      (input.recordPin !== undefined &&
+        (input.recordPin.backend !== pin.backend ||
+          input.recordPin.generation !== pin.generation))
+    ) {
+      throw new MigrationCorruptionError(
+        `object ${kind}/${objectId}`,
+        "runtime and durable pin mismatch",
+      );
+    }
+    const generation = await this.requireGeneration(tn, teamId, pin.generation);
+    if (
+      generation.backend !== pin.backend ||
+      (generation.status !== "open" && generation.status !== "draining")
+    ) {
+      throw new MigrationStaleGenerationError(
+        teamId,
+        pin.backend,
+        pin.generation,
+      );
+    }
+    const rawIndex = await tn.get(this.teamObjectKey(teamId, kind, objectId));
+    if (!rawIndex) {
+      throw new MigrationCorruptionError(
+        `object ${kind}/${objectId}`,
+        "missing team pin index",
+      );
+    }
+    const indexed = validatePin(
+      parseJson(rawIndex, `object ${kind}/${objectId} team index`),
+      `object ${kind}/${objectId} team index`,
+    );
+    if (JSON.stringify(indexed) !== JSON.stringify(pin)) {
+      throw new MigrationCorruptionError(
+        `object ${kind}/${objectId}`,
+        "team pin index mismatch",
+      );
+    }
+
+    const residue = normalizeResidue(input.residue);
+    const terminal = input.terminal === true;
+    if (pin.lifecycle === "terminal") {
+      if (!terminal || Object.values(residue).some(value => value !== 0)) {
+        throw new MigrationStoreError(
+          "NUQ_MIGRATION_LIFECYCLE_MISMATCH",
+          `${kind}/${objectId} tombstone cannot be reopened`,
+        );
+      }
+      return pin;
+    }
+    if (!terminal && residueEqual(pin.residue, residue)) return pin;
+    await this.applyResidueDelta(
+      tn,
+      teamId,
+      pin.generation,
+      pin.residue,
+      residue,
+    );
+    const revision = pin.revision + 1;
+    if (!Number.isSafeInteger(revision)) {
+      throw new MigrationCorruptionError(
+        `object ${kind}/${objectId}`,
+        "pin revision exhausted",
+      );
+    }
+    const next: MigrationObjectPin = {
+      ...pin,
+      lifecycle: terminal ? "terminal" : pin.lifecycle,
+      revision,
+      residue,
+    };
+    const encoded = encodeJson(next);
+    tn.set(this.objectKey(kind, objectId), encoded);
+    tn.set(this.teamObjectKey(teamId, kind, objectId), encoded);
+    return next;
+  }
+
+  public async validateManagedObjectInTxn(
+    tn: Transaction,
+    input: Omit<ReconcileManagedObjectInput, "residue" | "terminal">,
+  ): Promise<MigrationObjectPin | null> {
+    const pin = await this.inspectPinInTxn(tn, input.kind, input.objectId);
+    return await this.reconcileManagedObjectInTxn(tn, {
+      ...input,
+      residue: pin?.residue ?? {},
+    });
   }
 
   public async resolveSteady(

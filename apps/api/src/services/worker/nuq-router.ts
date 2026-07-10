@@ -571,13 +571,20 @@ async function completeRoutingPin(
   operation: string,
 ): Promise<void> {
   if (!pin || pin.lifecycle === "terminal") return;
-  const fromLifecycle = pin.lifecycle;
+  // FDB runtime mutations terminalize their pin in the same transaction. The
+  // router may hold the pre-mutation snapshot, so re-read before applying the
+  // cross-store completion used by PG paths.
+  const current = await optionalFdbRead(() =>
+    nuqFdbMigrationStore.inspectPin(pin.kind, pin.objectId),
+  );
+  if (!current || current.lifecycle === "terminal") return;
+  const fromLifecycle = current.lifecycle;
   await fdbMutation(() =>
     nuqFdbMigrationStore.completePinnedObject({
-      teamId: pin.teamId,
-      kind: pin.kind,
-      objectId: pin.objectId,
-      operationId: `nuq-router/v1/${operation}/${pin.objectId}`,
+      teamId: current.teamId,
+      kind: current.kind,
+      objectId: current.objectId,
+      operationId: `nuq-router/v1/${operation}/${current.objectId}`,
       fromLifecycle,
     }),
   );

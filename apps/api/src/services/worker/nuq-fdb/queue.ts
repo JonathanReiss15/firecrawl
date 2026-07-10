@@ -65,7 +65,16 @@ import {
   bumpKeyActive,
   scheduleRaiseTask,
   GroupJobIndexValue,
+  reconcileJobMigrationInTxn,
+  validateJobMigrationInTxn,
+  stampMigrationPin,
 } from "./ops";
+import { MigrationStoreError, nuqFdbMigrationStore } from "./migration-store";
+import type {
+  MigrationBackend,
+  MigrationObjectKind,
+  MigrationResidue,
+} from "./migration-store";
 import { NuqFdbGroupOps } from "./groups";
 
 // FDB's stable transaction option code for TIMEOUT. Keep this local so merely
@@ -123,6 +132,8 @@ export type NuQFdbJob<Data = any, ReturnValue = any> = {
   leaseExpiresAt?: Date;
   ownerId?: string;
   groupId?: string;
+  migrationBackend?: MigrationBackend;
+  migrationGeneration?: number;
 };
 
 export type NuQFdbJobOptions = {
@@ -226,6 +237,7 @@ export class NuQFdbQueue<JobData = any, JobReturnValue = any> {
       // lease duration override, used by tests
       leaseMs?: number;
       // Deterministic fault/race injection for the FDB integration tests.
+      migrationObjectKind?: MigrationObjectKind;
       testHooks?: {
         afterManifest?: () => Promise<void>;
         afterStageBatch?: (batch: number) => Promise<void>;
@@ -235,12 +247,15 @@ export class NuQFdbQueue<JobData = any, JobReturnValue = any> {
       };
     },
   ) {
-    this.ks = new NuqFdbKeyspace(queueName);
+    this.ks = new NuqFdbKeyspace(
+      queueName,
+      options.migrationObjectKind ?? "scrape_job",
+    );
     this.groupOps = options.hasGroups
       ? new NuqFdbGroupOps(
           this.ks,
           options.finishedQueueName
-            ? new NuqFdbKeyspace(options.finishedQueueName)
+            ? new NuqFdbKeyspace(options.finishedQueueName, "crawl_finished")
             : null,
         )
       : null;
@@ -631,6 +646,14 @@ export class NuQFdbQueue<JobData = any, JobReturnValue = any> {
         }
       }
       if (fresh.length === 0) return;
+      for (const { job, plan } of fresh) {
+        await nuqFdbMigrationStore.validateManagedObjectInTxn(tn, {
+          teamId: plan.o,
+          kind: ks.migrationObjectKind,
+          objectId: job.id,
+          allowMissingRecordPin: true,
+        });
+      }
 
       const gated = fresh.filter(
         ({ plan }) => opMeta.l !== null && !plan.b,
@@ -816,7 +839,7 @@ export class NuQFdbQueue<JobData = any, JobReturnValue = any> {
         if (groupAccounted) flags |= F_GACC;
 
         const timesOutAt = gated ? j.options.timesOutAt?.getTime() : undefined;
-        const entry: QueueEntry = {
+        let entry: QueueEntry = {
           i: j.id,
           o: ownerId ?? "",
           g: gid,
@@ -826,28 +849,38 @@ export class NuQFdbQueue<JobData = any, JobReturnValue = any> {
           c: now,
           to: timesOutAt,
         };
+        const migrationPin = await validateJobMigrationInTxn(tn, ks, entry, {
+          allowMissingRecordPin: true,
+        });
+        entry = stampMigrationPin(entry, migrationPin);
 
-        const meta: JobMeta = {
-          c: now,
-          p: entry.p,
-          o: entry.o,
-          g: gid,
-          k: entry.k,
-          f: flags,
-          to: timesOutAt,
-          dc: j.dataChunks.length,
-        };
+        const meta: JobMeta = stampMigrationPin(
+          {
+            c: now,
+            p: entry.p,
+            o: entry.o,
+            g: gid,
+            k: entry.k,
+            f: flags,
+            to: timesOutAt,
+            dc: j.dataChunks.length,
+          },
+          migrationPin,
+        );
         tn.set(ks.jobMeta(j.id), encodeJson(meta));
 
         let placedStatus: NuqFdbJobStatus;
+        let migrationResidue: Partial<MigrationResidue>;
         if (!gated) {
           pushReady(tn, ks, entry, txc);
           setStatusQueued(tn, ks, j.id);
           placedStatus = "queued";
+          migrationResidue = { capacity_ready_active: 1 };
         } else if (crawlGated && crawlFree.get(gid!)! <= 0) {
           const loc = appendCrawlPending(tn, ks, entry);
           setStatusPending(tn, ks, j.id, loc);
           placedStatus = "pending";
+          migrationResidue = { capacity_crawl_pending: 1 };
         } else if (keyGated && keyFree <= 0) {
           // holds the crawl slot (if any) while waiting in the key gate
           if (crawlGated) {
@@ -857,6 +890,7 @@ export class NuQFdbQueue<JobData = any, JobReturnValue = any> {
           const loc = appendKeyPending(tn, ks, entry);
           setStatusPending(tn, ks, j.id, loc);
           placedStatus = "pending";
+          migrationResidue = { capacity_key_pending: 1 };
         } else {
           if (crawlGated) {
             crawlFree.set(gid!, crawlFree.get(gid!)! - 1);
@@ -872,13 +906,16 @@ export class NuQFdbQueue<JobData = any, JobReturnValue = any> {
             pushReady(tn, ks, entry, txc);
             setStatusQueued(tn, ks, j.id);
             placedStatus = "queued";
+            migrationResidue = { capacity_ready_active: 1 };
           } else {
             const loc = appendTeamPending(tn, ks, entry);
             setStatusPending(tn, ks, j.id, loc);
             placedStatus = "pending";
+            migrationResidue = { capacity_team_pending: 1 };
           }
         }
 
+        await reconcileJobMigrationInTxn(tn, ks, entry, migrationResidue);
         await alignQueueMetricStatus(tn, ks, j.id);
         if (groupAccounted && gid) {
           tn.add(ks.groupRemaining(gid), ONE);
@@ -936,6 +973,14 @@ export class NuQFdbQueue<JobData = any, JobReturnValue = any> {
             await tn.get(ks.jobStatus(id)),
           );
           if (status?.s === "ingesting" && status.op === op) {
+            await nuqFdbMigrationStore.reconcileManagedObjectInTxn(tn, {
+              teamId: opMeta.o,
+              kind: ks.migrationObjectKind,
+              objectId: id,
+              allowMissingRecordPin: true,
+              residue: {},
+              terminal: true,
+            });
             deleteJobRecords(tn, ks, id);
             await alignQueueMetricStatus(tn, ks, id);
           }
@@ -1182,6 +1227,8 @@ export class NuQFdbQueue<JobData = any, JobReturnValue = any> {
         return "dropped";
       }
 
+      await validateJobMigrationInTxn(tn, ks, e);
+
       if (e.g && this.options.hasGroups) {
         const gMeta = decodeJson<GroupMeta>(await tn.get(ks.groupMeta(e.g)));
         if (gMeta && gMeta.s === "cancelled") {
@@ -1198,6 +1245,7 @@ export class NuQFdbQueue<JobData = any, JobReturnValue = any> {
               tn.set(ks.taskGroupFinish(e.g), EMPTY);
             }
           }
+          await reconcileJobMigrationInTxn(tn, ks, e, {}, { terminal: true });
           deleteJobRecords(tn, ks, e.i);
           await alignQueueMetricStatus(tn, ks, e.i);
           await releaseSlotsAndPromote(
@@ -1255,6 +1303,8 @@ export class NuQFdbQueue<JobData = any, JobReturnValue = any> {
         leaseExpiresAt: new Date(exp),
         ownerId: meta.o || undefined,
         groupId: meta.g,
+        migrationBackend: meta.mb,
+        migrationGeneration: meta.mg,
       };
     };
     let result = await this.db.doTn(claimTransaction);
@@ -1336,6 +1386,8 @@ export class NuQFdbQueue<JobData = any, JobReturnValue = any> {
       leaseExpiresAt: new Date(claim.e),
       ownerId: meta.o || undefined,
       groupId: meta.g,
+      migrationBackend: meta.mb,
+      migrationGeneration: meta.mg,
     };
   }
 
@@ -1357,6 +1409,20 @@ export class NuQFdbQueue<JobData = any, JobReturnValue = any> {
       // reap. The status' lock/expiry, not worker-local memory, is authoritative.
       const st = decodeJson<JobStatusRecord>(await tn.get(ks.jobStatus(id)));
       if (!st || st.s !== "active" || st.l !== lock) return false;
+      const meta = decodeJson<JobMeta>(await tn.get(ks.jobMeta(id)));
+      if (!meta) return false;
+      await validateJobMigrationInTxn(tn, ks, {
+        i: id,
+        o: meta.o,
+        g: meta.g,
+        k: meta.k,
+        p: meta.p,
+        f: meta.f,
+        c: meta.c,
+        to: meta.to,
+        mb: meta.mb,
+        mg: meta.mg,
+      });
       if (st.e !== undefined) {
         tn.clear(ks.lease(timeBucket(id), st.e, id));
       }
@@ -1494,7 +1560,10 @@ export class NuQFdbQueue<JobData = any, JobReturnValue = any> {
         f: meta.f,
         c: meta.c,
         to: meta.to,
+        mb: meta.mb,
+        mg: meta.mg,
       };
+      await reconcileJobMigrationInTxn(tn, ks, entry, {}, { terminal: true });
       await releaseSlotsAndPromote(
         tn,
         ks,
@@ -1576,6 +1645,8 @@ export class NuQFdbQueue<JobData = any, JobReturnValue = any> {
       lock: st.s === "active" ? st.l : undefined,
       ownerId: meta.o || undefined,
       groupId: meta.g,
+      migrationBackend: meta.mb,
+      migrationGeneration: meta.mg,
     };
   }
 
@@ -1665,9 +1736,13 @@ export class NuQFdbQueue<JobData = any, JobReturnValue = any> {
         f: meta.f,
         c: meta.c,
         to: meta.to,
+        mb: meta.mb,
+        mg: meta.mg,
       };
       const countable = !!(meta.f & F_COUNTABLE);
       const accounted = !!(meta.f & F_GACC) && !!meta.g && !!this.groupOps;
+
+      await reconcileJobMigrationInTxn(tn, ks, entry, {}, { terminal: true });
 
       if (st.s === "pending") {
         clearPendingPlacement(
@@ -1932,43 +2007,67 @@ export class NuQFdbQueue<JobData = any, JobReturnValue = any> {
 
   // === Introspection used by status/admin endpoints
 
-  // Recovery-only probe for ungated queues (notably crawl_finished). The
-  // migration integration replaces this legacy scan with owner-generation
-  // indexes before enabling cutover.
+  // Maintained transactionally with every live/terminal job transition. A
+  // bounded, durable backfill makes the index rollout-safe for jobs written by
+  // older binaries; callers retry rather than falsely declaring PG authority
+  // while that backfill is incomplete.
   public async hasReadyOrActiveJobForOwner(ownerId: string): Promise<boolean> {
     const owner = normalizeOwnerId(ownerId);
     if (owner === null) return false;
-    return await this.db.doTn(async tn => {
-      const snapshot = tn.snapshot();
-      const ready = await Promise.all(
-        Array.from({ length: READY_SHARDS }, (_, shard) => {
-          const range = this.ks.readyShardRange(shard);
-          return snapshot.getRangeAll(range.begin, range.end);
-        }),
-      );
-      if (
-        ready.some(rows =>
-          rows.some(
-            ([, value]) => decodeJson<QueueEntry>(value as Buffer)?.o === owner,
-          ),
-        )
-      ) {
-        return true;
-      }
-      const leaseRange = this.ks.leaseRange();
-      const leases = await snapshot.getRangeAll(
-        leaseRange.begin,
-        leaseRange.end,
-      );
-      for (const [key] of leases) {
-        const id = this.ks.unpackId(key as Buffer);
-        const meta = decodeJson<JobMeta>(
-          await snapshot.get(this.ks.jobMeta(id)),
+    const batchSize = 500;
+    const maxBatchesPerCall = 10;
+    for (let batch = 0; batch < maxBatchesPerCall; batch++) {
+      const result = await this.db.doTn(async tn => {
+        const ownerRange = this.ks.ownerLiveJobRange(owner);
+        const indexed = await tn
+          .snapshot()
+          .getRangeAll(ownerRange.begin, ownerRange.end, { limit: 1 });
+        if (indexed.length > 0) return { found: true, ready: true };
+        const jobs = this.ks.jobRootRange();
+        const cursor = await tn.get(this.ks.ownerLiveBackfillCursor());
+        const begin: Buffer | FdbKeySelector = cursor
+          ? { key: cursor, orEqual: true, offset: 1, _isKeySelector: true }
+          : jobs.begin;
+        const rows = await tn
+          .snapshot()
+          .getRangeAll(begin as any, jobs.end, { limit: batchSize });
+        let found = false;
+        for (const [rawKey, rawValue] of rows) {
+          const parts = this.ks.unpack(rawKey as Buffer);
+          if (parts[4] !== "m") continue;
+          const id = String(parts[3]);
+          const meta = decodeJson<JobMeta>(rawValue as Buffer);
+          if (!meta) continue;
+          // Normal status read conflicts with terminalization while this page
+          // publishes its index rows.
+          const status = decodeJson<JobStatusRecord>(
+            await tn.get(this.ks.jobStatus(id)),
+          );
+          if (status?.s !== "queued" && status?.s !== "active") continue;
+          tn.set(this.ks.ownerLiveJob(meta.o, id), EMPTY);
+          if (meta.o === owner) found = true;
+        }
+        if (rows.length < batchSize) {
+          // Do not persist a permanent "complete" marker: during a rolling
+          // deployment an older writer can still publish an unindexed job.
+          // A later negative lookup safely repeats this bounded scan.
+          tn.clear(this.ks.ownerLiveBackfillCursor());
+          return { found, ready: true };
+        }
+        tn.set(
+          this.ks.ownerLiveBackfillCursor(),
+          rows[rows.length - 1][0] as Buffer,
         );
-        if (meta?.o === owner) return true;
-      }
-      return false;
-    });
+        return { found, ready: false };
+      });
+      if (result.found) return true;
+      if (result.ready) return false;
+    }
+    throw new MigrationStoreError(
+      "NUQ_FDB_OWNER_INDEX_INITIALIZING",
+      `owner live-job index for ${this.queueName} is still backfilling`,
+      true,
+    );
   }
 
   public async getTeamActiveCount(teamId: string): Promise<number> {

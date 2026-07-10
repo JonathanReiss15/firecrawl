@@ -47,8 +47,12 @@ import {
   setGroupJobIndex,
   GroupJobIndexValue,
   alignQueueMetricStatus,
+  reconcileJobMigrationInTxn,
+  validateJobMigrationInTxn,
+  runtimeMigrationPin,
 } from "./ops";
-import { ACTIVE_GROUP_MAX_AGE_MS } from "./groups";
+import { nuqFdbMigrationStore } from "./migration-store";
+import { ACTIVE_GROUP_MAX_AGE_MS, prepareGroupSweepTaskInTxn } from "./groups";
 import { NuQFdbQueue } from "./queue";
 import { ExternalSlotSweepGuard, NuqFdbExternalSlots } from "./slots";
 
@@ -153,6 +157,8 @@ function entryFromMeta(id: string, meta: JobMeta): QueueEntry {
     f: meta.f,
     c: meta.c,
     to: meta.to,
+    mb: meta.mb,
+    mg: meta.mg,
   };
 }
 
@@ -1004,6 +1010,7 @@ export class NuqFdbSweeper {
           if (!meta) return;
           const entry = entryFromMeta(id, meta);
           if (st.st < MAX_STALLS) {
+            await validateJobMigrationInTxn(tn, ks, entry);
             pushReady(tn, ks, entry, txc);
             setStatusQueued(tn, ks, id, st.st + 1);
             await alignQueueMetricStatus(tn, ks, id);
@@ -1012,6 +1019,15 @@ export class NuqFdbSweeper {
               bumpGroupStatusCount(tn, ks, meta.g, "queued", 1);
             }
           } else {
+            await reconcileJobMigrationInTxn(
+              tn,
+              ks,
+              entry,
+              {},
+              {
+                terminal: true,
+              },
+            );
             tn.set(
               ks.jobStatus(id),
               encodeJson({
@@ -1099,6 +1115,16 @@ export class NuqFdbSweeper {
           if (!st || st.s !== "pending" || !st.loc) return;
           const meta = decodeJson<JobMeta>(await tn.get(ks.jobMeta(id)));
           if (!meta) return;
+          const entry = entryFromMeta(id, meta);
+          await reconcileJobMigrationInTxn(
+            tn,
+            ks,
+            entry,
+            {},
+            {
+              terminal: true,
+            },
+          );
           clearPendingPlacement(
             tn,
             ks,
@@ -1113,7 +1139,7 @@ export class NuqFdbSweeper {
             await releaseSlotsAndPromote(
               tn,
               ks,
-              entryFromMeta(id, meta),
+              entry,
               { team: false, key: st.loc.k === "tq", crawl: true },
               now,
               txc,
@@ -1246,6 +1272,14 @@ export class NuqFdbSweeper {
               await tn.get(ks.jobStatus(id)),
             );
             if (status?.s === "ingesting" && status.op === op) {
+              await nuqFdbMigrationStore.reconcileManagedObjectInTxn(tn, {
+                teamId: meta.o,
+                kind: ks.migrationObjectKind,
+                objectId: id,
+                allowMissingRecordPin: true,
+                residue: {},
+                terminal: true,
+              });
               deleteJobRecords(tn, ks, id);
               await alignQueueMetricStatus(tn, ks, id);
             }
@@ -1421,6 +1455,16 @@ export class NuqFdbSweeper {
             continue;
           }
           if (st.s === "pending" && st.loc) {
+            const entry = entryFromMeta(id, meta);
+            await reconcileJobMigrationInTxn(
+              tn,
+              ks,
+              entry,
+              {},
+              {
+                terminal: true,
+              },
+            );
             clearPendingPlacement(
               tn,
               ks,
@@ -1447,6 +1491,16 @@ export class NuqFdbSweeper {
             await alignQueueMetricStatus(tn, ks, id);
             cleaned++;
           } else if (g.z && (st.s === "queued" || st.s === "active")) {
+            const entry = entryFromMeta(id, meta);
+            await reconcileJobMigrationInTxn(
+              tn,
+              ks,
+              entry,
+              {},
+              {
+                terminal: true,
+              },
+            );
             tn.set(
               ks.jobStatus(id),
               encodeJson({
@@ -1461,7 +1515,7 @@ export class NuqFdbSweeper {
             await releaseSlotsAndPromote(
               tn,
               ks,
-              entryFromMeta(id, meta),
+              entry,
               { team: true, key: true, crawl: true },
               now,
               newTxContext(),
@@ -1701,6 +1755,15 @@ export class NuqFdbSweeper {
         return "done";
       }
       if (g.s === "active") {
+        await prepareGroupSweepTaskInTxn(tn, gid, g);
+        await nuqFdbMigrationStore.reconcileManagedObjectInTxn(tn, {
+          teamId: g.o,
+          kind: "group",
+          objectId: gid,
+          recordPin: runtimeMigrationPin(g),
+          residue: {},
+          terminal: true,
+        });
         const nextAt = now + ABANDONED_GROUP_DRAIN_GRACE_MS;
         const nextGeneration = randomUUID();
         tn.set(

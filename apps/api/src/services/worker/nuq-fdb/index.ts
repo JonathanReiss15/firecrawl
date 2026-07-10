@@ -48,6 +48,7 @@ export type {
   MigrationObjectKind,
   MigrationObjectLifecycle,
   MigrationObjectPin,
+  MigrationRecordPin,
   MigrationPhase,
   MigrationPinAdmission,
   MigrationResidue,
@@ -55,6 +56,7 @@ export type {
   MigrationSteadyResolution,
   MigrationTeamState,
   PreparePinnedObjectInput,
+  ReconcileManagedObjectInput,
   TransitionObjectResidueInput,
 } from "./migration-store";
 
@@ -67,6 +69,7 @@ export const crawlFinishedQueueFdb = new NuQFdbQueue<any, any>(
   "crawl_finished",
   {
     hasGroups: false,
+    migrationObjectKind: "crawl_finished",
   },
 );
 
