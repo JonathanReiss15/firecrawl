@@ -4,6 +4,8 @@ const redisMocks = vi.hoisted(() => ({
   eval: vi.fn(),
   zrangebyscore: vi.fn(),
   zrem: vi.fn(),
+  zcard: vi.fn(),
+  zcount: vi.fn(),
 }));
 const evalMock = redisMocks.eval;
 
@@ -15,6 +17,7 @@ import {
   CONCURRENCY_ROLLBACK_MARKER_TTL_MS,
   finalizeConcurrencyLimitActiveJobRollback,
   getConcurrencyLimitActiveJobsCount,
+  getConcurrencyRollbackCleanupBacklog,
   pushConcurrencyLimitActiveJob,
   recoverConcurrencyLimitRollbacks,
   renewConcurrencyLimitActiveJob,
@@ -176,6 +179,7 @@ describe("PG concurrency slot reservation", () => {
       read: 1,
       finalized: 1,
       fenced: 0,
+      hasMore: false,
     });
     expect(redisMocks.zrangebyscore).toHaveBeenCalledWith(
       "concurrency-rollback-cleanup:v1",
@@ -215,10 +219,36 @@ describe("PG concurrency slot reservation", () => {
       read: 2,
       finalized: 0,
       fenced: 2,
+      hasMore: true,
     });
     const script = evalMock.mock.calls[0][0] as string;
     expect(script).toContain("marker == 'cleanup:'");
     expect(script).not.toContain("ZREM', KEYS[1]");
+  });
+
+  test("reports exact bounded cleanup backlog and oldest overdue age", async () => {
+    evalMock.mockResolvedValue([7, 3, "900"]);
+
+    await expect(getConcurrencyRollbackCleanupBacklog(1_000)).resolves.toEqual({
+      total: 7,
+      due: 3,
+      oldestDueAt: 900,
+      oldestOverdueMs: 100,
+    });
+    expect(evalMock).toHaveBeenCalledWith(
+      expect.stringMatching(/ZCARD[\s\S]*ZCOUNT[\s\S]*ZRANGEBYSCORE/),
+      1,
+      "concurrency-rollback-cleanup:v1",
+      1_000,
+    );
+    expect(evalMock.mock.calls[0][0]).toContain("'LIMIT', 0, 1");
+  });
+
+  test("fails closed on corrupt cleanup accounting", async () => {
+    evalMock.mockResolvedValue([1, 2, ""]);
+    await expect(getConcurrencyRollbackCleanupBacklog(1_000)).rejects.toThrow(
+      "Corrupt Redis rollback cleanup accounting",
+    );
   });
 
   test("uses Redis time for legacy reads, writes, and renewals", async () => {

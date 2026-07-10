@@ -264,9 +264,74 @@ return marker == 'cleanup:' .. ARGV[1] and 1 or 0
 
 /** Drains one bounded due page. It never scans Redis keyspace and exact-token
  * fencing prevents a delayed cleanup from deleting a replacement holder. */
+export type ConcurrencyRollbackCleanupBacklog = {
+  total: number;
+  due: number;
+  oldestDueAt: number | null;
+  oldestOverdueMs: number;
+};
+
+const observeConcurrencyRollbackBacklogScript = `
+local total = redis.call('ZCARD', KEYS[1])
+local due = redis.call('ZCOUNT', KEYS[1], '-inf', ARGV[1])
+local oldest = redis.call('ZRANGEBYSCORE', KEYS[1], '-inf', ARGV[1], 'WITHSCORES', 'LIMIT', 0, 1)
+return {total, due, oldest[2] or ''}
+`;
+
+/** Exact bounded queue observability. One atomic script uses native ZCARD and
+ * ZCOUNT plus one limit-1 ordered read; it never scans the Redis keyspace. */
+export async function getConcurrencyRollbackCleanupBacklog(
+  now = Date.now(),
+): Promise<ConcurrencyRollbackCleanupBacklog> {
+  if (!Number.isSafeInteger(now) || now < 0) {
+    throw new TypeError("rollback observation time must be nonnegative");
+  }
+  const result = (await getRedisConnection().eval(
+    observeConcurrencyRollbackBacklogScript,
+    1,
+    CONCURRENCY_ROLLBACK_QUEUE,
+    now,
+  )) as [number, number, string];
+  if (!Array.isArray(result) || result.length !== 3) {
+    throw new Error("Corrupt Redis rollback cleanup accounting");
+  }
+  const [total, due, oldestScore] = result;
+  if (
+    !Number.isSafeInteger(total) ||
+    total < 0 ||
+    !Number.isSafeInteger(due) ||
+    due < 0 ||
+    due > total ||
+    typeof oldestScore !== "string"
+  ) {
+    throw new Error("Corrupt Redis rollback cleanup accounting");
+  }
+  const oldestDueAt = oldestScore === "" ? null : Number(oldestScore);
+  if (
+    (due === 0) !== (oldestDueAt === null) ||
+    (oldestDueAt !== null &&
+      (!Number.isSafeInteger(oldestDueAt) ||
+        oldestDueAt < 0 ||
+        oldestDueAt > now))
+  ) {
+    throw new Error("Corrupt Redis rollback cleanup oldest score");
+  }
+  return {
+    total,
+    due,
+    oldestDueAt,
+    oldestOverdueMs: oldestDueAt === null ? 0 : Math.max(0, now - oldestDueAt),
+  };
+}
+
 export async function recoverConcurrencyLimitRollbacks(
   limit = CONCURRENCY_ROLLBACK_BATCH,
-): Promise<{ read: number; finalized: number; fenced: number }> {
+): Promise<{
+  read: number;
+  finalized: number;
+  fenced: number;
+  hasMore: boolean;
+}> {
   if (!Number.isSafeInteger(limit) || limit < 1 || limit > 1000) {
     throw new TypeError("rollback recovery limit must be between 1 and 1000");
   }
@@ -318,7 +383,12 @@ export async function recoverConcurrencyLimitRollbacks(
     if (removed === 1) finalized++;
     else fenced++;
   }
-  return { read: members.length, finalized, fenced };
+  return {
+    read: members.length,
+    finalized,
+    fenced,
+    hasMore: members.length === limit,
+  };
 }
 
 const renewConcurrencySlotScript = `

@@ -11,6 +11,7 @@ import { config } from "../../config";
 import {
   finalizeConcurrencyLimitActiveJobRollback,
   getConcurrencyLimitActiveJobsCount,
+  getConcurrencyRollbackCleanupBacklog,
   recoverConcurrencyLimitRollbacks,
   removeConcurrencyLimitActiveJob,
   reserveConcurrencyLimitActiveJob,
@@ -32,7 +33,10 @@ import {
   pgJobRemovalsFdb,
   scrapeQueueFdb,
 } from "../../services/worker/nuq-fdb";
-import { TIME_BUCKETS } from "../../services/worker/nuq-fdb/keyspace";
+import {
+  encodeI64,
+  TIME_BUCKETS,
+} from "../../services/worker/nuq-fdb/keyspace";
 import {
   getFdb,
   getNuqFdbDatabase,
@@ -107,10 +111,39 @@ async function clearMigrationTeam(teamId: string): Promise<void> {
     const gcRows = await tn
       .snapshot()
       .getRangeAll(gc.begin as Buffer, gc.end as Buffer);
+    const dueCounts = fdb.tuple.range(["nuq-migration", 1, "gc", "due-count"]);
+    tn.clearRange(dueCounts.begin as Buffer, dueCounts.end as Buffer);
     for (const [key] of gcRows) {
-      const parts = fdb.tuple.unpack(key as Buffer).map(String);
+      const unpacked = fdb.tuple.unpack(key as Buffer);
+      const parts = unpacked.map(String);
       if (parts.includes(teamId) || parts.some(part => objectIds.has(part))) {
         tn.clear(key as Buffer);
+        continue;
+      }
+      const category = String(unpacked[3]);
+      const partition = Number(unpacked[4]);
+      const dueAt = Number(unpacked[5]);
+      if (
+        (category === "pin" ||
+          category === "control" ||
+          category === "generation") &&
+        Number.isSafeInteger(partition) &&
+        Number.isSafeInteger(dueAt)
+      ) {
+        let node = BigInt(dueAt) + 1n;
+        while (node <= 1n << 53n) {
+          tn.add(
+            nuqFdbMigrationStore.pack([
+              "gc",
+              "due-count",
+              category,
+              partition,
+              node.toString(),
+            ]),
+            encodeI64(1),
+          );
+          node += node & -node;
+        }
       }
     }
     const team = fdb.tuple.range(["nuq-migration", 1, "team", teamId]);
@@ -581,6 +614,46 @@ describeIf("NuQ PG publication with durable FDB authority", () => {
       lifecycle: "prepared",
       residue: { intent_unresolved: 1 },
     });
+  });
+
+  test("sustained Redis rollback cleanup drains multiple bounded pages", async () => {
+    const redis = getRedisConnection();
+    const queue = "concurrency-rollback-cleanup:v1";
+    await redis.del(queue);
+    const now = Date.now();
+    const entries = Array.from({ length: 250 }, (_, index) => {
+      const teamId = `${externalTeamId}-cleanup-${index}`;
+      const id = `holder-${index}`;
+      const token = `token-${index}`;
+      return {
+        member: JSON.stringify({ v: 1, teamId, id, token }),
+        marker: `concurrency-limiter:${teamId}:reservation:${id}`,
+        token,
+      };
+    });
+    const publish = redis.pipeline();
+    for (const entry of entries) {
+      publish.set(entry.marker, `cleanup:${entry.token}`, "PX", 60_000);
+      publish.zadd(queue, now - 1, entry.member);
+    }
+    await publish.exec();
+
+    await expect(
+      getConcurrencyRollbackCleanupBacklog(now),
+    ).resolves.toMatchObject({ due: 250 });
+    const pageSizes: number[] = [];
+    while ((await getConcurrencyRollbackCleanupBacklog(now)).due > 0) {
+      const page = await recoverConcurrencyLimitRollbacks(100);
+      pageSizes.push(page.read);
+      expect(page.read).toBeLessThanOrEqual(100);
+    }
+    expect(pageSizes).toEqual([100, 100, 50]);
+    await expect(
+      getConcurrencyRollbackCleanupBacklog(now),
+    ).resolves.toMatchObject({ total: 0, due: 0, oldestDueAt: null });
+    expect(await redis.mget(...entries.map(entry => entry.marker))).toEqual(
+      Array.from({ length: entries.length }, () => null),
+    );
   });
 
   test("PG external holder expiry remains durable after Redis loss and ignores stale renewal generations", async () => {

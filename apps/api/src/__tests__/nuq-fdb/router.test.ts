@@ -27,6 +27,18 @@ vi.mock("../../lib/crawl-redis", () => ({
 vi.mock("../../lib/concurrency-redis", () => ({
   getTeamQueueLimit: vi.fn().mockResolvedValue(100),
   getConcurrencyLimitActiveJobsCount: vi.fn().mockResolvedValue(0),
+  getConcurrencyRollbackCleanupBacklog: vi.fn().mockResolvedValue({
+    total: 0,
+    due: 0,
+    oldestDueAt: null,
+    oldestOverdueMs: 0,
+  }),
+  recoverConcurrencyLimitRollbacks: vi.fn().mockResolvedValue({
+    read: 0,
+    finalized: 0,
+    fenced: 0,
+    hasMore: false,
+  }),
   pushConcurrencyLimitActiveJob: vi.fn().mockResolvedValue(undefined),
   removeConcurrencyLimitActiveJob: vi.fn().mockResolvedValue(undefined),
   renewConcurrencyLimitActiveJob: vi.fn().mockResolvedValue(false),

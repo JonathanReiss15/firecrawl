@@ -9,6 +9,7 @@ import {
   getFdb,
   getNuqFdbDatabase,
 } from "../../services/worker/nuq-fdb/client";
+import { encodeI64 } from "../../services/worker/nuq-fdb/keyspace";
 import { reconcilePgResidueFence } from "../../services/worker/nuq-migration-control";
 
 // These tests intentionally exercise transaction conflicts and atomic ADDs on
@@ -68,10 +69,43 @@ describeIf("NuQ global FDB migration control plane", () => {
       tn.snapshot().getRangeAll(gcRange.begin as Buffer, gcRange.end as Buffer),
     );
     await db.doTn(async tn => {
+      const dueCountRange = fdb.tuple.range([
+        "nuq-migration",
+        1,
+        "gc",
+        "due-count",
+      ]);
+      tn.clearRange(dueCountRange.begin as Buffer, dueCountRange.end as Buffer);
       for (const [key] of gcRows) {
         const parts = fdb.tuple.unpack(key as Buffer);
         if (parts.some(part => String(part).includes(RUN))) {
           tn.clear(key as Buffer);
+          continue;
+        }
+        const category = String(parts[3]);
+        const partition = Number(parts[4]);
+        const dueAt = Number(parts[5]);
+        if (
+          (category === "pin" ||
+            category === "control" ||
+            category === "generation") &&
+          Number.isSafeInteger(partition) &&
+          Number.isSafeInteger(dueAt)
+        ) {
+          let node = BigInt(dueAt) + 1n;
+          while (node <= 1n << 53n) {
+            tn.add(
+              store.pack([
+                "gc",
+                "due-count",
+                category,
+                partition,
+                node.toString(),
+              ]),
+              encodeI64(1),
+            );
+            node += node & -node;
+          }
         }
       }
     });
@@ -1141,6 +1175,9 @@ describeIf("NuQ global FDB migration control plane", () => {
     const base = 1_800_000_000_000;
     const clock = vi.spyOn(Date, "now").mockReturnValue(base);
     try {
+      clock.mockReturnValue(base + 46 * 24 * 60 * 60 * 1000);
+      const baselineDue = (await store.inspectGcBacklog()).pin.due;
+      clock.mockReturnValue(base);
       const teamId = team();
       await initialize(teamId, "fdb");
       const ids = Array.from({ length: 150 }, () => object());
@@ -1181,6 +1218,13 @@ describeIf("NuQ global FDB migration control plane", () => {
         ),
       };
 
+      await expect(store.inspectGcBacklog()).resolves.toMatchObject({
+        pin: {
+          due: baselineDue + 150,
+          oldestOverdueMs: expect.any(Number),
+        },
+      });
+
       const firstStore = new NuqFdbMigrationStore();
       const first = await firstStore.sweepTerminalPins(authority, { limit: 7 });
       const restartedStore = new NuqFdbMigrationStore();
@@ -1190,6 +1234,18 @@ describeIf("NuQ global FDB migration control plane", () => {
       expect(first?.read).toBeLessThanOrEqual(7);
       expect(second?.read).toBeLessThanOrEqual(7);
       expect(second?.partition).not.toBe(first?.partition);
+
+      const concurrentClaims = await Promise.all(
+        Array.from({ length: 32 }, () =>
+          restartedStore.sweepTerminalPins(authority, { limit: 1 }),
+        ),
+      );
+      expect(
+        new Set(concurrentClaims.map(result => result?.partition)).size,
+      ).toBe(32);
+      expect(concurrentClaims.every(result => (result?.read ?? 0) <= 1)).toBe(
+        true,
+      );
 
       for (let pass = 0; pass < 3; pass++) {
         for (let partition = 0; partition < 32; partition++) {
@@ -1205,7 +1261,6 @@ describeIf("NuQ global FDB migration control plane", () => {
           store.inspectPin("scrape_job", objectId),
         ).resolves.toBeNull();
       }
-
       await getNuqFdbDatabase().doTn(async tn => tn.clear(runtimeKey));
       clock.mockReturnValue(
         base + 46 * 24 * 60 * 60 * 1000 + 2 * 60 * 60 * 1000,

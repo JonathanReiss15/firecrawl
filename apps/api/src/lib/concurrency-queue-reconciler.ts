@@ -7,6 +7,7 @@ import {
   getCombinedTeamActiveCount,
   sweepNuQMigrationGc,
   syncFdbLimitToPgOccupancy,
+  type NuQMigrationGcSweepStats,
 } from "../services/worker/nuq-router";
 import {
   completeNuQPgPublication,
@@ -26,12 +27,12 @@ import {
   restoreConcurrentJob,
 } from "./concurrency-limit";
 import { getCrawl } from "./crawl-redis";
-import { recoverConcurrencyLimitRollbacks } from "./concurrency-redis";
 import { logger as _logger } from "./logger";
 
 interface ReconcileOptions {
   teamId?: string;
   logger?: Logger;
+  signal?: AbortSignal;
 }
 
 interface ReconcileResult {
@@ -39,6 +40,7 @@ interface ReconcileResult {
   teamsWithDrift: number;
   jobsRequeued: number;
   jobsStarted: number;
+  migrationGc: NuQMigrationGcSweepStats;
 }
 
 function isExtractJob(data: ScrapeJobData): boolean {
@@ -511,17 +513,18 @@ export async function reconcileConcurrencyQueue(
     ownerIds = [...new Set([...backlogOwners, ...queueOwners])];
   }
 
-  await recoverConcurrencyLimitRollbacks();
-  await sweepNuQMigrationGc();
+  const migrationGc = await sweepNuQMigrationGc({ signal: options.signal });
 
   const result: ReconcileResult = {
     teamsScanned: ownerIds.length,
     teamsWithDrift: 0,
     jobsRequeued: 0,
     jobsStarted: 0,
+    migrationGc,
   };
 
   for (const ownerId of ownerIds) {
+    if (options.signal?.aborted) break;
     const teamLogger = logger.child({ teamId: ownerId });
 
     try {

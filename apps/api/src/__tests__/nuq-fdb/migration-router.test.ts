@@ -41,6 +41,18 @@ vi.mock("../../lib/concurrency-redis", () => ({
   finalizeConcurrencyLimitActiveJobRollback: controls.redisFinalize,
   getTeamQueueLimit: vi.fn().mockResolvedValue(100),
   getConcurrencyLimitActiveJobsCount: vi.fn().mockResolvedValue(0),
+  getConcurrencyRollbackCleanupBacklog: vi.fn().mockResolvedValue({
+    total: 0,
+    due: 0,
+    oldestDueAt: null,
+    oldestOverdueMs: 0,
+  }),
+  recoverConcurrencyLimitRollbacks: vi.fn().mockResolvedValue({
+    read: 0,
+    finalized: 0,
+    fenced: 0,
+    hasMore: false,
+  }),
   pushConcurrencyLimitActiveJob: vi.fn(),
   removeConcurrencyLimitActiveJob: controls.redisRemove,
   renewConcurrencyLimitActiveJob: vi.fn().mockResolvedValue(true),
@@ -442,6 +454,7 @@ describeIf("NuQ durable migration router", () => {
       teamId,
       holderId,
       "owned-attempt",
+      30_000,
     );
     expect(controls.redisFinalize).toHaveBeenCalledWith(
       teamId,
@@ -489,6 +502,7 @@ describeIf("NuQ durable migration router", () => {
       teamId,
       holderId,
       "stale-attempt",
+      30_000,
     );
     expect(controls.redisFinalize).not.toHaveBeenCalled();
     await expect(
@@ -554,6 +568,7 @@ describeIf("NuQ durable migration router", () => {
       teamId,
       holderId,
       "reopened-attempt",
+      30_000,
     );
     await expect(
       nuqFdbMigrationStore.inspectPin("external_holder", objectId),

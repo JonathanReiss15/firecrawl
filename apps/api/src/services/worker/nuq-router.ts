@@ -17,6 +17,9 @@ import {
   reserveConcurrencyLimitActiveJob,
   rollbackConcurrencyLimitActiveJob,
   constructConcurrencyLimitKey,
+  getConcurrencyRollbackCleanupBacklog,
+  recoverConcurrencyLimitRollbacks,
+  type ConcurrencyRollbackCleanupBacklog,
 } from "../../lib/concurrency-redis";
 import {
   NuQJob,
@@ -43,7 +46,10 @@ import {
   NuQFdbQueue,
   NuQFdbJob,
   nuqFdbMigrationStore,
+  MIGRATION_GC_PARTITIONS,
   type DurablePgJobRemoval,
+  type MigrationGcAuthority,
+  type MigrationGcBacklog,
   type MigrationObjectKind,
   type MigrationObjectPin,
   type MigrationResidue,
@@ -785,94 +791,403 @@ async function completeRoutingPin(
   );
 }
 
-/** One bounded production GC tick. Runtime FDB rows are checked in the same
- * transaction as tombstone deletion; PG and Redis-holder probes are bounded
- * point reads followed by that FDB CAS. */
-export async function sweepNuQMigrationGc(): Promise<void> {
-  if (!fdbQueueEnabled()) return;
-  await nuqFdbMigrationStore.sweepTerminalPins({
-    pgObjectExists: async pin => {
-      if (pin.backend !== "pg") return false;
-      if (pin.kind === "scrape_job") return await pgHasScrapeJob(pin.objectId);
-      if (pin.kind === "group") {
-        return (await crawlGroupPg.getGroup(pin.objectId)) !== null;
-      }
-      if (pin.kind === "crawl_finished") {
-        return (await crawlFinishedQueuePg.getJob(pin.objectId)) !== null;
-      }
-      if (pin.kind === "external_holder") {
-        const prefix = `${pin.teamId}/`;
-        if (!pin.objectId.startsWith(prefix)) return true;
-        return (
-          (await getRedisConnection().zscore(
-            constructConcurrencyLimitKey(pin.teamId),
-            pin.objectId.slice(prefix.length),
-          )) !== null
-        );
-      }
-      return false;
-    },
-    fdbReferenceExistsInTxn: async (tn, pin) => {
-      if (pin.kind === "scrape_job") {
-        const [status, meta, ownerIndex, removal] = await Promise.all([
-          tn.get(scrapeQueueFdb.ks.jobStatus(pin.objectId)),
-          tn.get(scrapeQueueFdb.ks.jobMeta(pin.objectId)),
-          tn.get(scrapeQueueFdb.ks.ownerLiveJob(pin.teamId, pin.objectId)),
-          pgJobRemovalsFdb.hasInTxn(tn, pin.objectId),
-        ]);
-        return Boolean(status || meta || ownerIndex || removal);
-      }
-      if (pin.kind === "crawl_finished") {
-        const [status, meta, ownerIndex] = await Promise.all([
-          tn.get(crawlFinishedQueueFdb.ks.jobStatus(pin.objectId)),
-          tn.get(crawlFinishedQueueFdb.ks.jobMeta(pin.objectId)),
-          tn.get(
-            crawlFinishedQueueFdb.ks.ownerLiveJob(pin.teamId, pin.objectId),
-          ),
-        ]);
-        return Boolean(status || meta || ownerIndex);
-      }
-      if (pin.kind === "group") {
-        const [meta, ownerIndex, cancelTask, legacyCancelTask, cancelCursor] =
-          await Promise.all([
-            tn.get(crawlGroupFdb.ks.groupMeta(pin.objectId)),
-            tn.get(crawlGroupFdb.ks.ongoingGroup(pin.teamId, pin.objectId)),
-            tn.get(crawlGroupFdb.ks.taskGroupCancel(pin.objectId)),
-            tn.get(crawlGroupFdb.ks.pack(["task", "gcancel", pin.objectId])),
-            tn.get(crawlGroupFdb.ks.groupCancelCursor(pin.objectId)),
-          ]);
-        return Boolean(
-          meta || ownerIndex || cancelTask || legacyCancelTask || cancelCursor,
-        );
-      }
-      if (pin.kind === "external_holder") {
-        const prefix = `${pin.teamId}/`;
-        if (!pin.objectId.startsWith(prefix)) return true;
-        return await externalSlotsFdb.hasMigrationReferenceInTxn(
-          tn,
-          pin.teamId,
+// Runtime FDB rows are checked in the same transaction as tombstone deletion;
+// PG and Redis-holder probes are bounded point reads followed by that FDB CAS.
+const migrationGcAuthority: MigrationGcAuthority = {
+  pgObjectExists: async pin => {
+    if (pin.backend !== "pg") return false;
+    if (pin.kind === "scrape_job") return await pgHasScrapeJob(pin.objectId);
+    if (pin.kind === "group") {
+      return (await crawlGroupPg.getGroup(pin.objectId)) !== null;
+    }
+    if (pin.kind === "crawl_finished") {
+      return (await crawlFinishedQueuePg.getJob(pin.objectId)) !== null;
+    }
+    if (pin.kind === "external_holder") {
+      const prefix = `${pin.teamId}/`;
+      if (!pin.objectId.startsWith(prefix)) return true;
+      return (
+        (await getRedisConnection().zscore(
+          constructConcurrencyLimitKey(pin.teamId),
           pin.objectId.slice(prefix.length),
-        );
-      }
-      if (pin.kind === "sweeper_task") {
-        const prefix = "group-cancel/";
-        if (!pin.objectId.startsWith(prefix)) return true;
-        const groupId = pin.objectId.slice(prefix.length);
-        const [task, legacyTask, cursor, group] = await Promise.all([
-          tn.get(crawlGroupFdb.ks.taskGroupCancel(groupId)),
-          tn.get(crawlGroupFdb.ks.pack(["task", "gcancel", groupId])),
-          tn.get(crawlGroupFdb.ks.groupCancelCursor(groupId)),
-          tn.get(crawlGroupFdb.ks.groupMeta(groupId)),
+        )) !== null
+      );
+    }
+    return false;
+  },
+  fdbReferenceExistsInTxn: async (tn, pin) => {
+    if (pin.kind === "scrape_job") {
+      const [status, meta, ownerIndex, removal] = await Promise.all([
+        tn.get(scrapeQueueFdb.ks.jobStatus(pin.objectId)),
+        tn.get(scrapeQueueFdb.ks.jobMeta(pin.objectId)),
+        tn.get(scrapeQueueFdb.ks.ownerLiveJob(pin.teamId, pin.objectId)),
+        pgJobRemovalsFdb.hasInTxn(tn, pin.objectId),
+      ]);
+      return Boolean(status || meta || ownerIndex || removal);
+    }
+    if (pin.kind === "crawl_finished") {
+      const [status, meta, ownerIndex] = await Promise.all([
+        tn.get(crawlFinishedQueueFdb.ks.jobStatus(pin.objectId)),
+        tn.get(crawlFinishedQueueFdb.ks.jobMeta(pin.objectId)),
+        tn.get(crawlFinishedQueueFdb.ks.ownerLiveJob(pin.teamId, pin.objectId)),
+      ]);
+      return Boolean(status || meta || ownerIndex);
+    }
+    if (pin.kind === "group") {
+      const [meta, ownerIndex, cancelTask, legacyCancelTask, cancelCursor] =
+        await Promise.all([
+          tn.get(crawlGroupFdb.ks.groupMeta(pin.objectId)),
+          tn.get(crawlGroupFdb.ks.ongoingGroup(pin.teamId, pin.objectId)),
+          tn.get(crawlGroupFdb.ks.taskGroupCancel(pin.objectId)),
+          tn.get(crawlGroupFdb.ks.pack(["task", "gcancel", pin.objectId])),
+          tn.get(crawlGroupFdb.ks.groupCancelCursor(pin.objectId)),
         ]);
-        return Boolean(task || legacyTask || cursor || group);
+      return Boolean(
+        meta || ownerIndex || cancelTask || legacyCancelTask || cancelCursor,
+      );
+    }
+    if (pin.kind === "external_holder") {
+      const prefix = `${pin.teamId}/`;
+      if (!pin.objectId.startsWith(prefix)) return true;
+      return await externalSlotsFdb.hasMigrationReferenceInTxn(
+        tn,
+        pin.teamId,
+        pin.objectId.slice(prefix.length),
+      );
+    }
+    if (pin.kind === "sweeper_task") {
+      const prefix = "group-cancel/";
+      if (!pin.objectId.startsWith(prefix)) return true;
+      const groupId = pin.objectId.slice(prefix.length);
+      const [task, legacyTask, cursor, group] = await Promise.all([
+        tn.get(crawlGroupFdb.ks.taskGroupCancel(groupId)),
+        tn.get(crawlGroupFdb.ks.pack(["task", "gcancel", groupId])),
+        tn.get(crawlGroupFdb.ks.groupCancelCursor(groupId)),
+        tn.get(crawlGroupFdb.ks.groupMeta(groupId)),
+      ]);
+      return Boolean(task || legacyTask || cursor || group);
+    }
+    return false;
+  },
+};
+
+export type NuQMigrationGcCategory =
+  | "terminal_pin"
+  | "control_history"
+  | "closed_generation"
+  | "redis_cleanup";
+
+export type NuQMigrationGcCategoryStats = {
+  pages: number;
+  processed: number;
+  removed: number;
+  retained: number;
+  stale: number;
+  errors: number;
+  dueBacklog: number;
+  oldestOverdueMs: number;
+};
+
+export type NuQMigrationGcSweepStats = {
+  pages: number;
+  processed: number;
+  removed: number;
+  retained: number;
+  stale: number;
+  errors: number;
+  hasMore: boolean;
+  elapsedMs: number;
+  stopReason: "idle" | "budget" | "page-cap" | "aborted" | "contended";
+  categories: Record<NuQMigrationGcCategory, NuQMigrationGcCategoryStats>;
+};
+
+type NuQMigrationGcPageResult = {
+  read: number;
+  removed: number;
+  retained: number;
+  stale: number;
+};
+
+type NuQMigrationGcSweepDependencies = {
+  fdbEnabled(): boolean;
+  inspectFdb(
+    now: number,
+  ): Promise<Record<"pin" | "control" | "generation", MigrationGcBacklog>>;
+  inspectRedis(now: number): Promise<ConcurrencyRollbackCleanupBacklog>;
+  sweepCategory(
+    category: NuQMigrationGcCategory,
+    now: number,
+    limit: number,
+    signal?: AbortSignal,
+  ): Promise<NuQMigrationGcPageResult | null>;
+};
+
+type NuQMigrationGcSweepOptions = {
+  workBudgetMs?: number;
+  maxPages?: number;
+  pageLimit?: number;
+  signal?: AbortSignal;
+  now?: () => number;
+  monotonicNow?: () => number;
+  /** Deterministic storage seam used by bounded scheduler tests. */
+  dependencies?: NuQMigrationGcSweepDependencies;
+};
+
+const productionMigrationGcDependencies: NuQMigrationGcSweepDependencies = {
+  fdbEnabled: fdbQueueEnabled,
+  inspectFdb: now => nuqFdbMigrationStore.inspectGcBacklog(now),
+  inspectRedis: getConcurrencyRollbackCleanupBacklog,
+  sweepCategory: async (category, now, limit, signal) => {
+    if (category === "redis_cleanup") {
+      const result = await recoverConcurrencyLimitRollbacks(limit);
+      return {
+        read: result.read,
+        removed: result.finalized,
+        retained: 0,
+        stale: result.fenced,
+      };
+    }
+    return category === "terminal_pin"
+      ? await nuqFdbMigrationStore.sweepTerminalPins(migrationGcAuthority, {
+          now,
+          limit,
+          signal,
+        })
+      : category === "control_history"
+        ? await nuqFdbMigrationStore.sweepControlHistory({
+            now,
+            limit,
+            signal,
+          })
+        : await nuqFdbMigrationStore.sweepClosedGenerations({
+            now,
+            limit,
+            signal,
+          });
+  },
+};
+
+const emptyGcCategoryStats = (): NuQMigrationGcCategoryStats => ({
+  pages: 0,
+  processed: 0,
+  removed: 0,
+  retained: 0,
+  stale: 0,
+  errors: 0,
+  dueBacklog: 0,
+  oldestOverdueMs: 0,
+});
+
+function validateGcRunBound(
+  value: number,
+  min: number,
+  max: number,
+  name: string,
+) {
+  if (!Number.isSafeInteger(value) || value < min || value > max) {
+    throw new TypeError(`${name} must be between ${min} and ${max}`);
+  }
+}
+
+/** Drain fair, globally leased pages until the independent wall-clock or page
+ * bound is reached. Empty partitions are visited at most once per category,
+ * so retained work and lease contention cannot create an in-process hot loop. */
+export async function sweepNuQMigrationGc(
+  options: NuQMigrationGcSweepOptions = {},
+): Promise<NuQMigrationGcSweepStats> {
+  const workBudgetMs =
+    options.workBudgetMs ?? config.NUQ_MIGRATION_GC_WORK_BUDGET_MS;
+  const maxPages = options.maxPages ?? config.NUQ_MIGRATION_GC_MAX_PAGES;
+  const pageLimit = options.pageLimit ?? config.NUQ_MIGRATION_GC_PAGE_LIMIT;
+  validateGcRunBound(workBudgetMs, 1, 55_000, "GC work budget");
+  validateGcRunBound(maxPages, 1, 1024, "GC max pages");
+  validateGcRunBound(pageLimit, 1, 100, "GC page limit");
+
+  const wallNow = options.now ?? Date.now;
+  const monotonicNow = options.monotonicNow ?? (() => performance.now());
+  const dependencies =
+    options.dependencies ?? productionMigrationGcDependencies;
+  const started = monotonicNow();
+  const categories: Record<
+    NuQMigrationGcCategory,
+    NuQMigrationGcCategoryStats
+  > = {
+    terminal_pin: emptyGcCategoryStats(),
+    control_history: emptyGcCategoryStats(),
+    closed_generation: emptyGcCategoryStats(),
+    redis_cleanup: emptyGcCategoryStats(),
+  };
+  const enabled = new Set<NuQMigrationGcCategory>();
+  const remaining = new Map<NuQMigrationGcCategory, number>();
+
+  const observeFdb = async () => {
+    if (!dependencies.fdbEnabled()) return;
+    const observed = await dependencies.inspectFdb(wallNow());
+    const mappings: Array<[NuQMigrationGcCategory, MigrationGcBacklog]> = [
+      ["terminal_pin", observed.pin],
+      ["control_history", observed.control],
+      ["closed_generation", observed.generation],
+    ];
+    for (const [category, backlog] of mappings) {
+      categories[category].dueBacklog = backlog.due;
+      categories[category].oldestOverdueMs = backlog.oldestOverdueMs;
+      remaining.set(category, backlog.due);
+      enabled.add(category);
+    }
+  };
+  const observeRedis = async () => {
+    const observed: ConcurrencyRollbackCleanupBacklog =
+      await dependencies.inspectRedis(wallNow());
+    categories.redis_cleanup.dueBacklog = observed.due;
+    categories.redis_cleanup.oldestOverdueMs = observed.oldestOverdueMs;
+    remaining.set("redis_cleanup", observed.due);
+    enabled.add("redis_cleanup");
+  };
+
+  try {
+    await observeFdb();
+  } catch (error) {
+    categories.terminal_pin.errors++;
+    categories.control_history.errors++;
+    categories.closed_generation.errors++;
+    _logger.error("Failed to observe FDB migration GC backlog", { error });
+  }
+  try {
+    await observeRedis();
+  } catch (error) {
+    categories.redis_cleanup.errors++;
+    _logger.error("Failed to observe Redis cleanup backlog", { error });
+  }
+
+  const order: NuQMigrationGcCategory[] = [
+    "terminal_pin",
+    "control_history",
+    // Control history must be retired before its referenced generations.
+    "closed_generation",
+    "redis_cleanup",
+  ];
+  let pages = 0;
+  let emptyAttempts = 0;
+  let stopReason: NuQMigrationGcSweepStats["stopReason"] = "idle";
+
+  while (pages < maxPages) {
+    if (options.signal?.aborted) {
+      stopReason = "aborted";
+      break;
+    }
+    if (monotonicNow() - started >= workBudgetMs) {
+      stopReason = "budget";
+      break;
+    }
+    const category = order[0];
+    if (!enabled.has(category) || (remaining.get(category) ?? 0) <= 0) {
+      if (
+        order.every(
+          item => !enabled.has(item) || (remaining.get(item) ?? 0) <= 0,
+        )
+      ) {
+        stopReason = "idle";
+        break;
       }
-      return false;
-    },
-  });
-  // History is removed before generations so generation-control references
-  // naturally enforce the required ordering.
-  await nuqFdbMigrationStore.sweepControlHistory();
-  await nuqFdbMigrationStore.sweepClosedGenerations();
+      // Skipping is not a page and must still advance fairness.
+      order.push(order.shift()!);
+      continue;
+    }
+
+    const categoryStats = categories[category];
+    try {
+      const now = wallNow();
+      let read = 0;
+      let removed = 0;
+      let retained = 0;
+      let stale = 0;
+      const result = await dependencies.sweepCategory(
+        category,
+        now,
+        pageLimit,
+        options.signal,
+      );
+      if (result) {
+        read = result.read;
+        removed = result.removed;
+        retained = result.retained;
+        stale = result.stale;
+      }
+      pages++;
+      categoryStats.pages++;
+      categoryStats.processed += read;
+      categoryStats.removed += removed;
+      categoryStats.retained += retained;
+      categoryStats.stale += stale;
+      remaining.set(
+        category,
+        Math.max(0, (remaining.get(category) ?? 0) - read),
+      );
+      emptyAttempts = read === 0 ? emptyAttempts + 1 : 0;
+    } catch (error) {
+      pages++;
+      categoryStats.pages++;
+      categoryStats.errors++;
+      enabled.delete(category);
+      _logger.error("Migration GC category page failed", { category, error });
+    }
+
+    order.push(order.shift()!);
+    const activeFdbCategories = order.filter(
+      category =>
+        category !== "redis_cleanup" &&
+        enabled.has(category) &&
+        (remaining.get(category) ?? 0) > 0,
+    ).length;
+    if (
+      emptyAttempts >=
+      Math.max(1, activeFdbCategories) * MIGRATION_GC_PARTITIONS
+    ) {
+      stopReason = "contended";
+      break;
+    }
+  }
+  if (pages >= maxPages && stopReason === "idle") stopReason = "page-cap";
+
+  // Do not add observation work after shutdown was requested. The conservative
+  // remaining estimate keeps the worker on backlog cadence if it restarts.
+  if (!options.signal?.aborted) {
+    try {
+      await observeFdb();
+    } catch (error) {
+      categories.terminal_pin.errors++;
+      categories.control_history.errors++;
+      categories.closed_generation.errors++;
+      _logger.error("Failed to refresh FDB migration GC backlog", { error });
+    }
+    try {
+      await observeRedis();
+    } catch (error) {
+      categories.redis_cleanup.errors++;
+      _logger.error("Failed to refresh Redis cleanup backlog", { error });
+    }
+  }
+
+  const totals = Object.values(categories).reduce(
+    (sum, category) => ({
+      processed: sum.processed + category.processed,
+      removed: sum.removed + category.removed,
+      retained: sum.retained + category.retained,
+      stale: sum.stale + category.stale,
+      errors: sum.errors + category.errors,
+    }),
+    { processed: 0, removed: 0, retained: 0, stale: 0, errors: 0 },
+  );
+  return {
+    pages,
+    ...totals,
+    hasMore:
+      totals.errors > 0 ||
+      Object.values(categories).some(category => category.dueBacklog > 0),
+    elapsedMs: Math.max(0, monotonicNow() - started),
+    stopReason: options.signal?.aborted ? "aborted" : stopReason,
+    categories,
+  };
 }
 
 // === External capacity holders (browser sessions, sync scrapes)

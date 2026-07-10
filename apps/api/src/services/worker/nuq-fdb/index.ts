@@ -37,6 +37,8 @@ export {
 export type { DurablePgJobRemoval } from "./pg-removals";
 export { isFdbConfigured, nuqFdbHealthCheck, withFdbTimeout } from "./client";
 export {
+  MIGRATION_GC_PAGE_LIMIT,
+  MIGRATION_GC_PARTITIONS,
   MIGRATION_RESIDUE_COUNTERS,
   MigrationCasError,
   MigrationCorruptionError,
@@ -52,6 +54,10 @@ export {
 export type {
   CompletePinnedObjectInput,
   MigrationBackend,
+  MigrationGcAuthority,
+  MigrationGcBacklog,
+  MigrationGcCategory,
+  MigrationGcSweepResult,
   MigrationGeneration,
   MigrationGenerationStatus,
   MigrationObjectKind,

@@ -4,10 +4,8 @@ import "../sentry";
 import { setSentryServiceTag } from "../sentry";
 import { logger as _logger } from "../../lib/logger";
 import { reconcileConcurrencyQueue } from "../../lib/concurrency-queue-reconciler";
-import { Counter, register } from "prom-client";
+import { Counter, Gauge, register } from "prom-client";
 import Express from "express";
-
-const RECONCILER_INTERVAL_MS = 60 * 1000;
 
 const reconcilerRunsTotal = new Counter({
   name: "concurrency_queue_reconciler_runs_total",
@@ -24,11 +22,43 @@ const reconcilerJobsRecoveredTotal = new Counter({
   help: "Total drifted jobs recovered by the reconciler",
 });
 
+const migrationGcRunsTotal = new Counter({
+  name: "nuq_migration_gc_runs_total",
+  help: "NuQ migration GC category runs",
+  labelNames: ["category"] as const,
+});
+const migrationGcPagesTotal = new Counter({
+  name: "nuq_migration_gc_pages_total",
+  help: "Bounded NuQ migration GC pages processed",
+  labelNames: ["category"] as const,
+});
+const migrationGcItemsTotal = new Counter({
+  name: "nuq_migration_gc_items_total",
+  help: "NuQ migration GC items by outcome",
+  labelNames: ["category", "outcome"] as const,
+});
+const migrationGcErrorsTotal = new Counter({
+  name: "nuq_migration_gc_errors_total",
+  help: "NuQ migration GC category errors",
+  labelNames: ["category"] as const,
+});
+const migrationGcDueBacklog = new Gauge({
+  name: "nuq_migration_gc_due_backlog",
+  help: "Exact number of due NuQ migration GC items",
+  labelNames: ["category"] as const,
+});
+const migrationGcOldestOverdueSeconds = new Gauge({
+  name: "nuq_migration_gc_oldest_overdue_seconds",
+  help: "Age in seconds of the oldest due NuQ migration GC item",
+  labelNames: ["category"] as const,
+});
+
 (async () => {
   setSentryServiceTag("nuq-reconciler-worker");
 
   let isShuttingDown = false;
   let reconcilerInFlight = false;
+  const shutdownController = new AbortController();
 
   const app = Express();
 
@@ -64,6 +94,7 @@ const reconcilerJobsRecoveredTotal = new Counter({
   async function shutdown() {
     if (isShuttingDown) return;
     isShuttingDown = true;
+    shutdownController.abort();
     _logger.info("NuQ reconciler worker shutting down");
 
     while (reconcilerInFlight) {
@@ -82,19 +113,67 @@ const reconcilerJobsRecoveredTotal = new Counter({
     process.on("SIGTERM", shutdown);
   }
 
+  const sleep = async (ms: number) => {
+    if (shutdownController.signal.aborted) return;
+    await new Promise<void>(resolve => {
+      const timer = setTimeout(resolve, ms);
+      shutdownController.signal.addEventListener(
+        "abort",
+        () => {
+          clearTimeout(timer);
+          resolve();
+        },
+        { once: true },
+      );
+    });
+  };
+
   while (!isShuttingDown) {
+    let nextIntervalMs = config.NUQ_RECONCILER_IDLE_INTERVAL_MS;
     if (!reconcilerInFlight) {
       reconcilerInFlight = true;
 
       try {
         const summary = await reconcileConcurrencyQueue({
           logger: _logger,
+          signal: shutdownController.signal,
         });
 
         reconcilerRunsTotal.inc();
         reconcilerJobsRecoveredTotal.inc(
           summary.jobsRequeued + summary.jobsStarted,
         );
+        nextIntervalMs = summary.migrationGc.hasMore
+          ? config.NUQ_RECONCILER_BACKLOG_RETRY_MS
+          : config.NUQ_RECONCILER_IDLE_INTERVAL_MS;
+        for (const [category, stats] of Object.entries(
+          summary.migrationGc.categories,
+        )) {
+          migrationGcRunsTotal.inc({ category });
+          migrationGcPagesTotal.inc({ category }, stats.pages);
+          migrationGcItemsTotal.inc(
+            { category, outcome: "processed" },
+            stats.processed,
+          );
+          migrationGcItemsTotal.inc(
+            { category, outcome: "removed" },
+            stats.removed,
+          );
+          migrationGcItemsTotal.inc(
+            { category, outcome: "retained" },
+            stats.retained,
+          );
+          migrationGcItemsTotal.inc(
+            { category, outcome: "stale" },
+            stats.stale,
+          );
+          migrationGcErrorsTotal.inc({ category }, stats.errors);
+          migrationGcDueBacklog.set({ category }, stats.dueBacklog);
+          migrationGcOldestOverdueSeconds.set(
+            { category },
+            stats.oldestOverdueMs / 1000,
+          );
+        }
 
         _logger.info("Concurrency queue reconciler run complete", summary);
       } catch (error) {
@@ -105,6 +184,6 @@ const reconcilerJobsRecoveredTotal = new Counter({
       }
     }
 
-    await new Promise(resolve => setTimeout(resolve, RECONCILER_INTERVAL_MS));
+    await sleep(nextIntervalMs);
   }
 })();
