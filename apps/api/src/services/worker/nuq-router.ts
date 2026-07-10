@@ -46,7 +46,10 @@ import {
   NuQRouterBothBackendsError,
   NuQRouterObjectNotFoundError,
   NuQRouterPinMismatchError,
+  discoverLegacyTeamBackend,
+  hasLegacyFdbTeamResidue,
   reconcileDesiredTeamBackend,
+  recoverLegacyTeamState,
   reconcilePgResidueFence,
   resolveAuthoritativeObjectBackend,
   type BackendMarker,
@@ -106,6 +109,50 @@ async function desiredTeamBackend(teamId: string): Promise<QueueBackend> {
   return acuc?.flags?.nuqFdb === true ? "fdb" : "pg";
 }
 
+async function discoverLegacyTeamAuthority(
+  teamId: string,
+): Promise<QueueBackend> {
+  return await discoverLegacyTeamBackend({
+    teamId,
+    probeFdbResidue: () =>
+      optionalFdbRead(async () => {
+        const [
+          scrapePending,
+          scrapeActive,
+          crawlFinishedPending,
+          crawlFinishedActive,
+          crawlFinishedIndexedLive,
+          groups,
+        ] = await Promise.all([
+          scrapeQueueFdb.getTeamPendingCount(teamId),
+          scrapeQueueFdb.getTeamActiveCount(teamId),
+          crawlFinishedQueueFdb.getTeamPendingCount(teamId),
+          crawlFinishedQueueFdb.getTeamActiveCount(teamId),
+          crawlFinishedQueueFdb.hasReadyOrActiveJobForOwner(teamId),
+          crawlGroupFdb.getOngoingByOwner(teamId),
+        ]);
+        return hasLegacyFdbTeamResidue({
+          scrapePending,
+          scrapeActive,
+          crawlFinishedPending,
+          crawlFinishedActive,
+          crawlFinishedIndexedLive,
+          activeGroups: groups.length,
+        });
+      }),
+    probePgResidue: async () => {
+      const [residue, redisOccupancy] = await Promise.all([
+        getNuQPgOwnerLiveResidue(teamId),
+        getConcurrencyLimitActiveJobsCount(teamId),
+      ]);
+      return residue.total + redisOccupancy > 0;
+    },
+    // This rollout starts from PG. Empty is an explicit deployment default,
+    // not a fallback after an unavailable FDB probe.
+    emptyBackend: "pg",
+  });
+}
+
 async function reconcileTerminalPgPins(teamId: string): Promise<void> {
   const pins = (await nuqFdbMigrationStore.inspectTeamPins(teamId)).filter(
     pin => pin.backend === "pg" && pin.lifecycle !== "terminal",
@@ -139,13 +186,10 @@ async function reconcileTerminalPgPins(teamId: string): Promise<void> {
         await completeRoutingPin(pin, "pg-reconcile-terminal");
       }
     } else if (pin.kind === "external_holder") {
-      const present = await getRedisConnection().zscore(
-        constructConcurrencyLimitKey(teamId),
-        pin.objectId,
-      );
-      if (present === null && pin.lifecycle === "active") {
-        await completeRoutingPin(pin, "pg-reconcile-terminal");
-      }
+      // Redis disappearance is not terminal evidence (flushes/failovers lose
+      // this hint). Explicit release or the corrected durable holder-expiry
+      // reconciler owns retirement, so an orphan conservatively blocks seal.
+      continue;
     } else if (pin.kind === "crawl_finished") {
       const job = await crawlFinishedQueuePg.getJob(pin.objectId);
       if (
@@ -168,8 +212,13 @@ async function authoritativeTeamBackend(teamId: string): Promise<QueueBackend> {
   );
   if (!current) {
     current = await fdbMutation(() =>
-      reconcileDesiredTeamBackend(nuqFdbMigrationStore, teamId, "pg"),
+      recoverLegacyTeamState(nuqFdbMigrationStore, teamId, () =>
+        discoverLegacyTeamAuthority(teamId),
+      ),
     );
+    // Discovery may have lost an initialize-if-absent race. Trust the durable
+    // winner exactly as returned; desired begin/cancel is a subsequent request.
+    return current.activeBackend;
   }
 
   // Before pausing PG admissions, snapshot authoritative legacy PG residue
@@ -196,33 +245,11 @@ async function authoritativeTeamBackend(teamId: string): Promise<QueueBackend> {
         observationId: `${teamId}/${current!.revision}/${pgResidueTotal === 0 ? "zero" : "nonzero"}`,
       }),
     );
-    if (
-      current.phase === "DRAINING_TO_FDB" &&
-      pgResidueTotal === 0 &&
-      current.transitionOperationId
-    ) {
-      current = await fdbMutation(() =>
-        nuqFdbMigrationStore.finalSeal({
-          teamId,
-          transitionOperationId: current!.transitionOperationId!,
-          expectedRevision: current!.revision,
-        }),
-      );
-    }
-  }
-
-  if (
-    desired === "pg" &&
-    current?.phase === "DRAINING_TO_PG" &&
-    current.transitionOperationId
-  ) {
-    current = await fdbMutation(() =>
-      nuqFdbMigrationStore.finalSeal({
-        teamId,
-        transitionOperationId: current!.transitionOperationId!,
-        expectedRevision: current!.revision,
-      }),
-    );
+    // TODO(corrected-core): only the reconciler may call finalSeal after every
+    // queue/group/slot/sweeper mutation uses generation accounting in its own
+    // FDB transaction and publishes an authoritative readiness decision. This
+    // router refreshes durable PG residue but never infers seal readiness from
+    // an out-of-transaction PG/Redis observation.
   }
 
   if (current?.activeBackend === desired && current.phase !== "ERROR") {
@@ -231,7 +258,9 @@ async function authoritativeTeamBackend(teamId: string): Promise<QueueBackend> {
     }
   }
   const state = await fdbMutation(() =>
-    reconcileDesiredTeamBackend(nuqFdbMigrationStore, teamId, desired),
+    reconcileDesiredTeamBackend(nuqFdbMigrationStore, teamId, desired, () =>
+      discoverLegacyTeamAuthority(teamId),
+    ),
   );
   return state.activeBackend;
 }
@@ -346,7 +375,9 @@ async function getCrawlQueueBackend(
     );
     if (!state) {
       state = await fdbMutation(() =>
-        reconcileDesiredTeamBackend(nuqFdbMigrationStore, group.ownerId, "pg"),
+        recoverLegacyTeamState(nuqFdbMigrationStore, group.ownerId, () =>
+          discoverLegacyTeamAuthority(group.ownerId),
+        ),
       );
     }
     let generation = state.activeGeneration;
@@ -545,7 +576,9 @@ async function acquireExternalSlot(
     );
     if (!state) {
       state = await fdbMutation(() =>
-        reconcileDesiredTeamBackend(nuqFdbMigrationStore, teamId, "pg"),
+        recoverLegacyTeamState(nuqFdbMigrationStore, teamId, () =>
+          discoverLegacyTeamAuthority(teamId),
+        ),
       );
     }
     const [fdbPresent, pgPresent] = await Promise.all([

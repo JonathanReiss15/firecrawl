@@ -5,8 +5,11 @@ import type {
 } from "./nuq-fdb/migration-store";
 import {
   DurableNuQPgPublicationAdapter,
+  discoverLegacyTeamBackend,
+  hasLegacyFdbTeamResidue,
   reconcileDesiredTeamBackend,
   reconcilePgResidueFence,
+  recoverLegacyTeamState,
   resolveAuthoritativeObjectBackend,
   stableTransitionOperationId,
   type NuQMigrationStorePort,
@@ -80,6 +83,88 @@ function storeMock(
 }
 
 describe("durable team state decisions", () => {
+  test("uninitialized teams use caller-discovered FDB authority", async () => {
+    const recovered = state({
+      activeBackend: "fdb",
+      phase: "FDB_ONLY",
+    });
+    const store = storeMock({
+      resolveSteady: vi.fn().mockResolvedValue({
+        status: "legacy-uninitialized",
+      }),
+      initializeLegacyTeam: vi.fn().mockResolvedValue(recovered),
+    });
+    const discover = vi.fn().mockResolvedValue("fdb");
+
+    await expect(
+      reconcileDesiredTeamBackend(store, "team", "fdb", discover),
+    ).resolves.toEqual(recovered);
+    expect(discover).toHaveBeenCalledOnce();
+    expect(store.initializeLegacyTeam).toHaveBeenCalledWith(
+      "team",
+      "fdb",
+      "nuq-router/v1/team/team/initialize/fdb",
+      { ifAbsent: true },
+    );
+  });
+
+  test("initialize-if-absent trusts a concurrent durable winner", async () => {
+    const winner = state({
+      revision: 2,
+      maxGeneration: 2,
+      activeBackend: "fdb",
+      activeGeneration: 1,
+      phase: "DRAINING_TO_PG",
+      targetBackend: "pg",
+      targetGeneration: 2,
+      transitionOperationId: "winner",
+    });
+    const store = storeMock({
+      resolveSteady: vi.fn().mockResolvedValue({
+        status: "legacy-uninitialized",
+      }),
+      inspectState: vi.fn().mockResolvedValue(null),
+      initializeLegacyTeam: vi.fn().mockResolvedValue(winner),
+    });
+
+    await expect(
+      reconcileDesiredTeamBackend(store, "team", "pg", async () => "pg"),
+    ).resolves.toEqual(winner);
+    expect(store.initializeLegacyTeam).toHaveBeenCalledWith(
+      "team",
+      "pg",
+      "nuq-router/v1/team/team/initialize/pg",
+      { ifAbsent: true },
+    );
+    expect(store.beginTransition).not.toHaveBeenCalled();
+    expect(store.cancelTransition).not.toHaveBeenCalled();
+  });
+
+  test("router bootstrap recovery returns an existing transitional winner unchanged", async () => {
+    const winner = state({
+      revision: 2,
+      maxGeneration: 2,
+      activeBackend: "fdb",
+      activeGeneration: 1,
+      phase: "DRAINING_TO_PG",
+      targetBackend: "pg",
+      targetGeneration: 2,
+      transitionOperationId: "winner",
+    });
+    const discover = vi.fn().mockResolvedValue("pg");
+    const store = storeMock({
+      inspectState: vi.fn().mockResolvedValue(winner),
+    });
+
+    await expect(
+      recoverLegacyTeamState(store, "team", discover),
+    ).resolves.toEqual(winner);
+    expect(discover).not.toHaveBeenCalled();
+    expect(store.initializeLegacyTeam).not.toHaveBeenCalled();
+    expect(store.beginTransition).not.toHaveBeenCalled();
+    expect(store.cancelTransition).not.toHaveBeenCalled();
+  });
+
   test("flag changes begin with stable operation IDs and fail admission retryably", async () => {
     const current = state();
     const store = storeMock({
@@ -100,7 +185,7 @@ describe("durable team state decisions", () => {
     });
 
     await expect(
-      reconcileDesiredTeamBackend(store, "team", "fdb"),
+      reconcileDesiredTeamBackend(store, "team", "fdb", async () => "pg"),
     ).rejects.toMatchObject({
       code: "NUQ_MIGRATION_IN_PROGRESS",
       retryable: true,
@@ -132,13 +217,66 @@ describe("durable team state decisions", () => {
     });
 
     await expect(
-      reconcileDesiredTeamBackend(store, "team", "pg"),
+      reconcileDesiredTeamBackend(store, "team", "pg", async () => "pg"),
     ).resolves.toEqual(cancelled);
     expect(store.cancelTransition).toHaveBeenCalledWith({
       teamId: "team",
       transitionOperationId: "stable-transition",
       expectedRevision: 2,
     });
+  });
+});
+
+describe("legacy team authority discovery", () => {
+  test("crawl-finished-only FDB residue is not classified empty", () => {
+    expect(
+      hasLegacyFdbTeamResidue({
+        scrapePending: 0,
+        scrapeActive: 0,
+        crawlFinishedPending: 0,
+        crawlFinishedActive: 0,
+        crawlFinishedIndexedLive: true,
+        activeGroups: 0,
+      }),
+    ).toBe(true);
+  });
+
+  test("FDB residue recovers FDB authority instead of defaulting to PG", async () => {
+    await expect(
+      discoverLegacyTeamBackend({
+        teamId: "team",
+        probeFdbResidue: vi.fn().mockResolvedValue(true),
+        probePgResidue: vi.fn().mockResolvedValue(false),
+        emptyBackend: "pg",
+      }),
+    ).resolves.toBe("fdb");
+  });
+
+  test("both-present is corruption", async () => {
+    await expect(
+      discoverLegacyTeamBackend({
+        teamId: "team",
+        probeFdbResidue: vi.fn().mockResolvedValue(true),
+        probePgResidue: vi.fn().mockResolvedValue(true),
+        emptyBackend: "pg",
+      }),
+    ).rejects.toMatchObject({ code: "NUQ_ROUTER_BOTH_BACKENDS_PRESENT" });
+  });
+
+  test("FDB unavailability is retryable and never probes PG", async () => {
+    const probePgResidue = vi.fn().mockResolvedValue(true);
+    await expect(
+      discoverLegacyTeamBackend({
+        teamId: "team",
+        probeFdbResidue: vi.fn().mockRejectedValue(new Error("FDB down")),
+        probePgResidue,
+        emptyBackend: "pg",
+      }),
+    ).rejects.toMatchObject({
+      code: "NUQ_ROUTER_FDB_UNAVAILABLE",
+      retryable: true,
+    });
+    expect(probePgResidue).not.toHaveBeenCalled();
   });
 });
 
@@ -242,6 +380,47 @@ test("PG residue reconciliation changes only the durable seal fence", async () =
     residue: { intent_unresolved: 0 },
   });
   expect(store.finalSeal).not.toHaveBeenCalled();
+});
+
+test("PG residue fence explicitly adopts the draining source generation", async () => {
+  const adopted = pin("pg-residue/team", {
+    kind: "cross_store_intent",
+    admission: "legacy-backfill",
+  });
+  const store = storeMock({
+    inspectPin: vi.fn().mockResolvedValue(null),
+    inspectState: vi.fn().mockResolvedValue(
+      state({
+        revision: 2,
+        maxGeneration: 2,
+        phase: "DRAINING_TO_FDB",
+        targetBackend: "fdb",
+        targetGeneration: 2,
+        transitionOperationId: "transition",
+      }),
+    ),
+    preparePinnedObject: vi.fn().mockResolvedValue(adopted),
+  });
+
+  await expect(
+    reconcilePgResidueFence(store, {
+      teamId: "team",
+      total: 4,
+      observationId: "recovery",
+    }),
+  ).resolves.toEqual(adopted);
+  expect(store.preparePinnedObject).toHaveBeenCalledWith({
+    teamId: "team",
+    kind: "cross_store_intent",
+    objectId: "pg-residue/team",
+    admission: {
+      type: "legacy-backfill",
+      backend: "pg",
+      generation: 1,
+    },
+    requiredBackend: "pg",
+    residue: { intent_unresolved: 1 },
+  });
 });
 
 test("PG publication adapter prepares and resolves every intent exact-once", async () => {

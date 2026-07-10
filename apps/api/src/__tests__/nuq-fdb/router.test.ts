@@ -36,7 +36,10 @@ import {
   reserveExternalSlot,
 } from "../../services/worker/nuq-router";
 import { waitForJob as waitForQueuedJob } from "../../services/queue-jobs";
-import { scrapeQueueFdb } from "../../services/worker/nuq-fdb";
+import {
+  crawlFinishedQueueFdb,
+  scrapeQueueFdb,
+} from "../../services/worker/nuq-fdb";
 import {
   getNuqFdbDatabase,
   getFdb,
@@ -398,6 +401,12 @@ describeIf("NuQ router (forced FDB mode)", () => {
     const listing = await scrapeQueue.getCrawlJobsForListing(gid, 10, 0);
     expect(listing.map(j => j.id)).toEqual([jobId]);
 
+    // The emitted ungated crawl_finished job is visible to legacy authority
+    // recovery even though it does not touch team gate counters.
+    await expect(
+      crawlFinishedQueueFdb.hasReadyOrActiveJobForOwner(teamId),
+    ).resolves.toBe(true);
+
     // the emitted crawl_finished job is consumable through the router
     let fin: any = null;
     for (let i = 0; i < 10 && !fin; i++) {
@@ -410,6 +419,9 @@ describeIf("NuQ router (forced FDB mode)", () => {
     expect(await crawlFinishedQueue.jobFinish(fin.id, fin.lock!, null)).toBe(
       true,
     );
+    await expect(
+      crawlFinishedQueueFdb.hasReadyOrActiveJobForOwner(teamId),
+    ).resolves.toBe(false);
 
     // cancel on an already-completed group is a no-op
     expect(await crawlGroup.cancelGroup(gid)).toBe(false);

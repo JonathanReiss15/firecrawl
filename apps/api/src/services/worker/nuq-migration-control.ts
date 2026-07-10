@@ -25,6 +25,7 @@ export interface NuQMigrationStorePort {
     teamId: string,
     backend: MigrationBackend,
     operationId: string,
+    options?: { ifAbsent?: boolean },
   ): Promise<MigrationTeamState>;
   beginTransition(input: {
     teamId: string;
@@ -133,8 +134,50 @@ export class NuQRouterObjectNotFoundError extends NuQRouterError {
 
 export type BackendMarker = MigrationBackend | "corrupt" | null;
 
-export function stableLegacyInitializationOperationId(teamId: string): string {
-  return `nuq-router/v1/team/${teamId}/initialize/pg`;
+export function hasLegacyFdbTeamResidue(input: {
+  scrapePending: number;
+  scrapeActive: number;
+  crawlFinishedPending: number;
+  crawlFinishedActive: number;
+  crawlFinishedIndexedLive: boolean;
+  activeGroups: number;
+}): boolean {
+  return Object.values(input).some(value =>
+    typeof value === "boolean" ? value : value > 0,
+  );
+}
+
+/**
+ * Discover legacy team authority before initializing durable state. FDB must
+ * be probed first: its unavailability is retryable and must never be re-read as
+ * an empty result that falls through to PG.
+ */
+export async function discoverLegacyTeamBackend(input: {
+  teamId: string;
+  probeFdbResidue: () => Promise<boolean>;
+  probePgResidue: () => Promise<boolean>;
+  emptyBackend: MigrationBackend;
+}): Promise<MigrationBackend> {
+  let fdbPresent: boolean;
+  try {
+    fdbPresent = await input.probeFdbResidue();
+  } catch (error) {
+    throw new NuQRouterBackendUnavailableError("team", input.teamId, error);
+  }
+  const pgPresent = await input.probePgResidue();
+  if (fdbPresent && pgPresent) {
+    throw new NuQRouterBothBackendsError("team", input.teamId);
+  }
+  if (fdbPresent) return "fdb";
+  if (pgPresent) return "pg";
+  return input.emptyBackend;
+}
+
+export function stableLegacyInitializationOperationId(
+  teamId: string,
+  backend: MigrationBackend,
+): string {
+  return `nuq-router/v1/team/${teamId}/initialize/${backend}`;
 }
 
 export function stableTransitionOperationId(
@@ -142,6 +185,24 @@ export function stableTransitionOperationId(
   targetBackend: MigrationBackend,
 ): string {
   return `nuq-router/v1/team/${state.teamId}/after-generation/${state.maxGeneration}/to/${targetBackend}`;
+}
+
+export async function recoverLegacyTeamState(
+  store: NuQMigrationStorePort,
+  teamId: string,
+  discoverLegacyBackend: () => Promise<MigrationBackend>,
+): Promise<MigrationTeamState> {
+  const existing = await store.inspectState(teamId);
+  if (existing) return existing;
+  const legacyBackend = await discoverLegacyBackend();
+  // A concurrent initializer wins authoritatively. `ifAbsent` returns its
+  // state instead of interpreting stale discovery as a rollout request.
+  return await store.initializeLegacyTeam(
+    teamId,
+    legacyBackend,
+    stableLegacyInitializationOperationId(teamId, legacyBackend),
+    { ifAbsent: true },
+  );
 }
 
 /**
@@ -153,23 +214,14 @@ export async function reconcileDesiredTeamBackend(
   store: NuQMigrationStorePort,
   teamId: string,
   desiredBackend: MigrationBackend,
+  discoverLegacyBackend: () => Promise<MigrationBackend>,
 ): Promise<MigrationTeamState> {
   let resolution = await store.resolveSteady(teamId, desiredBackend);
   if (resolution.status === "legacy-uninitialized") {
-    await store.initializeLegacyTeam(
-      teamId,
-      "pg",
-      stableLegacyInitializationOperationId(teamId),
-    );
-    resolution = await store.resolveSteady(teamId, desiredBackend);
-  }
-
-  if (resolution.status === "legacy-uninitialized") {
-    throw new NuQRouterError(
-      "NUQ_MIGRATION_INITIALIZATION_NOT_VISIBLE",
-      `team ${teamId} initialization did not become visible`,
-      true,
-    );
+    // This invocation had no durable state when it began. Return whichever
+    // initialization won; do not reinterpret stale discovery/the flag as a
+    // begin/cancel request against a concurrent winner.
+    return await recoverLegacyTeamState(store, teamId, discoverLegacyBackend);
   }
   if (resolution.status === "steady") return resolution.state;
   if (resolution.status === "cancel-required") {
@@ -405,11 +457,26 @@ export async function reconcilePgResidueFence(
   const objectId = pgResidueFenceObjectId(input.teamId);
   let pin = await store.inspectPin("cross_store_intent", objectId);
   if (!pin) {
+    const state = await store.inspectState(input.teamId);
+    if (!state || state.activeBackend !== "pg") {
+      throw new NuQRouterError(
+        "NUQ_MIGRATION_PG_SOURCE_NOT_ACTIVE",
+        `team ${input.teamId} has no active PG generation for residue adoption`,
+      );
+    }
     pin = await store.preparePinnedObject({
       teamId: input.teamId,
       kind: "cross_store_intent",
       objectId,
-      admission: { type: "new-root" },
+      admission:
+        state.phase === "DRAINING_TO_FDB"
+          ? {
+              type: "legacy-backfill",
+              backend: "pg",
+              generation: state.activeGeneration,
+            }
+          : { type: "new-root" },
+      requiredBackend: "pg",
       residue: { intent_unresolved: input.total === 0 ? 0 : 1 },
     });
     return pin;

@@ -937,6 +937,7 @@ export class NuqFdbMigrationStore {
     teamId: string,
     backend: MigrationBackend,
     operationId: string,
+    options?: { ifAbsent?: boolean },
   ): Promise<MigrationTeamState> {
     assertNonempty(teamId, "teamId");
     assertNonempty(operationId, "operationId");
@@ -959,7 +960,10 @@ export class NuqFdbMigrationStore {
         }
         return op.state;
       }
-      if (await this.readState(tn, teamId)) {
+      const existing = await this.readState(tn, teamId);
+      if (existing) {
+        await this.validateTopology(tn, existing);
+        if (options?.ifAbsent) return existing;
         throw new MigrationStoreError(
           "NUQ_MIGRATION_ALREADY_INITIALIZED",
           `team ${teamId} is already initialized`,

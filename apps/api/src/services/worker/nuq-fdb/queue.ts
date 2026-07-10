@@ -1932,6 +1932,45 @@ export class NuQFdbQueue<JobData = any, JobReturnValue = any> {
 
   // === Introspection used by status/admin endpoints
 
+  // Recovery-only probe for ungated queues (notably crawl_finished). The
+  // migration integration replaces this legacy scan with owner-generation
+  // indexes before enabling cutover.
+  public async hasReadyOrActiveJobForOwner(ownerId: string): Promise<boolean> {
+    const owner = normalizeOwnerId(ownerId);
+    if (owner === null) return false;
+    return await this.db.doTn(async tn => {
+      const snapshot = tn.snapshot();
+      const ready = await Promise.all(
+        Array.from({ length: READY_SHARDS }, (_, shard) => {
+          const range = this.ks.readyShardRange(shard);
+          return snapshot.getRangeAll(range.begin, range.end);
+        }),
+      );
+      if (
+        ready.some(rows =>
+          rows.some(
+            ([, value]) => decodeJson<QueueEntry>(value as Buffer)?.o === owner,
+          ),
+        )
+      ) {
+        return true;
+      }
+      const leaseRange = this.ks.leaseRange();
+      const leases = await snapshot.getRangeAll(
+        leaseRange.begin,
+        leaseRange.end,
+      );
+      for (const [key] of leases) {
+        const id = this.ks.unpackId(key as Buffer);
+        const meta = decodeJson<JobMeta>(
+          await snapshot.get(this.ks.jobMeta(id)),
+        );
+        if (meta?.o === owner) return true;
+      }
+      return false;
+    });
+  }
+
   public async getTeamActiveCount(teamId: string): Promise<number> {
     const owner = normalizeOwnerId(teamId);
     if (owner === null) return 0;

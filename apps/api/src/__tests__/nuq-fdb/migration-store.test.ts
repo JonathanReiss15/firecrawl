@@ -93,6 +93,11 @@ describeIf("NuQ global FDB migration control plane", () => {
     await expect(
       store.initializeLegacyTeam(teamId, "pg", operationId),
     ).resolves.toEqual(initialized);
+    await expect(
+      store.initializeLegacyTeam(teamId, "fdb", randomUUID(), {
+        ifAbsent: true,
+      }),
+    ).resolves.toEqual(initialized);
     await expect(store.resolveSteady(teamId, "pg")).resolves.toMatchObject({
       status: "steady",
     });
