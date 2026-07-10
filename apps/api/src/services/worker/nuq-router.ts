@@ -31,6 +31,7 @@ import {
   crawlFinishedQueueFdb,
   crawlGroupFdb,
   externalSlotsFdb,
+  externalSlotMigrationObjectId,
   isFdbConfigured,
   nuqFdbHealthCheck,
   withFdbTimeout,
@@ -690,8 +691,9 @@ async function inspectOrRecoverExternalSlotPin(
   holderId: string,
 ): Promise<MigrationObjectPin | null> {
   if (!fdbQueueEnabled() || fdbForced()) return null;
+  const pinId = externalSlotMigrationObjectId(teamId, holderId);
   const existing = await optionalFdbRead(() =>
-    nuqFdbMigrationStore.inspectPin("external_holder", holderId),
+    nuqFdbMigrationStore.inspectPin("external_holder", pinId),
   );
   if (existing) return existing;
 
@@ -724,7 +726,7 @@ async function inspectOrRecoverExternalSlotPin(
     nuqFdbMigrationStore.preparePinnedObject({
       teamId,
       kind: "external_holder",
-      objectId: holderId,
+      objectId: pinId,
       admission: {
         type: "legacy-backfill",
         backend,
@@ -748,7 +750,7 @@ async function acquireExternalSlot(
     (await prepareRoutingPin({
       teamId,
       kind: "external_holder",
-      objectId: holderId,
+      objectId: externalSlotMigrationObjectId(teamId, holderId),
     }));
   const backend = pin?.backend ?? (await authoritativeTeamBackend(teamId));
   if (backend === "fdb") {

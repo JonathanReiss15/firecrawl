@@ -40,6 +40,14 @@ export type ExternalSlotSweepObserver = (
 const EXTERNAL_SWEEP_BATCH = 100;
 const EXTERNAL_SWEEP_BUDGET_MS = 5_000;
 
+// Holder IDs are tenant-local; migration pins live in a global object keyspace.
+export function externalSlotMigrationObjectId(
+  teamId: string,
+  holderId: string,
+): string {
+  return `${teamId}/${holderId}`;
+}
+
 export class NuqFdbExternalSlots {
   constructor(public readonly ks: NuqFdbKeyspace) {}
 
@@ -106,7 +114,7 @@ export class NuqFdbExternalSlots {
         ? await nuqFdbMigrationStore.reconcileManagedObjectInTxn(tn, {
             teamId: owner,
             kind: "external_holder",
-            objectId: holderId,
+            objectId: externalSlotMigrationObjectId(owner, holderId),
             recordPin: runtimeMigrationPin(existing),
             residue: { capacity_external_holders: 1 },
           })
@@ -131,7 +139,7 @@ export class NuqFdbExternalSlots {
         : await nuqFdbMigrationStore.reconcileManagedObjectInTxn(tn, {
             teamId: owner,
             kind: "external_holder",
-            objectId: holderId,
+            objectId: externalSlotMigrationObjectId(owner, holderId),
             allowMissingRecordPin: true,
             residue: { capacity_external_holders: 1 },
           });
@@ -174,7 +182,7 @@ export class NuqFdbExternalSlots {
     await nuqFdbMigrationStore.reconcileManagedObjectInTxn(tn, {
       teamId: owner,
       kind: "external_holder",
-      objectId: holderId,
+      objectId: externalSlotMigrationObjectId(owner, holderId),
       recordPin: runtimeMigrationPin(existing),
       residue: {},
       terminal: true,

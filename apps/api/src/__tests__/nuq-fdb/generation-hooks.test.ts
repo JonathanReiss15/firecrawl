@@ -2,6 +2,7 @@ import { randomUUID } from "crypto";
 import { config } from "../../config";
 import {
   MIGRATION_RESIDUE_COUNTERS,
+  externalSlotMigrationObjectId,
   NuQFdbJobGroup,
   NuQFdbQueue,
   NuqFdbExternalSlots,
@@ -169,8 +170,9 @@ describeIf("NuQ FDB transaction-scoped migration generation hooks", () => {
     });
 
     await slots.acquire(teamId, holderId, 120_000);
+    const externalObjectId = externalSlotMigrationObjectId(teamId, holderId);
     await expect(
-      store.inspectPin("external_holder", holderId),
+      store.inspectPin("external_holder", externalObjectId),
     ).resolves.toMatchObject({
       admission: "legacy-backfill",
       lifecycle: "active",
@@ -178,7 +180,7 @@ describeIf("NuQ FDB transaction-scoped migration generation hooks", () => {
     });
     await slots.release(teamId, holderId);
     await expect(
-      store.inspectPin("external_holder", holderId),
+      store.inspectPin("external_holder", externalObjectId),
     ).resolves.toMatchObject({ lifecycle: "terminal" });
   });
 
@@ -326,17 +328,18 @@ describeIf("NuQ FDB transaction-scoped migration generation hooks", () => {
   test("external holders and group/crawl_finished controls are exact", async () => {
     const teamId = await managedTeam();
     const holderId = randomUUID();
+    const externalObjectId = externalSlotMigrationObjectId(teamId, holderId);
     await store.preparePinnedObject({
       teamId,
       kind: "external_holder",
-      objectId: holderId,
+      objectId: externalObjectId,
       admission: { type: "new-root" },
       requiredBackend: "fdb",
       residue: { intent_unresolved: 1 },
     });
     await slots.acquire(teamId, holderId, 60_000);
     await expect(
-      store.inspectPin("external_holder", holderId),
+      store.inspectPin("external_holder", externalObjectId),
     ).resolves.toMatchObject({ lifecycle: "active" });
     expect(await residue(teamId)).toMatchObject({
       capacity_external_holders: 1,
@@ -454,7 +457,7 @@ describeIf("NuQ FDB transaction-scoped migration generation hooks", () => {
     await store.preparePinnedObject({
       teamId: externalTeam,
       kind: "external_holder",
-      objectId: holderId,
+      objectId: externalSlotMigrationObjectId(externalTeam, holderId),
       admission: { type: "new-root" },
       requiredBackend: "fdb",
       residue: { intent_unresolved: 1 },

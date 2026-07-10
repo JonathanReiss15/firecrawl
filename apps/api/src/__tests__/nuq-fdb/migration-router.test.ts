@@ -49,6 +49,7 @@ import {
 import {
   crawlFinishedQueueFdb,
   crawlGroupFdb,
+  externalSlotMigrationObjectId,
   externalSlotsFdb,
   nuqFdbMigrationStore,
   scrapeQueueFdb,
@@ -261,8 +262,9 @@ describeIf("NuQ durable migration router", () => {
     await getRedisConnection().zrem(`limit:${teamId}`, holderId);
 
     await mirrorExternalSlotAcquire(teamId, holderId, 120_000);
+    const externalObjectId = externalSlotMigrationObjectId(teamId, holderId);
     await expect(
-      nuqFdbMigrationStore.inspectPin("external_holder", holderId),
+      nuqFdbMigrationStore.inspectPin("external_holder", externalObjectId),
     ).resolves.toMatchObject({
       admission: "legacy-backfill",
       backend: "fdb",
@@ -272,7 +274,7 @@ describeIf("NuQ durable migration router", () => {
     await mirrorExternalSlotRelease(teamId, holderId);
     await expect(externalSlotsFdb.has(teamId, holderId)).resolves.toBe(false);
     await expect(
-      nuqFdbMigrationStore.inspectPin("external_holder", holderId),
+      nuqFdbMigrationStore.inspectPin("external_holder", externalObjectId),
     ).resolves.toMatchObject({ lifecycle: "terminal" });
   });
 

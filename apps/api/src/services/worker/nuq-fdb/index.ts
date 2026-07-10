@@ -25,7 +25,7 @@ export type {
 export { NuQFdbJobGroup } from "./groups";
 export type { NuQFdbJobGroupInstance, NuQFdbGroupStatus } from "./groups";
 export { NuqFdbSweeper } from "./sweeper";
-export { NuqFdbExternalSlots } from "./slots";
+export { NuqFdbExternalSlots, externalSlotMigrationObjectId } from "./slots";
 export { isFdbConfigured, nuqFdbHealthCheck, withFdbTimeout } from "./client";
 export {
   MIGRATION_RESIDUE_COUNTERS,
