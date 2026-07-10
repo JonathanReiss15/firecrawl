@@ -1,7 +1,11 @@
 import { afterEach, describe, expect, test, vi } from "vitest";
 import { encodeI64, METRIC_SHARDS } from "./keyspace";
 import { crawlFinishedQueueFdb, nuqFdbGetMetrics, scrapeQueueFdb } from ".";
-import { NuQFdbQueue } from "./queue";
+import { NuQFdbQueue, NuqFdbMetricsInitializingError } from "./queue";
+
+const READINESS = `# HELP firecrawl_nuq_fdb_metrics_ready Whether maintained FDB queue metrics are fully initialized
+# TYPE firecrawl_nuq_fdb_metrics_ready gauge
+`;
 
 const SCRAPE_METRICS = `# HELP nuq_fdb_queue_scrape_job_count Number of FDB jobs in each status
 # TYPE nuq_fdb_queue_scrape_job_count gauge
@@ -32,8 +36,11 @@ describe("NuQ FDB metrics", () => {
     let initialized = true;
     const get = vi.fn(async (key: Buffer) => {
       const [, , family, status, shard] = queue.ks.unpack(key);
-      if (family === "mn-backfill" && status === "done") {
-        return initialized ? Buffer.alloc(0) : undefined;
+      if (
+        family === "mn-backfill" &&
+        (status === "active-v2" || status === "done")
+      ) {
+        return initialized ? Buffer.from("generation") : undefined;
       }
       if (family !== "mn" || shard !== 0) return undefined;
       if (status === "queued") return encodeI64(2);
@@ -57,7 +64,7 @@ describe("NuQ FDB metrics", () => {
     });
 
     expect(await queue.getMetrics()).toBe(SCRAPE_METRICS);
-    expect(get).toHaveBeenCalledTimes(3 * METRIC_SHARDS + 1);
+    expect(get).toHaveBeenCalledTimes(3 * METRIC_SHARDS + 2);
     expect(getRangeAll).not.toHaveBeenCalled();
 
     get.mockClear();
@@ -65,7 +72,7 @@ describe("NuQ FDB metrics", () => {
     queueCardinality = 1_000_000;
 
     expect(await queue.getMetrics()).toBe(SCRAPE_METRICS);
-    expect(get).toHaveBeenCalledTimes(3 * METRIC_SHARDS + 1);
+    expect(get).toHaveBeenCalledTimes(3 * METRIC_SHARDS + 2);
     expect(getRangeAll).not.toHaveBeenCalled();
 
     get.mockClear();
@@ -73,7 +80,7 @@ describe("NuQ FDB metrics", () => {
     await expect(queue.getMetrics()).rejects.toThrow(
       "NuQ FDB metrics are initializing",
     );
-    expect(get).toHaveBeenCalledTimes(3 * METRIC_SHARDS + 1);
+    expect(get).toHaveBeenCalledTimes(3 * METRIC_SHARDS + 2);
     expect(getRangeAll).not.toHaveBeenCalled();
   });
 
@@ -85,9 +92,24 @@ describe("NuQ FDB metrics", () => {
     vi.spyOn(scrapeQueueFdb, "getWorkerLoadCount").mockResolvedValue(5);
 
     await expect(nuqFdbGetMetrics()).resolves
-      .toBe(`${SCRAPE_METRICS}${CRAWL_FINISHED_METRICS}# HELP firecrawl_nuq_fdb_pending_jobs Number of FDB scrape jobs currently admitted to workers or waiting in ready shards
+      .toBe(`${READINESS}firecrawl_nuq_fdb_metrics_ready 1
+${SCRAPE_METRICS}${CRAWL_FINISHED_METRICS}# HELP firecrawl_nuq_fdb_pending_jobs Number of FDB scrape jobs currently admitted to workers or waiting in ready shards
 # TYPE firecrawl_nuq_fdb_pending_jobs gauge
 firecrawl_nuq_fdb_pending_jobs 5
 `);
+  });
+
+  test("exported collector remains scrapeable while counters initialize", async () => {
+    vi.spyOn(scrapeQueueFdb, "getMetrics").mockRejectedValue(
+      new NuqFdbMetricsInitializingError("initializing"),
+    );
+    vi.spyOn(crawlFinishedQueueFdb, "getMetrics").mockResolvedValue(
+      CRAWL_FINISHED_METRICS,
+    );
+    vi.spyOn(scrapeQueueFdb, "getWorkerLoadCount").mockResolvedValue(5);
+
+    await expect(nuqFdbGetMetrics()).resolves.toBe(
+      `${READINESS}firecrawl_nuq_fdb_metrics_ready 0\n`,
+    );
   });
 });

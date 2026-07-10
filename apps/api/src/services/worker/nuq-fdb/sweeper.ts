@@ -1,6 +1,7 @@
 import { randomUUID } from "crypto";
 import { Logger } from "winston";
 import { logger as _logger } from "../../../lib/logger";
+import { config } from "../../../config";
 import { getNuqFdbDatabase } from "./client";
 import {
   NuqFdbKeyspace,
@@ -165,7 +166,7 @@ export class NuqFdbSweeper {
   public async sweepOnce(logger: Logger = _logger): Promise<void> {
     const now = Date.now();
     for (const queue of this.queues) {
-      await queue.backfillMetricCounts();
+      await queue.backfillMetricCounts(100, config.NUQ_FDB_METRICS_V2_ACTIVATE);
       await this.sweepLeases(queue, now, logger);
       await this.sweepBacklogTimeouts(queue, now, logger);
       await this.sweepDelayed(queue, now, logger);

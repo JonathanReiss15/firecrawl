@@ -373,6 +373,9 @@ export class NuqFdbKeyspace {
   metricStatusRange(status: string) {
     return this.packRange(["mn", status]);
   }
+  metricBackfillActive(): Buffer {
+    return this.pack(["mn-backfill", "active-v2"]);
+  }
   metricBackfillCursor(): Buffer {
     return this.pack(["mn-backfill", "cursor"]);
   }

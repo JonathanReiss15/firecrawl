@@ -24,7 +24,7 @@ import {
   setStatusQueued,
   setGroupJobIndex,
   bumpGroupStatusCount,
-  bumpQueueStatus,
+  enrollQueueStatus,
 } from "./ops";
 
 export type NuQFdbGroupStatus = "active" | "completed" | "cancelled";
@@ -122,7 +122,6 @@ export class NuqFdbGroupOps {
       const fid = randomUUID();
       const meta: JobMeta = { c: now, p: 0, o: gMeta.o, g: gid, f: 0, dc: 1 };
       tn.set(this.finishedKs.jobMeta(fid), encodeJson(meta));
-      tn.set(this.finishedKs.jobMetricTracked(fid), EMPTY);
       tn.set(this.finishedKs.jobData(fid, 0), encodeJson({}));
       const entry: QueueEntry = {
         i: fid,
@@ -134,7 +133,7 @@ export class NuqFdbGroupOps {
       };
       pushReady(tn, this.finishedKs, entry, txc);
       setStatusQueued(tn, this.finishedKs, fid);
-      await bumpQueueStatus(tn, this.finishedKs, fid, "queued", 1);
+      await enrollQueueStatus(tn, this.finishedKs, fid, "queued");
       // pointer for group TTL cleanup to find the finished job's records
       tn.set(this.ks.groupFinishedJob(gid), Buffer.from(fid, "utf8"));
     }

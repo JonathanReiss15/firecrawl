@@ -47,6 +47,8 @@ async function makeCtx(
     ...overrides,
   });
   const finishedQueue = new NuQFdbQueue(finishedName, { hasGroups: false });
+  await queue.backfillMetricCounts(100, true);
+  await finishedQueue.backfillMetricCounts(100, true);
   const group = new NuQFdbJobGroup(queue.ks, queue.groupOps!);
   const sweeper = new NuqFdbSweeper([queue, finishedQueue]);
   return { queue, finishedQueue, group, sweeper };

@@ -56,6 +56,24 @@ export function setTeamActive(
   else tn.set(ks.teamActiveIndex(teamId), EMPTY);
 }
 
+export async function enrollQueueStatus(
+  tn: Transaction,
+  ks: NuqFdbKeyspace,
+  id: string,
+  status: "pending" | "queued" | "active",
+): Promise<void> {
+  // Activation is an explicit second rollout after all pre-membership writers
+  // have drained. Compatibility-version writers observe this shared key even
+  // when their local activation flag remains off.
+  const generation = await tn.get(ks.metricBackfillActive());
+  if (!generation) return;
+  const membership = await tn.get(ks.jobMetricTracked(id));
+  if (membership && (membership as Buffer).equals(generation as Buffer)) return;
+  tn.set(ks.jobMetricTracked(id), generation as Buffer);
+  const shard = fnv1a(id) % METRIC_SHARDS;
+  tn.add(ks.metricCount(status, shard), ONE);
+}
+
 export async function bumpQueueStatus(
   tn: Transaction,
   ks: NuqFdbKeyspace,
@@ -63,10 +81,14 @@ export async function bumpQueueStatus(
   status: "pending" | "queued" | "active",
   delta: 1 | -1,
 ): Promise<void> {
-  // Counters were introduced after the queue keyspace. Legacy jobs are
-  // enrolled by the durable sweeper backfill; until then their transitions
-  // must not create negative counter debt.
-  if (!(await tn.get(ks.jobMetricTracked(id)))) return;
+  // Legacy jobs are enrolled by the durable sweeper backfill. Until then their
+  // transitions must not create negative counter debt.
+  const generation = await tn.get(ks.metricBackfillActive());
+  if (!generation) return;
+  const membership = await tn.get(ks.jobMetricTracked(id));
+  if (!membership || !(membership as Buffer).equals(generation as Buffer)) {
+    return;
+  }
   const shard = fnv1a(id) % METRIC_SHARDS;
   tn.add(ks.metricCount(status, shard), delta === 1 ? ONE : MINUS_ONE);
 }

@@ -1,11 +1,21 @@
 import type { ScrapeJobData } from "../../../types";
-import { NuQFdbQueue, QueueFullError, normalizeOwnerId } from "./queue";
+import {
+  NuQFdbQueue,
+  QueueFullError,
+  normalizeOwnerId,
+  NuqFdbMetricsInitializingError,
+} from "./queue";
 import { NuQFdbJobGroup } from "./groups";
 import { NuqFdbSweeper } from "./sweeper";
 import { NuqFdbExternalSlots } from "./slots";
 import { isFdbConfigured, nuqFdbHealthCheck, withFdbTimeout } from "./client";
 
-export { NuQFdbQueue, QueueFullError, normalizeOwnerId } from "./queue";
+export {
+  NuQFdbQueue,
+  QueueFullError,
+  normalizeOwnerId,
+  NuqFdbMetricsInitializingError,
+} from "./queue";
 export type {
   NuQFdbJob,
   NuQFdbJobOptions,
@@ -38,17 +48,29 @@ export const crawlGroupFdb = new NuQFdbJobGroup(
 export const externalSlotsFdb = new NuqFdbExternalSlots(scrapeQueueFdb.ks);
 
 export async function nuqFdbGetMetrics(): Promise<string> {
-  const [scrapeQueueMetrics, crawlFinishedQueueMetrics, workerLoad] =
-    await Promise.all([
-      scrapeQueueFdb.getMetrics(),
-      crawlFinishedQueueFdb.getMetrics(),
-      scrapeQueueFdb.getWorkerLoadCount(),
-    ]);
+  const readiness = `# HELP firecrawl_nuq_fdb_metrics_ready Whether maintained FDB queue metrics are fully initialized
+# TYPE firecrawl_nuq_fdb_metrics_ready gauge
+`;
+  try {
+    const [scrapeQueueMetrics, crawlFinishedQueueMetrics, workerLoad] =
+      await Promise.all([
+        scrapeQueueFdb.getMetrics(),
+        crawlFinishedQueueFdb.getMetrics(),
+        scrapeQueueFdb.getWorkerLoadCount(),
+      ]);
 
-  return `${scrapeQueueMetrics}${crawlFinishedQueueMetrics}# HELP firecrawl_nuq_fdb_pending_jobs Number of FDB scrape jobs currently admitted to workers or waiting in ready shards
+    return `${readiness}firecrawl_nuq_fdb_metrics_ready 1
+${scrapeQueueMetrics}${crawlFinishedQueueMetrics}# HELP firecrawl_nuq_fdb_pending_jobs Number of FDB scrape jobs currently admitted to workers or waiting in ready shards
 # TYPE firecrawl_nuq_fdb_pending_jobs gauge
 firecrawl_nuq_fdb_pending_jobs ${workerLoad}
 `;
+  } catch (error) {
+    if (error instanceof NuqFdbMetricsInitializingError) {
+      return `${readiness}firecrawl_nuq_fdb_metrics_ready 0
+`;
+    }
+    throw error;
+  }
 }
 
 let sweeper: NuqFdbSweeper | null = null;
