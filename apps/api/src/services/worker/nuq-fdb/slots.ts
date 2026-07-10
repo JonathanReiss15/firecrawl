@@ -24,6 +24,9 @@ type ExternalSlotRecord = {
 };
 
 export type ExternalSlotSweepGuard = (tn: Transaction) => Promise<void>;
+export type ExternalSlotSweepObserver = (
+  due: readonly [Buffer, Buffer][],
+) => void;
 
 const EXTERNAL_SWEEP_BATCH = 100;
 const EXTERNAL_SWEEP_BUDGET_MS = 5_000;
@@ -168,17 +171,19 @@ export class NuqFdbExternalSlots {
     now: number,
     bucket: number,
     guard?: ExternalSlotSweepGuard,
+    observeDue?: ExternalSlotSweepObserver,
   ): Promise<number> {
     const startedAt = Date.now();
     let processed = 0;
     while (Date.now() - startedAt < EXTERNAL_SWEEP_BUDGET_MS) {
       const r = this.expiryScanRange(bucket, now);
-      const due = await this.db.doTn(async tn => {
+      const due = (await this.db.doTn(async tn => {
         if (guard) await guard(tn);
         return await tn
           .snapshot()
           .getRangeAll(r.begin, r.end, { limit: EXTERNAL_SWEEP_BATCH });
-      });
+      })) as [Buffer, Buffer][];
+      observeDue?.(due);
       if (due.length === 0) break;
       for (const [key, value] of due) {
         const parts = this.ks.unpack(key as Buffer);

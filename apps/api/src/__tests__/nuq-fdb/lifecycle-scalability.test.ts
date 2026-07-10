@@ -1,4 +1,5 @@
 import { randomUUID } from "crypto";
+import { vi } from "vitest";
 import { config } from "../../config";
 import { logger } from "../../lib/logger";
 import {
@@ -55,6 +56,13 @@ const gate = (teamLimit: number) => ({
 
 function scrapeData() {
   return { mode: "single_urls", url: "https://example.com" };
+}
+
+function idInTimeBucket(bucket: number): string {
+  for (let i = 0; ; i++) {
+    const id = `bucket-${bucket}-${i}`;
+    if (timeBucket(id) === bucket) return id;
+  }
 }
 
 async function rescheduleGroupExpiry(
@@ -446,6 +454,89 @@ describeIf("NuQ FDB lifecycle scalability", () => {
       return true;
     });
     expect(oldCouldAcquire).toBe(false);
+  }, 30_000);
+
+  test("overdue metrics use observed scans and reset after the partition drains", async () => {
+    const { queue } = await makeCtx("overdue-metric");
+    const sweeper = new NuqFdbSweeper([queue]);
+    const dueAt = Date.now() - 5_000;
+    const id = idInTimeBucket(0);
+    await getNuqFdbDatabase().doTn(async tn => {
+      tn.set(
+        queue.ks.delayed(0, dueAt, id),
+        encodeJson({ i: id, o: "", p: 0, f: 0, c: dueAt }),
+      );
+    });
+
+    await sweeper.sweepOnce();
+    const line = sweeper
+      .getMetrics()
+      .split("\n")
+      .find(value =>
+        value.includes(
+          `queue="${queue.queueName}",index="delay",partition="0"`,
+        ),
+      );
+    expect(line).toBeDefined();
+    expect(Number(line!.split(" ")[1])).toBeGreaterThanOrEqual(5);
+
+    const db = getNuqFdbDatabase();
+    const doTn = vi.spyOn(db, "doTn");
+    const readsBeforeCollection = doTn.mock.calls.length;
+    sweeper.getMetrics();
+    expect(doTn.mock.calls).toHaveLength(readsBeforeCollection);
+    doTn.mockRestore();
+
+    await sweeper.sweepOnce();
+    expect(sweeper.getMetrics()).not.toContain(
+      `queue="${queue.queueName}",index="delay",partition="0"`,
+    );
+  }, 30_000);
+
+  test("an ownership transfer removes the previous sweeper's stale label", async () => {
+    const { queue } = await makeCtx("overdue-transfer");
+    const dueAt = Date.now() - 5_000;
+    const id = idInTimeBucket(0);
+    await getNuqFdbDatabase().doTn(async tn => {
+      tn.set(
+        queue.ks.delayed(0, dueAt, id),
+        encodeJson({ i: id, o: "", p: 0, f: 0, c: dueAt }),
+      );
+    });
+
+    const previous = new NuqFdbSweeper([queue], [], { lockTtlMs: 2_000 });
+    await previous.sweepOnce(logger, 3);
+    expect(previous.getMetrics()).toContain(
+      `queue="${queue.queueName}",index="delay",partition="0"`,
+    );
+    const ownershipKey = queue.ks.sweeperPartition("delay", 0);
+    const firstGeneration = await getNuqFdbDatabase().doTn(async tn =>
+      decodeJson<{ g: string; x: number }>(await tn.get(ownershipKey)),
+    );
+
+    while (Date.now() <= firstGeneration!.x) {
+      await new Promise(resolve => setTimeout(resolve, 25));
+    }
+    await getNuqFdbDatabase().doTn(async tn => {
+      // New overdue work arriving at transfer time must be exported only by
+      // the next owner; the expired owner's earlier sample must disappear.
+      tn.set(
+        queue.ks.delayed(0, dueAt, id),
+        encodeJson({ i: id, o: "", p: 0, f: 0, c: dueAt }),
+      );
+    });
+    const next = new NuqFdbSweeper([queue], [], { lockTtlMs: 2_000 });
+    await next.sweepOnce(logger, 3);
+    const nextGeneration = await getNuqFdbDatabase().doTn(async tn =>
+      decodeJson<{ g: string }>(await tn.get(ownershipKey)),
+    );
+    expect(nextGeneration?.g).not.toBe(firstGeneration?.g);
+    expect(previous.getMetrics()).not.toContain(
+      `queue="${queue.queueName}",index="delay",partition="0"`,
+    );
+    expect(next.getMetrics()).toContain(
+      `queue="${queue.queueName}",index="delay",partition="0"`,
+    );
   }, 30_000);
 
   test("partition leases fail over and multiple sweepers drain disjoint buckets", async () => {

@@ -86,6 +86,15 @@ type PartitionClaim = {
   phase: string;
   partition: number;
   generation: string;
+  expiresAt: number;
+};
+
+type OverdueObservation = {
+  queue: string;
+  index: string;
+  partition: number;
+  oldestDueAtMs: number;
+  ownershipExpiresAtMs: number;
 };
 
 type PartitionWork = {
@@ -106,6 +115,13 @@ type SweepLagStats = {
 
 function keyAfter(key: Buffer): Buffer {
   return Buffer.concat([key, Buffer.from([0])]);
+}
+
+function escapePrometheusLabel(value: string): string {
+  return value
+    .replace(/\\/g, "\\\\")
+    .replace(/\n/g, "\\n")
+    .replace(/"/g, '\\"');
 }
 
 function entryFromMeta(id: string, meta: JobMeta): QueueEntry {
@@ -139,7 +155,9 @@ export class NuqFdbSweeper {
   private readonly sweeperId = randomUUID();
   private loop: NodeJS.Timeout | null = null;
   private running = false;
+  private metricsEnabled = true;
   private partitionOffset = 0;
+  private readonly overdueObservations = new Map<string, OverdueObservation>();
   private readonly lockTtlMs: number;
   private readonly maxPartitionsPerTick: number;
 
@@ -164,7 +182,7 @@ export class NuqFdbSweeper {
     now: number = Date.now(),
   ): Promise<PartitionClaim | null> {
     const generation = randomUUID();
-    return await this.db.doTn(async tn => {
+    const claim = await this.db.doTn(async tn => {
       // During rolling deployment, defer to the old all-or-nothing owner until
       // its final lease expires; old and new protocols must not overlap.
       const legacyKey = this.queues[0].ks.legacySweeperLock();
@@ -192,20 +210,26 @@ export class NuqFdbSweeper {
       if (current && current.x > now && current.w !== this.sweeperId) {
         return null;
       }
+      const expiresAt = now + this.lockTtlMs;
       tn.set(
         key,
         encodeJson({
           w: this.sweeperId,
           g: generation,
-          x: now + this.lockTtlMs,
+          x: expiresAt,
         } satisfies OwnershipRecord),
       );
-      return { ks, phase, partition, generation };
+      return { ks, phase, partition, generation, expiresAt };
     });
+    // A new claim must be repopulated only by its own scan. A failed claim
+    // means another replica owns the partition, so this process must not keep
+    // exporting an observation from an earlier generation.
+    this.clearOverdueObservation(ks, phase, partition);
+    return claim;
   }
 
   private async renewClaim(claim: PartitionClaim): Promise<void> {
-    await this.db.doTn(async tn => {
+    const expiresAt = await this.db.doTn(async tn => {
       const key = claim.ks.sweeperPartition(claim.phase, claim.partition);
       const current = decodeJson<OwnershipRecord>(await tn.get(key));
       const legacyKey = this.queues[0].ks.legacySweeperLock();
@@ -233,7 +257,13 @@ export class NuqFdbSweeper {
           } satisfies LegacyOwnershipRecord),
         );
       }
+      return expiresAt;
     });
+    claim.expiresAt = expiresAt;
+    const observation = this.overdueObservations.get(
+      this.observationKey(claim.ks, claim.phase, claim.partition),
+    );
+    if (observation) observation.ownershipExpiresAtMs = expiresAt;
   }
 
   private async guardClaim(
@@ -484,7 +514,15 @@ export class NuqFdbSweeper {
           partition: bucket,
           run: async claim => {
             await this.renewClaim(claim);
-            await slots.sweepExpiredBucket(now, bucket, this.guard(claim));
+            await slots.sweepExpiredBucket(
+              now,
+              bucket,
+              this.guard(claim),
+              due =>
+                this.observeDue(claim, "external_expiry", due, key =>
+                  Number(claim.ks.unpack(key)[4]),
+                ),
+            );
           },
         });
       }
@@ -526,6 +564,7 @@ export class NuqFdbSweeper {
         await item.run(claim);
       } catch (error) {
         if (error instanceof OwnershipLostError) {
+          this.clearOverdueObservation(item.ks, item.phase, item.partition);
           logger.info("NuQ FDB sweeper partition ownership lost", {
             canonicalLog: "nuq-fdb/sweeper_ownership_lost",
             queueName: item.ks.queueName,
@@ -541,6 +580,7 @@ export class NuqFdbSweeper {
 
   public start(intervalMs: number = 1000, logger: Logger = _logger): void {
     if (this.loop) return;
+    this.metricsEnabled = true;
     this.loop = setInterval(async () => {
       if (this.running) return;
       this.running = true;
@@ -558,10 +598,85 @@ export class NuqFdbSweeper {
   }
 
   public stop(): void {
+    this.metricsEnabled = false;
+    this.overdueObservations.clear();
     if (this.loop) {
       clearInterval(this.loop);
       this.loop = null;
     }
+  }
+
+  private observationKey(
+    ks: NuqFdbKeyspace,
+    phase: string,
+    partition: number,
+  ): string {
+    return JSON.stringify([ks.queueName, phase, partition]);
+  }
+
+  private clearOverdueObservation(
+    ks: NuqFdbKeyspace,
+    phase: string,
+    partition: number,
+  ): void {
+    this.overdueObservations.delete(this.observationKey(ks, phase, partition));
+  }
+
+  private observeDue(
+    claim: PartitionClaim,
+    index: string,
+    due: readonly [unknown, unknown][],
+    dueAt: (key: Buffer) => number,
+  ): void {
+    const key = this.observationKey(claim.ks, claim.phase, claim.partition);
+    if (!this.metricsEnabled || due.length === 0) {
+      this.overdueObservations.delete(key);
+      return;
+    }
+    let oldestDueAtMs = Number.POSITIVE_INFINITY;
+    for (const [rawKey] of due) {
+      const value = dueAt(rawKey as Buffer);
+      if (Number.isFinite(value))
+        oldestDueAtMs = Math.min(oldestDueAtMs, value);
+    }
+    if (!Number.isFinite(oldestDueAtMs)) {
+      this.overdueObservations.delete(key);
+      return;
+    }
+    this.overdueObservations.set(key, {
+      queue: claim.ks.queueName,
+      index,
+      partition: claim.partition,
+      oldestDueAtMs,
+      ownershipExpiresAtMs: claim.expiresAt,
+    });
+  }
+
+  // Pure in-memory collector: scans populate observations while metrics
+  // collection performs no FoundationDB reads. Expired local claims are
+  // removed here so a stopped or partitioned pod cannot pin autoscaling.
+  public getMetrics(nowMs: number = Date.now()): string {
+    const rows: string[] = [];
+    const observations = [...this.overdueObservations.entries()].sort(
+      ([a], [b]) => a.localeCompare(b),
+    );
+    for (const [key, observation] of observations) {
+      if (!this.metricsEnabled || observation.ownershipExpiresAtMs <= nowMs) {
+        this.overdueObservations.delete(key);
+        continue;
+      }
+      const labels = `queue="${escapePrometheusLabel(observation.queue)}",index="${escapePrometheusLabel(observation.index)}",partition="${observation.partition}"`;
+      const seconds = Math.max(0, nowMs - observation.oldestDueAtMs) / 1000;
+      rows.push(
+        `firecrawl_nuq_fdb_sweeper_oldest_overdue_seconds{${labels}} ${seconds}`,
+      );
+    }
+    return [
+      "# HELP firecrawl_nuq_fdb_sweeper_oldest_overdue_seconds Age of the oldest overdue entry observed by an owned NuQ FDB sweeper partition",
+      "# TYPE firecrawl_nuq_fdb_sweeper_oldest_overdue_seconds gauge",
+      ...rows,
+      "",
+    ].join("\n");
   }
 
   private addLag(
@@ -629,6 +744,7 @@ export class NuqFdbSweeper {
     const stats = emptySweepLagStats();
     while (Date.now() - startedAt < PARTITION_WORK_BUDGET_MS) {
       const due = await this.dueBatch(claim, ks.leaseScanRange(bucket, now));
+      this.observeDue(claim, "lease", due, key => Number(ks.unpackId(key, 1)));
       this.addLag(stats, ks, due, now);
       if (due.length === 0) break;
       for (const [key, value] of due) {
@@ -731,6 +847,9 @@ export class NuqFdbSweeper {
         claim,
         ks.backlogTimeoutScanRange(bucket, now),
       );
+      this.observeDue(claim, "backlog_timeout", due, key =>
+        Number(ks.unpackId(key, 1)),
+      );
       this.addLag(stats, ks, due, now);
       if (due.length === 0) break;
       for (const [key] of due) {
@@ -798,6 +917,7 @@ export class NuqFdbSweeper {
     const stats = emptySweepLagStats();
     while (Date.now() - startedAt < PARTITION_WORK_BUDGET_MS) {
       const due = await this.dueBatch(claim, ks.delayedScanRange(bucket, now));
+      this.observeDue(claim, "delay", due, key => Number(ks.unpackId(key, 1)));
       this.addLag(stats, ks, due, now);
       if (due.length === 0) break;
       for (const [key, value] of due) {
@@ -1252,6 +1372,9 @@ export class NuqFdbSweeper {
         ks.jobExpiryScanRange(bucket, now),
         SWEEP_BATCH * 2,
       );
+      this.observeDue(claim, "job_expiry", due, key =>
+        Number(ks.unpackId(key, 1)),
+      );
       if (due.length === 0) break;
       await this.renewClaim(claim);
       await this.db.doTn(async tn => {
@@ -1287,6 +1410,12 @@ export class NuqFdbSweeper {
     const ks = queue.ks;
     while (Date.now() - startedAt < PARTITION_WORK_BUDGET_MS) {
       const due = await this.dueBatch(claim, range, 20);
+      this.observeDue(
+        claim,
+        legacy ? "legacy_group_expiry" : "group_expiry",
+        due,
+        key => Number(ks.unpack(key)[legacy ? 3 : 4]),
+      );
       if (due.length === 0) break;
       for (const [key] of due) {
         const parts = ks.unpack(key);
