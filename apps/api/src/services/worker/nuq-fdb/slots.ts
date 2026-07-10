@@ -75,6 +75,14 @@ export class NuqFdbExternalSlots {
     });
   }
 
+  public async has(teamId: string, holderId: string): Promise<boolean> {
+    const owner = normalizeOwnerId(teamId);
+    if (owner === null) return false;
+    return await this.db.doTn(async tn =>
+      Boolean(await tn.snapshot().get(this.key(owner, holderId))),
+    );
+  }
+
   // Releases the slot, handing it to a pending job when one exists.
   public async release(teamId: string, holderId: string): Promise<void> {
     const owner = normalizeOwnerId(teamId);

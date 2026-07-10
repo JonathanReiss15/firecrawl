@@ -1,4 +1,5 @@
 import { randomUUID } from "crypto";
+import { vi } from "vitest";
 import { config } from "../../config";
 import {
   NuQFdbQueue,
@@ -10,6 +11,7 @@ import {
   getFdb,
 } from "../../services/worker/nuq-fdb/client";
 import { encodeI64, encodeJson } from "../../services/worker/nuq-fdb/keyspace";
+import { QueueFullError } from "../../lib/queue-full-error";
 
 // These tests exercise the FDB queue core directly against a real FoundationDB
 // cluster (no API server needed). They are skipped when FDB is not configured.
@@ -106,6 +108,37 @@ describeIf("NuQ FDB core", () => {
       expect(job?.returnvalue).toEqual({ result: "yay" });
     } else {
       expect(job?.returnvalue).toBeNull();
+    }
+  });
+
+  test("dequeue retry returns the original committed lease", async () => {
+    const { queue } = await makeCtx("take-retry");
+    const owner = freshOwner();
+    const ids = [randomUUID(), randomUUID()];
+    await queue.addJobs(
+      ids.map(id => ({ id, data: scrapeData(), options: { ownerId: owner } })),
+      UNLIMITED,
+    );
+
+    const db = (queue as any).db;
+    const originalDoTn = db.doTn.bind(db);
+    let retried = false;
+    const doTn = vi.spyOn(db, "doTn").mockImplementation(async (body, opts) => {
+      const first = await originalDoTn(body, opts);
+      if (!retried && first && (first as any).status === "active") {
+        retried = true;
+        return await originalDoTn(body, opts);
+      }
+      return first;
+    });
+    try {
+      const taken = await queue.getJobToProcess();
+      expect(taken).not.toBeNull();
+      expect(retried).toBe(true);
+      const statuses = (await queue.getJobs(ids)).map(job => job.status).sort();
+      expect(statuses).toEqual(["active", "queued"]);
+    } finally {
+      doTn.mockRestore();
     }
   });
 
@@ -239,7 +272,7 @@ describeIf("NuQ FDB core", () => {
     expect(promoted.id).toBe(highPrio);
   });
 
-  test("kickoff jobs bypass the gate and hold no slot", async () => {
+  test("kickoff jobs bypass admission but hold an occupancy slot", async () => {
     const { queue } = await makeCtx("kickoff");
     const owner = freshOwner();
     const kickoff = randomUUID();
@@ -249,13 +282,79 @@ describeIf("NuQ FDB core", () => {
       { ownerId: owner, bypassGate: true },
       gate(1),
     );
-    expect(await queue.getTeamActiveCount(owner)).toBe(0);
+    expect(await queue.getTeamActiveCount(owner)).toBe(1);
 
     const [k] = await takeAll(queue, 1);
     expect(k.id).toBe(kickoff);
-    expect(await queue.getTeamActiveCount(owner)).toBe(0);
+    expect(await queue.getTeamActiveCount(owner)).toBe(1);
     await queue.jobFinish(k.id, k.lock!, null);
     expect(await queue.getTeamActiveCount(owner)).toBe(0);
+  });
+
+  test("backlog cap charges only actual pending placements", async () => {
+    const { queue } = await makeCtx("qcap-placement");
+    const owner = freshOwner();
+    const jobs = [randomUUID(), randomUUID(), randomUUID()].map(id => ({
+      id,
+      data: scrapeData(),
+      options: { ownerId: owner },
+    }));
+    const placed = await queue.addJobs(jobs, gate(2, 1));
+    expect(placed.map(job => job.status)).toEqual([
+      "queued",
+      "queued",
+      "backlog",
+    ]);
+
+    const bypass = await queue.addJob(
+      randomUUID(),
+      { mode: "kickoff" },
+      { ownerId: owner, bypassGate: true },
+      gate(2, 1),
+    );
+    expect(bypass.status).toBe("queued");
+  });
+
+  test("concurrent admissions cannot exceed the backlog cap", async () => {
+    const { queue } = await makeCtx("qcap-concurrent");
+    const owner = freshOwner();
+    await queue.addJob(
+      randomUUID(),
+      scrapeData(),
+      { ownerId: owner },
+      gate(1, 1),
+    );
+    const adds = await Promise.allSettled(
+      [randomUUID(), randomUUID()].map(id =>
+        queue.addJob(id, scrapeData(), { ownerId: owner }, gate(1, 1)),
+      ),
+    );
+    expect(adds.filter(result => result.status === "fulfilled")).toHaveLength(
+      1,
+    );
+    expect(adds.filter(result => result.status === "rejected")).toHaveLength(1);
+  });
+
+  test("PG pending occupancy reduces the FDB backlog cap", async () => {
+    const { queue } = await makeCtx("qcap-combined");
+    const owner = freshOwner();
+    await queue.addJob(
+      randomUUID(),
+      scrapeData(),
+      { ownerId: owner },
+      gate(1, 2),
+    );
+    await expect(
+      queue.addJob(
+        randomUUID(),
+        scrapeData(),
+        { ownerId: owner },
+        {
+          ...gate(1, 2),
+          externalPending: 2,
+        },
+      ),
+    ).rejects.toBeInstanceOf(QueueFullError);
   });
 
   test("QueueFullError when the backlog cap is exceeded", async () => {

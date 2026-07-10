@@ -51,6 +51,9 @@ function timeout<T>(promise: Promise<T>, timeoutMs: number): Promise<T> {
   });
 }
 
+// Only use this for side-effect-free reads. It bounds caller latency but does
+// not cancel the underlying Promise. Mutations must await a definitive FDB
+// result and must never fall back to PG after an ambiguous result.
 export async function withFdbTimeout<T>(
   promise: Promise<T>,
   timeoutMs: number,
@@ -69,11 +72,11 @@ export async function nuqFdbHealthCheck(timeoutMs = 1000): Promise<boolean> {
   }
 
   try {
-    await timeout(
-      getNuqFdbDatabase().doTn(async tn => {
+    await getNuqFdbDatabase().doTn(
+      async tn => {
         await tn.getReadVersion();
-      }),
-      timeoutMs,
+      },
+      { timeout: timeoutMs },
     );
     lastHealthCheck = { checkedAt: now, timeoutMs, ok: true };
     return true;

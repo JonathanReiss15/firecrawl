@@ -1,4 +1,4 @@
-import { randomUUID } from "crypto";
+import { createHash, randomUUID } from "crypto";
 import type { Transaction } from "foundationdb";
 import { Logger } from "winston";
 import { logger as _logger } from "../../../lib/logger";
@@ -44,6 +44,7 @@ import {
   appendKeyPending,
   appendCrawlPending,
   popTeamPending,
+  promoteEntryToReady,
   setStatusQueued,
   setStatusPending,
   clearPendingPlacement,
@@ -112,6 +113,11 @@ export type NuQFdbGate = {
   // null = unlimited (self-hosted)
   teamLimit: number | null;
   queueCap: number;
+  // Capacity already occupied by the team's legacy PG ledger. The router
+  // samples this while holding the cross-backend admission lock.
+  externalActive?: number;
+  // Pending jobs already held by the legacy PG concurrency queue.
+  externalPending?: number;
   // API-key-scoped concurrency limit; null/absent = the key is unlimited.
   // Only applies when the batch is team-gated (teamLimit !== null).
   key?: { id: string; limit: number } | null;
@@ -126,6 +132,7 @@ type AddJobInput<Data> = {
 type PreparedAddJob<Data> = AddJobInput<Data> & {
   dataBuf: Buffer;
   dataChunks: Buffer[];
+  fingerprint: string;
   estimatedAffectedBytes: number;
 };
 
@@ -259,22 +266,30 @@ export class NuQFdbQueue<JobData = any, JobReturnValue = any> {
   ): PreparedAddJob<JobData> {
     const dataBuf = Buffer.from(JSON.stringify(job.data ?? null), "utf8");
     const dataChunks = chunkBuffer(dataBuf, DATA_CHUNK_BYTES);
+    const fingerprint = createHash("sha256")
+      .update(
+        JSON.stringify({
+          data: job.data ?? null,
+          priority: job.options.priority ?? 0,
+          listenable: job.options.listenable ?? false,
+          ownerId,
+          groupId: job.options.groupId ?? null,
+          bypassGate: job.options.bypassGate ?? false,
+        }),
+      )
+      .digest("hex");
+    const prepared = { ...job, dataBuf, dataChunks, fingerprint };
     const estimatedAffectedBytes = this.estimateEnqueueAffectedBytes(
-      job,
+      prepared,
       ownerId,
       keyId,
       dataChunks,
     );
-    return {
-      ...job,
-      dataBuf,
-      dataChunks,
-      estimatedAffectedBytes,
-    };
+    return { ...prepared, estimatedAffectedBytes };
   }
 
   private estimateEnqueueAffectedBytes(
-    job: AddJobInput<JobData>,
+    job: AddJobInput<JobData> & { fingerprint: string },
     ownerId: string | null,
     keyId: string | null,
     dataChunks: Buffer[],
@@ -310,6 +325,7 @@ export class NuQFdbQueue<JobData = any, JobReturnValue = any> {
       f: entry.f,
       to: entry.to,
       dc: dataChunks.length,
+      h: job.fingerprint,
     };
 
     let bytes =
@@ -390,33 +406,61 @@ export class NuQFdbQueue<JobData = any, JobReturnValue = any> {
     return await this.db.doTn(async tn => {
       const txc = newTxContext();
       const now = Date.now();
-      const out: NuQFdbJob<JobData, JobReturnValue>[] = [];
+      const out = new Map<string, NuQFdbJob<JobData, JobReturnValue>>();
+
+      // addJobs is retried after an ambiguous commit using the same stable job
+      // ids. Reconcile those ids inside the transaction so a late/unknown
+      // commit cannot increment gates or create queue entries twice.
+      const newJobs: PreparedAddJob<JobData>[] = [];
+      for (const job of jobs) {
+        const existingStatus = await tn.get(ks.jobStatus(job.id));
+        if (!existingStatus) {
+          newJobs.push(job);
+          continue;
+        }
+        const existingMeta = decodeJson<JobMeta>(
+          await tn.get(ks.jobMeta(job.id)),
+        );
+        const existing = await this.readJob(tn, job.id);
+        if (
+          !existing ||
+          normalizeOwnerId(existing.ownerId) !== ownerId ||
+          existing.groupId !== job.options.groupId ||
+          (existingMeta?.h !== undefined && existingMeta.h !== job.fingerprint)
+        ) {
+          throw new Error(`NuQ FDB job id ${job.id} is already reserved`);
+        }
+        out.set(job.id, existing);
+      }
 
       let free = Infinity;
+      let existingPending = 0;
       if (gate.teamLimit !== null && ownerId !== null) {
+        const effectiveLimit = Math.max(
+          0,
+          gate.teamLimit - (gate.externalActive ?? 0),
+        );
         const storedBuf = await tn.get(ks.teamLimit(ownerId));
         const stored = storedBuf ? decodeI64(storedBuf) : null;
-        if (stored !== gate.teamLimit) {
-          tn.set(ks.teamLimit(ownerId), encodeI64(gate.teamLimit));
-          if (stored !== null && gate.teamLimit > stored) {
+        if (stored !== effectiveLimit) {
+          tn.set(ks.teamLimit(ownerId), encodeI64(effectiveLimit));
+          if (stored !== null && effectiveLimit > stored) {
             tn.set(ks.taskTeamRaise(ownerId), EMPTY);
           }
         }
 
-        const pend = decodeI64(
-          await tn.snapshot().get(ks.teamPendingCount(ownerId)),
-        );
-        if (pend + jobs.length > gate.queueCap) {
-          throw new QueueFullError(pend, gate.queueCap);
-        }
+        // A normal read conflicts concurrent FDB admissions. Charge only jobs
+        // actually placed pending below; ready/direct jobs do not consume the
+        // backlog cap.
+        existingPending = decodeI64(await tn.get(ks.teamPendingCount(ownerId)));
 
         // big-limit teams tolerate a small admission overshoot in exchange for
         // a conflict-free read; small-limit teams get the strict read
         const active =
-          gate.teamLimit >= 256
+          effectiveLimit >= 256
             ? decodeI64(await tn.snapshot().get(ks.teamActive(ownerId)))
             : decodeI64(await tn.get(ks.teamActive(ownerId)));
-        free = Math.max(0, gate.teamLimit - active);
+        free = Math.max(0, effectiveLimit - active);
       }
 
       // API-key gate state; only meaningful inside the team-gated world
@@ -440,7 +484,7 @@ export class NuQFdbQueue<JobData = any, JobReturnValue = any> {
       const groupMetas = new Map<string, GroupMeta | null>();
       const crawlFree = new Map<string, number>();
       if (this.options.hasGroups) {
-        for (const j of jobs) {
+        for (const j of newJobs) {
           const gid = j.options.groupId;
           if (!gid || groupMetas.has(gid)) continue;
           const gMeta = decodeJson<GroupMeta>(await tn.get(ks.groupMeta(gid)));
@@ -457,12 +501,17 @@ export class NuQFdbQueue<JobData = any, JobReturnValue = any> {
 
       let granted = 0;
       let keyGranted = 0;
+      let pendingAdded = 0;
       const crawlAcquired = new Map<string, number>();
 
-      for (const j of jobs) {
+      for (const j of newJobs) {
         const gid = j.options.groupId;
         const gMeta = gid ? groupMetas.get(gid) : null;
         const groupLive = !!gMeta && gMeta.s === "active";
+        // PG records every owned direct/queued job in its active occupancy
+        // ledger, including self-hosted unlimited mode. FDB does the same for
+        // metrics and exact release parity; a null limit only disables gating.
+        const occupiesTeamSlot = ownerId !== null;
         const gated = gate.teamLimit !== null && !j.options.bypassGate;
         const crawlGated = gated && !!gid && groupLive && crawlFree.has(gid!);
         const keyGated = gated && keyId !== null;
@@ -472,7 +521,10 @@ export class NuQFdbQueue<JobData = any, JobReturnValue = any> {
           (j.data as any)?.mode === "single_urls";
 
         let flags = 0;
-        if (gated) flags |= F_GATED;
+        // Direct and kickoff jobs bypass admission, not accounting. PG adds
+        // them to the active ledger too, and FDB must release the same slot on
+        // terminal completion.
+        if (occupiesTeamSlot) flags |= F_GATED;
         if (crawlGated) flags |= F_CRAWL_GATED;
         if (keyGated) flags |= F_KEY_GATED;
         if (j.options.listenable) flags |= F_LISTENABLE;
@@ -501,6 +553,7 @@ export class NuQFdbQueue<JobData = any, JobReturnValue = any> {
           f: flags,
           to: timesOutAt,
           dc: j.dataChunks.length,
+          h: j.fingerprint,
         };
         tn.set(ks.jobMeta(j.id), encodeJson(meta));
         j.dataChunks.forEach((chunk, ci) =>
@@ -509,6 +562,7 @@ export class NuQFdbQueue<JobData = any, JobReturnValue = any> {
 
         let placedStatus: NuqFdbJobStatus;
         if (!gated) {
+          if (occupiesTeamSlot) granted++;
           pushReady(tn, ks, entry, txc);
           setStatusQueued(tn, ks, j.id);
           placedStatus = "queued";
@@ -547,13 +601,15 @@ export class NuQFdbQueue<JobData = any, JobReturnValue = any> {
           }
         }
 
+        if (placedStatus === "pending") pendingAdded++;
+
         if (groupLive && gid) {
           tn.add(ks.groupRemaining(gid), ONE);
           setGroupJobIndex(tn, ks, gid, j.id, countable, placedStatus);
           if (countable) bumpGroupStatusCount(tn, ks, gid, placedStatus, 1);
         }
 
-        out.push({
+        out.set(j.id, {
           id: j.id,
           status: placedStatus === "pending" ? "backlog" : "queued",
           createdAt: new Date(now),
@@ -562,6 +618,16 @@ export class NuQFdbQueue<JobData = any, JobReturnValue = any> {
           ownerId: entry.o || undefined,
           groupId: gid,
         });
+      }
+
+      if (gate.teamLimit !== null && ownerId !== null) {
+        const effectiveQueueCap = Math.max(
+          0,
+          gate.queueCap - (gate.externalPending ?? 0),
+        );
+        if (existingPending + pendingAdded > effectiveQueueCap) {
+          throw new QueueFullError(existingPending, effectiveQueueCap);
+        }
       }
 
       if (granted > 0 && ownerId !== null) {
@@ -574,7 +640,7 @@ export class NuQFdbQueue<JobData = any, JobReturnValue = any> {
         tn.add(ks.groupCrawlActive(gid), encodeI64(n));
       }
 
-      return out;
+      return jobs.map(job => out.get(job.id)!);
     });
   }
 
@@ -584,6 +650,8 @@ export class NuQFdbQueue<JobData = any, JobReturnValue = any> {
     logger: Logger = _logger,
   ): Promise<NuQFdbJob<JobData, JobReturnValue> | null> {
     const startedAt = Date.now();
+    // Stable across every transaction retry/probe in this logical dequeue.
+    const takeOperationId = randomUUID();
     // blind random probes win at high occupancy (no coordination, conflicts
     // spread across shards); the occupancy scan below covers the sparse case
     const PROBES = 4;
@@ -592,7 +660,7 @@ export class NuQFdbQueue<JobData = any, JobReturnValue = any> {
     while (tried.size < PROBES) {
       const shard = Math.floor(Math.random() * READY_SHARDS);
       if (tried.has(shard)) continue;
-      const result = await this.takeFromShard(shard);
+      const result = await this.takeFromShard(shard, takeOperationId);
       if (result === "empty") {
         tried.add(shard);
         continue;
@@ -641,7 +709,7 @@ export class NuQFdbQueue<JobData = any, JobReturnValue = any> {
       if (tried.has(shard)) continue;
       for (let attempt = 0; attempt < 4; attempt++) {
         fallbackAttempts++;
-        const result = await this.takeFromShard(shard);
+        const result = await this.takeFromShard(shard, takeOperationId);
         if (result === "empty") {
           fallbackEmpty++;
           break;
@@ -689,11 +757,44 @@ export class NuQFdbQueue<JobData = any, JobReturnValue = any> {
 
   private async takeFromShard(
     shard: number,
+    takeOperationId: string,
   ): Promise<NuQFdbJob<JobData, JobReturnValue> | "empty" | "dropped"> {
     const ks = this.ks;
-    return await this.db.doTn(async tn => {
+    const result = await this.db.doTn(async tn => {
       const txc = newTxContext();
       const now = Date.now();
+      const prior = decodeJson<{ i: string; l: string; e: number }>(
+        await tn.get(ks.takeOperation(takeOperationId)),
+      );
+      if (prior) {
+        const st = decodeJson<JobStatusRecord>(
+          await tn.snapshot().get(ks.jobStatus(prior.i)),
+        );
+        const meta = decodeJson<JobMeta>(
+          await tn.snapshot().get(ks.jobMeta(prior.i)),
+        );
+        if (!st || st.s !== "active" || st.l !== prior.l || !meta) {
+          throw new Error("FDB dequeue operation result is inconsistent");
+        }
+        const dataRange = ks.jobDataRange(prior.i);
+        const dataParts = await tn
+          .snapshot()
+          .getRangeAll(dataRange.begin, dataRange.end);
+        const data = JSON.parse(
+          Buffer.concat(dataParts.map(([, v]) => v as Buffer)).toString("utf8"),
+        );
+        return {
+          id: prior.i,
+          status: "active" as const,
+          createdAt: new Date(meta.c),
+          priority: meta.p,
+          data,
+          lock: prior.l,
+          leaseExpiresAt: new Date(prior.e),
+          ownerId: meta.o || undefined,
+          groupId: meta.g,
+        };
+      }
       const range = ks.readyShardRange(shard);
       const head = await tn.getRangeAll(range.begin, range.end, { limit: 1 });
       if (head.length === 0) return "empty";
@@ -756,6 +857,10 @@ export class NuQFdbQueue<JobData = any, JobReturnValue = any> {
       const rec: JobStatusRecord = { s: "active", l: lock, e: exp, st: st.st };
       tn.set(ks.jobStatus(e.i), encodeJson(rec));
       tn.set(ks.lease(timeBucket(e.i), exp, e.i), encodeJson({ l: lock }));
+      tn.set(
+        ks.takeOperation(takeOperationId),
+        encodeJson({ i: e.i, l: lock, e: exp }),
+      );
       if (e.g && e.f & F_COUNTABLE) {
         bumpGroupStatusCount(tn, ks, e.g, "queued", -1);
         bumpGroupStatusCount(tn, ks, e.g, "active", 1);
@@ -774,6 +879,20 @@ export class NuQFdbQueue<JobData = any, JobReturnValue = any> {
         groupId: meta.g,
       };
     });
+    if (typeof result === "object") {
+      // The record only bridges doTn retries. Best-effort cleanup must not hide
+      // a definitively leased job from the worker.
+      void this.db
+        .doTn(async tn => tn.clear(ks.takeOperation(takeOperationId)))
+        .catch(error =>
+          _logger.warn("Failed to clear FDB dequeue operation record", {
+            queueName: this.queueName,
+            takeOperationId,
+            error,
+          }),
+        );
+    }
+    return result;
   }
 
   // === Leases
@@ -1317,6 +1436,39 @@ export class NuQFdbQueue<JobData = any, JobReturnValue = any> {
   }
 
   // === Introspection used by status/admin endpoints
+
+  public async setTeamLimit(
+    teamId: string,
+    teamLimit: number,
+    externalActive: number,
+  ): Promise<void> {
+    const owner = normalizeOwnerId(teamId);
+    if (owner === null) return;
+    const effectiveLimit = Math.max(0, teamLimit - externalActive);
+    await this.db.doTn(async tn => {
+      const stored = decodeI64(await tn.get(this.ks.teamLimit(owner)));
+      if (stored === effectiveLimit) return;
+      tn.set(this.ks.teamLimit(owner), encodeI64(effectiveLimit));
+      if (effectiveLimit > stored) {
+        // Fill newly available capacity in this transaction. The caller holds
+        // the cross-ledger admission lock, so PG observes the promoted FDB
+        // occupancy before deciding whether it may promote its own backlog.
+        const active = decodeI64(await tn.get(this.ks.teamActive(owner)));
+        let free = Math.min(Math.max(0, effectiveLimit - active), 32);
+        let promoted = 0;
+        const txc = newTxContext();
+        while (free > 0) {
+          const entry = await popTeamPending(tn, this.ks, owner);
+          if (!entry) break;
+          promoteEntryToReady(tn, this.ks, entry, txc);
+          promoted++;
+          free--;
+        }
+        if (promoted > 0) bumpTeamActive(tn, this.ks, owner, promoted);
+        if (free === 0) tn.set(this.ks.taskTeamRaise(owner), EMPTY);
+      }
+    });
+  }
 
   public async getTeamActiveCount(teamId: string): Promise<number> {
     const owner = normalizeOwnerId(teamId);

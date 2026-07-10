@@ -11,6 +11,10 @@ import {
   pushConcurrencyLimitActiveJob,
 } from "../../lib/concurrency-limit";
 import { addJobPriority, deleteJobPriority } from "../../lib/job-priority";
+import {
+  syncFdbLimitToPgOccupancy,
+  withTeamMigrationAdmission,
+} from "./nuq-router";
 import { cacheableLookup } from "../../scraper/scrapeURL/lib/cacheableLookup";
 import { v7 as uuidv7 } from "uuid";
 import {
@@ -1544,12 +1548,37 @@ async function processJobWithTracing(job: NuQJob<ScrapeJobData>, logger: any) {
         job.data?.team_id &&
         !job.data.skipNuq
       ) {
-        extendLockInterval = setInterval(async () => {
-          await pushConcurrencyLimitActiveJob(
+        let reconciliationRunning = false;
+        extendLockInterval = setInterval(() => {
+          // Never let a slow/hung FDB reconciliation suppress the Redis TTL
+          // heartbeat that keeps this live PG job visible.
+          void pushConcurrencyLimitActiveJob(
             job.data.team_id,
             job.id,
             60 * 1000,
-          ); // 60s lock renew, just like in the queue
+          ).catch(error =>
+            _logger.warn("Failed to renew PG concurrency occupancy", {
+              jobId: job.id,
+              teamId: job.data.team_id,
+              error,
+            }),
+          );
+
+          if (reconciliationRunning) return;
+          reconciliationRunning = true;
+          void withTeamMigrationAdmission(job.data.team_id, async () =>
+            syncFdbLimitToPgOccupancy(job.data.team_id),
+          )
+            .catch(error =>
+              _logger.warn("Failed to reconcile FDB concurrency occupancy", {
+                jobId: job.id,
+                teamId: job.data.team_id,
+                error,
+              }),
+            )
+            .finally(() => {
+              reconciliationRunning = false;
+            });
         }, jobLockExtendInterval);
       }
 

@@ -44,6 +44,7 @@ export type JobMeta = {
   f: number; // flags
   to?: number; // backlog timesOutAt ms
   dc: number; // data chunk count
+  h?: string; // immutable enqueue payload/options fingerprint
 };
 
 export type JobStatusRecord = {
@@ -166,6 +167,9 @@ export class NuqFdbKeyspace {
   }
   jobRange(id: string) {
     return this.packRange(["j", id]);
+  }
+  takeOperation(id: string): Buffer {
+    return this.pack(["takeop", id]);
   }
 
   // === Team gate
