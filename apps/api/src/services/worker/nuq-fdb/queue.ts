@@ -21,6 +21,7 @@ import {
   decodeJson,
   timeBucket,
   READY_SHARDS,
+  METRIC_SHARDS,
   F_GATED,
   F_CRAWL_GATED,
   F_LISTENABLE,
@@ -1258,6 +1259,7 @@ export class NuQFdbQueue<JobData = any, JobReturnValue = any> {
       Buffer.concat(parts.map(([, value]) => value as Buffer)).toString("utf8"),
     );
     return {
+      backend: "fdb",
       id: claim.i,
       status: "active",
       createdAt: new Date(meta.c),
@@ -1914,17 +1916,20 @@ export class NuQFdbQueue<JobData = any, JobReturnValue = any> {
     const ks = this.ks;
     return await this.db.doTn(async tn => {
       const internal = ["queued", "active", "pending"] as const;
+      // Read only the fixed-width maintained counter set. Point reads make the
+      // scrape footprint exactly statuses * METRIC_SHARDS regardless of jobs,
+      // teams, leases, ready entries, or unexpected keys in these prefixes.
       const rows = await Promise.all(
-        internal.map(status => {
-          const range = ks.metricStatusRange(status);
-          return tn.snapshot().getRangeAll(range.begin, range.end);
-        }),
+        internal.map(status =>
+          Promise.all(
+            Array.from({ length: METRIC_SHARDS }, (_, shard) =>
+              tn.snapshot().get(ks.metricCount(status, shard)),
+            ),
+          ),
+        ),
       );
       const totals = rows.map(statusRows =>
-        statusRows.reduce(
-          (sum, [, value]) => sum + decodeI64(value as Buffer),
-          0,
-        ),
+        statusRows.reduce((sum, value) => sum + decodeI64(value), 0),
       );
       return {
         queued: Math.max(0, totals[0]),

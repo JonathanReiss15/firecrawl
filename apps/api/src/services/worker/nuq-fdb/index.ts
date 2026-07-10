@@ -38,13 +38,14 @@ export const crawlGroupFdb = new NuQFdbJobGroup(
 export const externalSlotsFdb = new NuqFdbExternalSlots(scrapeQueueFdb.ks);
 
 export async function nuqFdbGetMetrics(): Promise<string> {
-  const [queueMetrics, workerLoad] = await Promise.all([
-    scrapeQueueFdb.getMetrics(),
-    scrapeQueueFdb.getWorkerLoadCount(),
-  ]);
+  const [scrapeQueueMetrics, crawlFinishedQueueMetrics, workerLoad] =
+    await Promise.all([
+      scrapeQueueFdb.getMetrics(),
+      crawlFinishedQueueFdb.getMetrics(),
+      scrapeQueueFdb.getWorkerLoadCount(),
+    ]);
 
-  return `${queueMetrics}
-# HELP firecrawl_nuq_fdb_pending_jobs Number of FDB scrape jobs currently admitted to workers or waiting in ready shards
+  return `${scrapeQueueMetrics}${crawlFinishedQueueMetrics}# HELP firecrawl_nuq_fdb_pending_jobs Number of FDB scrape jobs currently admitted to workers or waiting in ready shards
 # TYPE firecrawl_nuq_fdb_pending_jobs gauge
 firecrawl_nuq_fdb_pending_jobs ${workerLoad}
 `;
