@@ -95,3 +95,44 @@ describe("groundCitations", () => {
     expect(groundCitations(fixture.markdown, [], { f: ["anything"] }).f).toEqual([]);
   });
 });
+
+describe("wrapSchemaWithCitations / splitCitedExtraction", () => {
+  it("wraps a user schema under data and adds the citations map", async () => {
+    const { wrapSchemaWithCitations } = await import("../citations");
+    const wrapped = wrapSchemaWithCitations({
+      type: "object",
+      properties: { total_revenue: { type: "string" } },
+    }) as any;
+    expect(wrapped.properties.data.properties.total_revenue.type).toBe("string");
+    expect(wrapped.properties.citations.additionalProperties.items.type).toBe("string");
+    expect(wrapped.required).toEqual(["data"]);
+  });
+
+  it("wraps schema-less extraction with a permissive data object", async () => {
+    const { wrapSchemaWithCitations } = await import("../citations");
+    const wrapped = wrapSchemaWithCitations(undefined) as any;
+    expect(wrapped.properties.data).toEqual({ type: "object" });
+  });
+
+  it("splits a wrapped result and normalizes quote shapes", async () => {
+    const { splitCitedExtraction } = await import("../citations");
+    const split = splitCitedExtraction({
+      data: { total_revenue: "$391B" },
+      citations: {
+        total_revenue: "net sales of $391 billion",
+        fiscal_year: ["ended September 27, 2025", 42 as any],
+      },
+    });
+    expect(split).not.toBeNull();
+    expect((split!.data as any).total_revenue).toBe("$391B");
+    expect(split!.quotesByField.total_revenue).toEqual(["net sales of $391 billion"]);
+    expect(split!.quotesByField.fiscal_year).toEqual(["ended September 27, 2025"]);
+  });
+
+  it("returns null when the wrapper shape is missing (model ignored it)", async () => {
+    const { splitCitedExtraction } = await import("../citations");
+    expect(splitCitedExtraction({ total_revenue: "$391B" })).toBeNull();
+    expect(splitCitedExtraction(null)).toBeNull();
+    expect(splitCitedExtraction("just a string")).toBeNull();
+  });
+});

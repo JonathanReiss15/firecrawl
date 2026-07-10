@@ -167,3 +167,59 @@ export function groundCitations(
   }
   return out;
 }
+
+// ---------------------------------------------------------------------------
+// Extraction-side helpers: schema wrapping and result splitting. The
+// extraction schema is wrapped as { data: <user schema>, citations:
+// { "<field.path>": [verbatim quotes] } } so one LLM call returns both the
+// user's object (untouched shape) and the supporting quotes to ground.
+// ---------------------------------------------------------------------------
+
+export const CITATIONS_PROMPT_ADDENDUM =
+  "Additionally, for every field you extract, record in `citations` the exact verbatim quote(s) " +
+  "from the content that support that field's value, keyed by the field's JSON path within `data` " +
+  '(e.g. "total_revenue" or "items[2].name"). Quotes must be copied character-for-character from ' +
+  "the content — do not paraphrase, translate, or normalize them. If no supporting text exists for " +
+  "a field, omit that field from `citations`.";
+
+/** Wrap the user's extraction schema so the model returns data + quotes. */
+export function wrapSchemaWithCitations(userSchema: unknown): Record<string, unknown> {
+  return {
+    type: "object",
+    properties: {
+      data: userSchema ?? { type: "object" },
+      citations: {
+        type: "object",
+        description:
+          "Per extracted field (keyed by its JSON path in `data`), the exact verbatim quotes from the content supporting the value.",
+        additionalProperties: {
+          type: "array",
+          items: { type: "string" },
+        },
+      },
+    },
+    required: ["data"],
+  };
+}
+
+/**
+ * Split a wrapped extraction result back into the user's data object and a
+ * normalized quotes map. Returns null when the result doesn't carry the
+ * wrapper shape (model ignored the wrapper) — callers should fall back to
+ * treating the raw result as the data, ungrounded.
+ */
+export function splitCitedExtraction(
+  raw: unknown,
+): { data: unknown; quotesByField: Record<string, string[]> } | null {
+  if (raw === null || typeof raw !== "object" || !("data" in raw)) return null;
+  const obj = raw as Record<string, unknown>;
+  const quotesByField: Record<string, string[]> = {};
+  const citations = obj.citations;
+  if (citations && typeof citations === "object" && !Array.isArray(citations)) {
+    for (const [field, value] of Object.entries(citations as Record<string, unknown>)) {
+      if (typeof value === "string") quotesByField[field] = [value];
+      else if (Array.isArray(value)) quotesByField[field] = value.filter((q): q is string => typeof q === "string");
+    }
+  }
+  return { data: obj.data, quotesByField };
+}
