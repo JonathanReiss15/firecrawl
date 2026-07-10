@@ -637,7 +637,11 @@ export class AutumnService {
             .where(
               and(
                 eq(schema.teams.org_id, customerId),
+                // Both columns are required together (enforced by the DB CHECK);
+                // gate on both so the rows we select match the rows we rebuild —
+                // a half-configured row can never strip a limit without replacing it.
                 isNotNull(schema.api_keys.credit_limit),
+                isNotNull(schema.api_keys.credit_limit_interval),
               ),
             );
 

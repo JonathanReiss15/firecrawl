@@ -84,6 +84,13 @@ export const api_keys = pgTable(
     // Target of key_restriction_config's composite FK, which pins a
     // restriction row's team_id to the key's actual team.
     unique("api_keys_id_team_id_key").on(table.id, table.team_id),
+    // Mirrors the DB constraint (firecrawl-db migration): a credit limit is
+    // either fully unset, or a positive credit count with a valid interval.
+    // Keeps these source-of-truth columns from holding invalid/half rows.
+    check(
+      "api_keys_credit_limit_check",
+      sql`(${table.credit_limit} IS NULL AND ${table.credit_limit_interval} IS NULL) OR (${table.credit_limit} > 0 AND ${table.credit_limit_interval} IN ('day', 'week', 'month'))`,
+    ),
   ],
 );
 
