@@ -27,6 +27,36 @@ export type { NuQFdbJobGroupInstance, NuQFdbGroupStatus } from "./groups";
 export { NuqFdbSweeper } from "./sweeper";
 export { NuqFdbExternalSlots } from "./slots";
 export { isFdbConfigured, nuqFdbHealthCheck, withFdbTimeout } from "./client";
+export {
+  MIGRATION_RESIDUE_COUNTERS,
+  MigrationCasError,
+  MigrationCorruptionError,
+  MigrationInProgressError,
+  MigrationLegacyStateError,
+  MigrationOperationConflictError,
+  MigrationResidueNotEmptyError,
+  MigrationStaleGenerationError,
+  MigrationStoreError,
+  NuqFdbMigrationStore,
+  nuqFdbMigrationStore,
+} from "./migration-store";
+export type {
+  CompletePinnedObjectInput,
+  MigrationBackend,
+  MigrationGeneration,
+  MigrationGenerationStatus,
+  MigrationObjectKind,
+  MigrationObjectLifecycle,
+  MigrationObjectPin,
+  MigrationPhase,
+  MigrationPinAdmission,
+  MigrationResidue,
+  MigrationResidueCounter,
+  MigrationSteadyResolution,
+  MigrationTeamState,
+  PreparePinnedObjectInput,
+  TransitionObjectResidueInput,
+} from "./migration-store";
 
 export const scrapeQueueFdb = new NuQFdbQueue<ScrapeJobData, any>("scrape", {
   hasGroups: true,
