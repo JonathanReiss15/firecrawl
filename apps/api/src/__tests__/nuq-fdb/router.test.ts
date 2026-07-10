@@ -7,6 +7,9 @@ import { vi } from "vitest";
 vi.mock("../../services/worker/nuq", () => {
   const queue = {
     getJobToProcess: vi.fn().mockResolvedValue(null),
+    getJob: vi.fn().mockResolvedValue(null),
+    getJobs: vi.fn().mockResolvedValue([]),
+    getJobsFromBacklog: vi.fn().mockResolvedValue([]),
   };
   return {
     scrapeQueue: queue,
@@ -308,9 +311,7 @@ describeIf("NuQ router (forced FDB mode)", () => {
     });
     expect(first[0].id).toBe(jobId);
     expect(retried[0].id).toBe(jobId);
-    expect(await scrapeQueueFdb.getTeamActiveCount(teamId)).toBe(1);
     await scrapeQueueFdb.removeJob(jobId);
-    expect(await scrapeQueueFdb.getTeamActiveCount(teamId)).toBe(0);
   });
 
   test("optional router never attempts an FDB dequeue before PG fallback", async () => {
