@@ -184,6 +184,52 @@ describeIf("NuQ durable migration router", () => {
     await makeMetricsReady();
   });
 
+  test("begin and final seal require both corrected-core generations in their own transactions", async () => {
+    const teamId = randomUUID();
+    teams.add(teamId);
+    await expect(isFdbTeam(teamId)).resolves.toBe(false);
+
+    await crawlFinishedQueueFdb.invalidateMetricCounterGeneration();
+    await expect(
+      nuqFdbMigrationStore.beginTransition({
+        teamId,
+        targetBackend: "fdb",
+        operationId: randomUUID(),
+      }),
+    ).rejects.toMatchObject({
+      code: "NUQ_FDB_CORE_METRICS_NOT_READY",
+      retryable: true,
+    });
+
+    await makeMetricsReady();
+    const transition = await nuqFdbMigrationStore.beginTransition({
+      teamId,
+      targetBackend: "fdb",
+      operationId: randomUUID(),
+    });
+    await scrapeQueueFdb.invalidateMetricCounterGeneration();
+    await expect(
+      nuqFdbMigrationStore.finalSeal({
+        teamId,
+        transitionOperationId: transition.transitionOperationId!,
+      }),
+    ).rejects.toMatchObject({
+      code: "NUQ_FDB_CORE_METRICS_NOT_READY",
+      retryable: true,
+    });
+
+    await makeMetricsReady();
+    await expect(
+      nuqFdbMigrationStore.finalSeal({
+        teamId,
+        transitionOperationId: transition.transitionOperationId!,
+      }),
+    ).resolves.toMatchObject({
+      activeBackend: "fdb",
+      phase: "FDB_ONLY",
+    });
+  });
+
   test("discovers and drains an uncounted pre-protocol FDB job without dual authority", async () => {
     const teamId = randomUUID();
     const jobId = randomUUID();
