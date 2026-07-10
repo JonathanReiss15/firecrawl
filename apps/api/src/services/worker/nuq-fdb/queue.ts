@@ -1,5 +1,5 @@
 import { randomUUID } from "crypto";
-import type { Transaction } from "foundationdb";
+import { TransactionOptionCode, type Transaction } from "foundationdb";
 import { Logger } from "winston";
 import { logger as _logger } from "../../../lib/logger";
 import { config } from "../../../config";
@@ -585,8 +585,20 @@ export class NuQFdbQueue<JobData = any, JobReturnValue = any> {
 
   public async getJobToProcess(
     logger: Logger = _logger,
+    operation?: { timeoutMs: number },
   ): Promise<NuQFdbJob<JobData, JobReturnValue> | null> {
     const startedAt = Date.now();
+    const operationDeadline = operation
+      ? startedAt + operation.timeoutMs
+      : null;
+    const remainingOperation = () => {
+      if (operationDeadline === null) return undefined;
+      const timeoutMs = operationDeadline - Date.now();
+      if (timeoutMs <= 0) {
+        throw new Error("FDB dequeue operation timed out");
+      }
+      return { timeoutMs };
+    };
     // blind random probes win at high occupancy (no coordination, conflicts
     // spread across shards); the occupancy scan below covers the sparse case
     const PROBES = 4;
@@ -595,7 +607,7 @@ export class NuQFdbQueue<JobData = any, JobReturnValue = any> {
     while (tried.size < PROBES) {
       const shard = Math.floor(Math.random() * READY_SHARDS);
       if (tried.has(shard)) continue;
-      const result = await this.takeFromShard(shard);
+      const result = await this.takeFromShard(shard, remainingOperation());
       if (result === "empty") {
         tried.add(shard);
         continue;
@@ -622,7 +634,14 @@ export class NuQFdbQueue<JobData = any, JobReturnValue = any> {
     }
 
     // sparse queue: find non-empty shards via their occupancy counters
+    const candidatesOperation = remainingOperation();
     const candidates = await this.db.doTn(async tn => {
+      if (candidatesOperation) {
+        tn.setOption(
+          TransactionOptionCode.Timeout,
+          candidatesOperation.timeoutMs,
+        );
+      }
       const r = this.ks.readyShardCountRange();
       const counts = await tn.snapshot().getRangeAll(r.begin, r.end);
       const nonEmpty: number[] = [];
@@ -644,7 +663,7 @@ export class NuQFdbQueue<JobData = any, JobReturnValue = any> {
       if (tried.has(shard)) continue;
       for (let attempt = 0; attempt < 4; attempt++) {
         fallbackAttempts++;
-        const result = await this.takeFromShard(shard);
+        const result = await this.takeFromShard(shard, remainingOperation());
         if (result === "empty") {
           fallbackEmpty++;
           break;
@@ -692,9 +711,12 @@ export class NuQFdbQueue<JobData = any, JobReturnValue = any> {
 
   private async takeFromShard(
     shard: number,
+    operation?: { timeoutMs: number },
   ): Promise<NuQFdbJob<JobData, JobReturnValue> | "empty" | "dropped"> {
     const ks = this.ks;
     return await this.db.doTn(async tn => {
+      if (operation)
+        tn.setOption(TransactionOptionCode.Timeout, operation.timeoutMs);
       const txc = newTxContext();
       const now = Date.now();
       const range = ks.readyShardRange(shard);
@@ -786,6 +808,7 @@ export class NuQFdbQueue<JobData = any, JobReturnValue = any> {
     id: string,
     lock: string,
     logger: Logger = _logger,
+    operation?: { timeoutMs: number },
   ): Promise<boolean> {
     const oldExp = this.leaseExps.get(id);
     if (oldExp === undefined) return false;
@@ -793,6 +816,8 @@ export class NuQFdbQueue<JobData = any, JobReturnValue = any> {
     const newExp = Date.now() + (this.options.leaseMs ?? LEASE_MS);
     try {
       await this.db.doTn(async tn => {
+        if (operation)
+          tn.setOption(TransactionOptionCode.Timeout, operation.timeoutMs);
         // blind writes only; the sweeper validates the lock before reaping
         tn.clear(ks.lease(timeBucket(id), oldExp, id));
         tn.set(ks.lease(timeBucket(id), newExp, id), encodeJson({ l: lock }));
@@ -825,8 +850,16 @@ export class NuQFdbQueue<JobData = any, JobReturnValue = any> {
     lock: string,
     returnvalue: JobReturnValue | null,
     logger: Logger = _logger,
+    operation?: { timeoutMs: number },
   ): Promise<boolean> {
-    return this.finishOrFail(id, lock, "completed", returnvalue ?? null, null);
+    return this.finishOrFail(
+      id,
+      lock,
+      "completed",
+      returnvalue ?? null,
+      null,
+      operation,
+    );
   }
 
   public async jobFail(
@@ -834,8 +867,9 @@ export class NuQFdbQueue<JobData = any, JobReturnValue = any> {
     lock: string,
     failedReason: string,
     logger: Logger = _logger,
+    operation?: { timeoutMs: number },
   ): Promise<boolean> {
-    return this.finishOrFail(id, lock, "failed", null, failedReason);
+    return this.finishOrFail(id, lock, "failed", null, failedReason, operation);
   }
 
   private async finishOrFail(
@@ -844,9 +878,12 @@ export class NuQFdbQueue<JobData = any, JobReturnValue = any> {
     outcome: "completed" | "failed",
     returnvalue: any,
     failedReason: string | null,
+    operation?: { timeoutMs: number },
   ): Promise<boolean> {
     const ks = this.ks;
     const ok = await this.db.doTn(async tn => {
+      if (operation)
+        tn.setOption(TransactionOptionCode.Timeout, operation.timeoutMs);
       const txc = newTxContext();
       const now = Date.now();
       const st = decodeJson<JobStatusRecord>(await tn.get(ks.jobStatus(id)));

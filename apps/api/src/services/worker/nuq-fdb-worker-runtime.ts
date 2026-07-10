@@ -5,12 +5,17 @@ import {
   runLeasedJob,
   RuntimeLogger,
   waitForAbortableDelay,
+  withOperationTimeout,
   type FenceReason,
   type LeasedJobQueue,
+  type QueueOperationOptions,
 } from "./nuq-worker-runtime";
 
 export type CrawlFinishedQueue = LeasedJobQueue & {
-  getJobToProcess(logger?: any): Promise<NuQJob<any, any> | null>;
+  getJobToProcess(
+    logger?: any,
+    operation?: QueueOperationOptions,
+  ): Promise<NuQJob<any, any> | null>;
 };
 
 export type CrawlFinishedLoop = {
@@ -50,7 +55,11 @@ export function startCrawlFinishedLoop(options: {
     while (!stopController.signal.aborted) {
       let job: NuQJob<any, any> | null;
       try {
-        job = await options.queue.getJobToProcess(options.logger);
+        job = await withOperationTimeout(
+          options.queue.getJobToProcess(options.logger, { timeoutMs: 5_000 }),
+          5_000,
+          "crawl-finished dequeue",
+        );
         consecutiveDequeueErrors = 0;
         errorBaseMs = options.idleOptions?.minMs ?? 500;
       } catch (error) {
@@ -148,10 +157,14 @@ export function startCrawlFinishedLoop(options: {
     },
     error => {
       state = "failed";
-      options.logger.error("Crawl-finished supervisor stopped unexpectedly", {
-        error,
-      });
-      throw error;
+      try {
+        options.logger.error("Crawl-finished supervisor stopped unexpectedly", {
+          error,
+        });
+      } catch {
+        // Logging must not turn the supervised failure into an unhandled
+        // rejection. The failed state remains visible through liveness.
+      }
     },
   );
 

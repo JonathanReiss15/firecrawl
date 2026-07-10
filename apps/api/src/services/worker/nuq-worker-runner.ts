@@ -11,23 +11,36 @@ import type { Server } from "http";
 import {
   nextIdlePollDelay,
   runLeasedJob,
+  settleDrain,
   waitForAbortableDelay,
+  withOperationTimeout,
+  type QueueOperationOptions,
 } from "./nuq-worker-runtime";
 
 export type WorkerQueue = {
-  getJobToProcess(logger?: any): Promise<NuQJob<any, any> | null>;
-  renewLock(id: string, lock: string, logger?: any): Promise<boolean>;
+  getJobToProcess(
+    logger?: any,
+    operation?: QueueOperationOptions,
+  ): Promise<NuQJob<any, any> | null>;
+  renewLock(
+    id: string,
+    lock: string,
+    logger?: any,
+    operation?: QueueOperationOptions,
+  ): Promise<boolean>;
   jobFinish(
     id: string,
     lock: string,
     returnvalue: any | null,
     logger?: any,
+    operation?: QueueOperationOptions,
   ): Promise<boolean>;
   jobFail(
     id: string,
     lock: string,
     failedReason: string,
     logger?: any,
+    operation?: QueueOperationOptions,
   ): Promise<boolean>;
 };
 
@@ -173,7 +186,11 @@ export async function runNuqWorker(options: {
     while (!isShuttingDown) {
       let job: NuQJob<any, any> | null;
       try {
-        job = await options.queue.getJobToProcess();
+        job = await withOperationTimeout(
+          options.queue.getJobToProcess(undefined, { timeoutMs: 5_000 }),
+          5_000,
+          "job dequeue",
+        );
         dequeueErrorBaseMs = 500;
       } catch (error) {
         _logger.error("Failed to dequeue NuQ job", {
@@ -263,14 +280,19 @@ export async function runNuqWorker(options: {
   await Promise.race([loop, shutdownRequested]);
   let drained = false;
   if (isShuttingDown) {
-    const drain = Promise.all([
-      loop,
-      Promise.resolve().then(() => options.drain?.()),
-    ]);
+    const drain = settleDrain(
+      [loop, Promise.resolve().then(() => options.drain?.())],
+      error => {
+        _logger.error("NuQ worker drain failed", {
+          module: options.serviceName,
+          error,
+        });
+      },
+    );
     const graceController = new AbortController();
     drained =
       (await Promise.race([
-        drain.then(() => true),
+        drain,
         waitForAbortableDelay(
           Math.max(
             0,

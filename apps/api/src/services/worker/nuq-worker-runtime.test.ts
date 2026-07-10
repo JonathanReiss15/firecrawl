@@ -2,6 +2,7 @@ import { afterEach, describe, expect, test, vi } from "vitest";
 import {
   nextIdlePollDelay,
   runLeasedJob,
+  settleDrain,
   type RuntimeLogger,
 } from "./nuq-worker-runtime";
 import { startCrawlFinishedLoop } from "./nuq-fdb-worker-runtime";
@@ -103,6 +104,9 @@ describe("NuQ worker lease lifecycle", () => {
       reason: "renewal-failed",
     });
     expect(renewLock).toHaveBeenCalledTimes(1);
+    expect(renewLock).toHaveBeenCalledWith("job-1", "lock-1", logger, {
+      timeoutMs: 5,
+    });
     expect(onFence).toHaveBeenCalledWith("renewal-failed");
   });
 
@@ -210,6 +214,9 @@ describe("NuQ worker lease lifecycle", () => {
       reason: "finalization-timeout",
     });
     expect(jobFinish).toHaveBeenCalledTimes(1);
+    expect(jobFinish).toHaveBeenCalledWith("job-1", "lock-1", "ok", logger, {
+      timeoutMs: 5,
+    });
     expect(onFence).toHaveBeenCalledWith("finalization-timeout");
   });
 
@@ -298,6 +305,7 @@ describe("NuQ FDB worker supervision", () => {
 
     expect(loop.isHealthy()).toBe(true);
     await vi.advanceTimersByTimeAsync(20);
+    expect(getJobToProcess).toHaveBeenCalledWith(logger, { timeoutMs: 5_000 });
     expect(processJob).toHaveBeenCalledTimes(2);
     expect(processJob.mock.calls[0][0].backend).toBe("fdb");
     expect(jobFinish).toHaveBeenCalledTimes(2);
@@ -309,6 +317,47 @@ describe("NuQ FDB worker supervision", () => {
     loop.stop();
     await loop.done;
     expect(loop.isHealthy()).toBe(false);
+  });
+
+  test("turns an unexpected supervisor rejection into unhealthy state", async () => {
+    let errorCalls = 0;
+    const rejectingLogger: RuntimeLogger = {
+      ...logger,
+      error: () => {
+        errorCalls++;
+        throw new Error("logger transport failed");
+      },
+    };
+    const loop = startCrawlFinishedLoop({
+      queue: {
+        ...queue(),
+        getJobToProcess: vi.fn().mockRejectedValue(new Error("dequeue failed")),
+      },
+      processJob: vi.fn(),
+      logger: rejectingLogger,
+    });
+
+    await expect(loop.done).resolves.toBeUndefined();
+    expect(loop.isHealthy()).toBe(false);
+    expect(errorCalls).toBe(2);
+  });
+
+  test("bounds a hung dequeue so shutdown can settle", async () => {
+    vi.useFakeTimers();
+    const loop = startCrawlFinishedLoop({
+      queue: {
+        ...queue(),
+        getJobToProcess: vi.fn(
+          () => new Promise<ReturnType<typeof job> | null>(() => {}),
+        ),
+      },
+      processJob: vi.fn(),
+      logger,
+    });
+
+    loop.stop();
+    await vi.advanceTimersByTimeAsync(5_000);
+    await expect(loop.done).resolves.toBeUndefined();
   });
 
   test("does not start a crawl-finished job returned after shutdown", async () => {
@@ -385,6 +434,17 @@ describe("NuQ FDB worker supervision", () => {
     await loop.done;
     expect(q.jobFinish).not.toHaveBeenCalled();
     expect(q.jobFail).not.toHaveBeenCalled();
+  });
+
+  test("converts drain rejection into an undrained result", async () => {
+    const onError = vi.fn();
+    await expect(
+      settleDrain(
+        [Promise.resolve(), Promise.reject(new Error("drain failed"))],
+        onError,
+      ),
+    ).resolves.toBe(false);
+    expect(onError).toHaveBeenCalledOnce();
   });
 
   test("uses exponential jittered idle polling independent of RabbitMQ", () => {

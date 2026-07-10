@@ -7,19 +7,28 @@ export type RuntimeLogger = {
   error: (message: string, meta?: Record<string, unknown>) => void;
 };
 
+export type QueueOperationOptions = { timeoutMs: number };
+
 export type LeasedJobQueue = {
-  renewLock(id: string, lock: string, logger?: any): Promise<boolean>;
+  renewLock(
+    id: string,
+    lock: string,
+    logger?: any,
+    operation?: QueueOperationOptions,
+  ): Promise<boolean>;
   jobFinish(
     id: string,
     lock: string,
     returnvalue: any | null,
     logger?: any,
+    operation?: QueueOperationOptions,
   ): Promise<boolean>;
   jobFail(
     id: string,
     lock: string,
     failedReason: string,
     logger?: any,
+    operation?: QueueOperationOptions,
   ): Promise<boolean>;
 };
 
@@ -104,7 +113,7 @@ export async function retryWithBackoff<T>(options: {
 
 class OperationTimeoutError extends Error {}
 
-async function withOperationTimeout<T>(
+export async function withOperationTimeout<T>(
   operation: Promise<T>,
   timeoutMs: number,
   label: string,
@@ -127,6 +136,19 @@ async function withOperationTimeout<T>(
     ]);
   } finally {
     if (timer) clearTimeout(timer);
+  }
+}
+
+export async function settleDrain(
+  tasks: Promise<unknown>[],
+  onError: (error: unknown) => void,
+): Promise<boolean> {
+  try {
+    await Promise.all(tasks);
+    return true;
+  } catch (error) {
+    onError(error);
+    return false;
   }
 }
 
@@ -198,7 +220,9 @@ export async function runLeasedJob<T>(options: {
         operation: async attempt => {
           options.logger.info?.("Renewing job lock", { attempt });
           return await withOperationTimeout(
-            options.queue.renewLock(options.job.id, lock, options.logger),
+            options.queue.renewLock(options.job.id, lock, options.logger, {
+              timeoutMs: options.renewalTimeoutMs ?? 5_000,
+            }),
             options.renewalTimeoutMs ?? 5_000,
             "job lock renewal",
           );
@@ -264,12 +288,14 @@ export async function runLeasedJob<T>(options: {
               lock,
               processResult.data,
               options.logger,
+              { timeoutMs: options.finalizationTimeoutMs ?? 10_000 },
             )
           : options.queue.jobFail(
               options.job.id,
               lock,
               failureReason(processResult.error),
               options.logger,
+              { timeoutMs: options.finalizationTimeoutMs ?? 10_000 },
             );
         const result = await withOperationTimeout(
           finalization,
