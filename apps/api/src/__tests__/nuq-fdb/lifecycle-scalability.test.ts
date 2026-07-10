@@ -593,7 +593,7 @@ describeIf("NuQ FDB lifecycle scalability", () => {
     await getNuqFdbDatabase().doTn(async tn => {
       for (let i = 0; i < 3; i++) {
         const claimOp = `claim-${i}`;
-        tn.set(queue.ks.claim(claimOp), EMPTY);
+        tn.set(queue.ks.claim(claimOp), encodeJson({ e: dueAt + i }));
         tn.set(queue.ks.claimExpiry(dueAt + i, claimOp), EMPTY);
         tn.set(queue.ks.ingestExpiry(dueAt + i, `ingest-${i}`), EMPTY);
       }

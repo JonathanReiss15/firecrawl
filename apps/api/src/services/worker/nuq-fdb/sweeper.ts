@@ -354,18 +354,6 @@ export class NuqFdbSweeper {
   private partitionWork(now: number, logger: Logger): PartitionWork[] {
     const work: PartitionWork[] = [];
     for (const queue of this.queues) {
-      work.push({
-        ks: queue.ks,
-        phase: "metric-backfill",
-        partition: 0,
-        run: async claim => {
-          await this.renewClaim(claim);
-          await queue.backfillMetricCounts(
-            100,
-            config.NUQ_FDB_METRICS_V2_ACTIVATE,
-          );
-        },
-      });
       for (let bucket = 0; bucket < TIME_BUCKETS; bucket++) {
         work.push(
           {
@@ -597,6 +585,9 @@ export class NuqFdbSweeper {
   ): Promise<void> {
     const now = Date.now();
     const startedAt = Date.now();
+    for (const queue of this.queues) {
+      await queue.backfillMetricCounts(100, config.NUQ_FDB_METRICS_V2_ACTIVATE);
+    }
     const work = this.partitionWork(now, logger);
     const offset = this.partitionOffset % Math.max(1, work.length);
     const ordered = [...work.slice(offset), ...work.slice(0, offset)];
