@@ -17,6 +17,7 @@ import {
   JobMeta,
   JobStatusRecord,
   TIME_BUCKETS,
+  decodeI64,
   decodeJson,
   encodeI64,
   encodeJson,
@@ -402,6 +403,63 @@ describeIf("NuQ FDB lifecycle scalability", () => {
       expect(await tn.get(queue.ks.keyActive(keyId))).toBeFalsy();
       expect(await tn.get(queue.ks.teamActiveIndex(teamId))).toBeFalsy();
       expect(await tn.get(queue.ks.keyLedgerIndex(keyId))).toBeFalsy();
+    });
+  }, 30_000);
+
+  test("a staged ingest reservation keeps the team ledger live until release", async () => {
+    const { queue, sweeper } = await makeCtx("ledger-reservation");
+    const owner = randomUUID();
+    const id = randomUUID();
+    let publishStarted!: () => void;
+    let releasePublish!: () => void;
+    const started = new Promise<void>(resolve => {
+      publishStarted = resolve;
+    });
+    const blocked = new Promise<void>(resolve => {
+      releasePublish = resolve;
+    });
+    const originalPublish = (queue as any).publishIngestBatch.bind(queue);
+    const publish = vi
+      .spyOn(queue as any, "publishIngestBatch")
+      .mockImplementation(async (...args: unknown[]) => {
+        publishStarted();
+        await blocked;
+        return await originalPublish(...args);
+      });
+    const adding = queue.addJobs(
+      [
+        {
+          id,
+          data: scrapeData(),
+          options: { ownerId: owner },
+        },
+      ],
+      gate(10),
+    );
+
+    await started;
+    try {
+      await sweeper.sweepOnce();
+      await getNuqFdbDatabase().doTn(async tn => {
+        expect(
+          decodeI64(await tn.get(queue.ks.teamIngestReserved(owner))),
+        ).toBe(1);
+        expect(await tn.get(queue.ks.teamLedgerGcIndex(owner))).toBeTruthy();
+      });
+    } finally {
+      releasePublish();
+      await adding;
+      publish.mockRestore();
+    }
+
+    const job = await queue.getJobToProcess();
+    expect(job?.id).toBe(id);
+    await queue.jobFinish(job!.id, job!.lock!, null);
+    await sweeper.sweepOnce();
+    await getNuqFdbDatabase().doTn(async tn => {
+      expect(await tn.get(queue.ks.teamLimit(owner))).toBeTruthy();
+      expect(await tn.get(queue.ks.teamIngestReserved(owner))).toBeFalsy();
+      expect(await tn.get(queue.ks.teamLedgerGcIndex(owner))).toBeFalsy();
     });
   }, 30_000);
 

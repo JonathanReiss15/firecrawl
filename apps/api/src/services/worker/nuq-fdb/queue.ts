@@ -62,7 +62,6 @@ import {
   bumpGroupStatusCount,
   bumpTeamActive,
   alignQueueMetricStatus,
-  bumpQueueStatus,
   bumpKeyActive,
   scheduleRaiseTask,
   GroupJobIndexValue,
@@ -647,6 +646,7 @@ export class NuQFdbQueue<JobData = any, JobReturnValue = any> {
           throw new QueueFullError(pending + reserved, opMeta.q);
         }
         tn.add(ks.teamIngestReserved(opMeta.o), encodeI64(gated));
+        tn.set(ks.teamLedgerGcIndex(opMeta.o), EMPTY);
         const storedBuf = await tn.get(ks.teamLimit(opMeta.o));
         const stored = storedBuf ? decodeI64(storedBuf) : null;
         if (stored !== opMeta.l) {

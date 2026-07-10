@@ -2015,7 +2015,11 @@ export class NuqFdbSweeper {
             kind === "team" ? ks.teamPendingCount(id) : ks.keyPendingCount(id),
           ),
         );
-        if (active > 0 || pending > 0) return;
+        const reserved =
+          kind === "team"
+            ? decodeI64(await tn.get(ks.teamIngestReserved(id)))
+            : 0;
+        if (active > 0 || pending > 0 || reserved > 0) return;
         // Delayed and crawl-pending work intentionally holds neither an
         // active nor a pending slot at the inner gates. Keep the cold limit
         // key so such latent work cannot wake up to Infinity; collect the
@@ -2023,6 +2027,7 @@ export class NuqFdbSweeper {
         if (kind === "team") {
           tn.clear(ks.teamActive(id));
           tn.clear(ks.teamPendingCount(id));
+          tn.clear(ks.teamIngestReserved(id));
           const shards = ks.teamShardCountRange(id);
           tn.clearRange(shards.begin, shards.end);
           tn.clear(ks.teamActiveIndex(id));
