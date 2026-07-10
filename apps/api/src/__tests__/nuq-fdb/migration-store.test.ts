@@ -1169,7 +1169,7 @@ describeIf("NuQ global FDB migration control plane", () => {
       );
       clock.mockReturnValue(base + 46 * 24 * 60 * 60 * 1000);
       const authority = {
-        pgObjectExists: vi.fn(async () => false),
+        pgObjectExists: vi.fn(async (_pin: { objectId: string }) => false),
         fdbReferenceExistsInTxn: vi.fn(
           async (
             tn: import("foundationdb").Transaction,
@@ -1216,7 +1216,11 @@ describeIf("NuQ global FDB migration control plane", () => {
       await expect(
         store.inspectPin("scrape_job", retainedId),
       ).resolves.toBeNull();
-      expect(authority.pgObjectExists).not.toHaveBeenCalled();
+      expect(
+        authority.pgObjectExists.mock.calls.some(([pin]) =>
+          ids.includes(pin.objectId),
+        ),
+      ).toBe(false);
     } finally {
       clock.mockRestore();
     }
@@ -1296,12 +1300,40 @@ describeIf("NuQ global FDB migration control plane", () => {
       });
       const transitionOperationId = randomUUID();
       await begin(teamId, transitionOperationId);
+      const fdb = getFdb();
+      const generationGcRange = fdb.tuple.range([
+        "nuq-migration",
+        1,
+        "gc",
+        "generation",
+      ]);
+      const targetGcEntry = await getNuqFdbDatabase().doTn(async tn => {
+        const rows = await tn
+          .snapshot()
+          .getRangeAll(
+            generationGcRange.begin as Buffer,
+            generationGcRange.end as Buffer,
+          );
+        return rows.find(([key]) => {
+          const parts = fdb.tuple.unpack(key as Buffer).map(String);
+          return parts.includes(teamId) && parts.includes("2");
+        }) as [Buffer, Buffer] | undefined;
+      });
+      expect(targetGcEntry).toBeDefined();
       await store.finalSeal({ teamId, transitionOperationId });
+      // Simulate a delayed writer restoring the target's now-stale closed
+      // generation entry. The open generation/version CAS must make it a no-op.
+      await getNuqFdbDatabase().doTn(async tn =>
+        tn.set(targetGcEntry![0], targetGcEntry![1]),
+      );
       clock.mockReturnValue(base + 46 * 24 * 60 * 60 * 1000);
 
+      let staleGenerationEntries = 0;
       for (let partition = 0; partition < 32; partition++) {
-        await store.sweepClosedGenerations();
+        staleGenerationEntries +=
+          (await store.sweepClosedGenerations())?.stale ?? 0;
       }
+      expect(staleGenerationEntries).toBeGreaterThan(0);
       await expect(
         store.inspectGenerationIfPresent(teamId, 1),
       ).resolves.not.toBeNull();

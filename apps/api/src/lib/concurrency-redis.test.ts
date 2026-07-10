@@ -1,22 +1,29 @@
 import { vi } from "vitest";
 
-const evalMock = vi.hoisted(() => vi.fn());
+const redisMocks = vi.hoisted(() => ({
+  eval: vi.fn(),
+  zrangebyscore: vi.fn(),
+  zrem: vi.fn(),
+}));
+const evalMock = redisMocks.eval;
 
 vi.mock("../services/queue-service", () => ({
-  getRedisConnection: () => ({ eval: evalMock }),
+  getRedisConnection: () => redisMocks,
 }));
 
 import {
+  CONCURRENCY_ROLLBACK_MARKER_TTL_MS,
   finalizeConcurrencyLimitActiveJobRollback,
   getConcurrencyLimitActiveJobsCount,
   pushConcurrencyLimitActiveJob,
+  recoverConcurrencyLimitRollbacks,
   renewConcurrencyLimitActiveJob,
   reserveConcurrencyLimitActiveJob,
   rollbackConcurrencyLimitActiveJob,
 } from "./concurrency-redis";
 
 describe("PG concurrency slot reservation", () => {
-  beforeEach(() => evalMock.mockReset());
+  beforeEach(() => vi.clearAllMocks());
 
   test("uses one Redis script for capacity check and insertion", async () => {
     evalMock.mockResolvedValue([1, 1]);
@@ -113,12 +120,21 @@ describe("PG concurrency slot reservation", () => {
     ).resolves.toBe(false);
     expect(evalMock.mock.calls[0]).toEqual([
       expect.stringContaining("GET"),
-      2,
+      3,
       "concurrency-limiter:team",
       "concurrency-limiter:team:reservation:holder",
+      "concurrency-rollback-cleanup:v1",
       "holder",
       "stale-token",
+      JSON.stringify({
+        v: 1,
+        teamId: "team",
+        id: "holder",
+        token: "stale-token",
+      }),
+      CONCURRENCY_ROLLBACK_MARKER_TTL_MS,
     ]);
+    expect(evalMock.mock.calls[0][0]).not.toContain("PERSIST");
   });
 
   test("finalizes the cleanup tombstone by ownership token", async () => {
@@ -133,10 +149,76 @@ describe("PG concurrency slot reservation", () => {
     ).resolves.toBe(true);
     expect(evalMock.mock.calls[0]).toEqual([
       expect.stringContaining("cleanup:"),
-      1,
+      2,
       "concurrency-limiter:team:reservation:holder",
+      "concurrency-rollback-cleanup:v1",
       "owned-token",
+      JSON.stringify({
+        v: 1,
+        teamId: "team",
+        id: "holder",
+        token: "owned-token",
+      }),
     ]);
+  });
+
+  test("recovers abandoned rollback without a same-holder retry", async () => {
+    const member = JSON.stringify({
+      v: 1,
+      teamId: "team",
+      id: "holder",
+      token: "abandoned",
+    });
+    redisMocks.zrangebyscore.mockResolvedValue([member]);
+    evalMock.mockResolvedValue(1);
+
+    await expect(recoverConcurrencyLimitRollbacks(10)).resolves.toEqual({
+      read: 1,
+      finalized: 1,
+      fenced: 0,
+    });
+    expect(redisMocks.zrangebyscore).toHaveBeenCalledWith(
+      "concurrency-rollback-cleanup:v1",
+      "-inf",
+      expect.any(Number),
+      "LIMIT",
+      0,
+      10,
+    );
+    expect(evalMock.mock.calls[0]).toEqual([
+      expect.stringContaining("Never delete it"),
+      2,
+      "concurrency-limiter:team:reservation:holder",
+      "concurrency-rollback-cleanup:v1",
+      "abandoned",
+      member,
+    ]);
+  });
+
+  test("renewal/reacquire fencing and marker loss only retire the old index", async () => {
+    const replacement = JSON.stringify({
+      v: 1,
+      teamId: "team",
+      id: "replacement",
+      token: "old",
+    });
+    const lost = JSON.stringify({
+      v: 1,
+      teamId: "team",
+      id: "lost",
+      token: "lost",
+    });
+    redisMocks.zrangebyscore.mockResolvedValue([replacement, lost]);
+    evalMock.mockResolvedValue(0);
+
+    await expect(recoverConcurrencyLimitRollbacks(2)).resolves.toEqual({
+      read: 2,
+      finalized: 0,
+      fenced: 2,
+    });
+    const script = evalMock.mock.calls[0][0] as string;
+    expect(script).toContain("marker == 'cleanup:'");
+    expect(script).not.toContain("ZREM', KEYS[1]");
   });
 
   test("uses Redis time for legacy reads, writes, and renewals", async () => {

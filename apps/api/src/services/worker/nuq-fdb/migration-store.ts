@@ -944,6 +944,22 @@ export class NuqFdbMigrationStore {
     ]);
   }
 
+  private legacyObjectOperationRange(
+    teamId: string,
+    kind: MigrationObjectKind,
+    objectId: string,
+  ) {
+    return getFdb().tuple.range([
+      "nuq-migration",
+      1,
+      "team",
+      teamId,
+      "object-operation",
+      kind,
+      objectId,
+    ]);
+  }
+
   private writeGenerationInTxn(
     tn: Transaction,
     previous: MigrationGeneration | null,
@@ -2625,12 +2641,36 @@ export class NuqFdbMigrationStore {
             tn,
             current,
           );
+          const operationRange = this.legacyObjectOperationRange(
+            current.teamId,
+            current.kind,
+            current.objectId,
+          );
+          const operationRows = await tn.getRangeAll(
+            operationRange.begin as Buffer,
+            operationRange.end as Buffer,
+            { limit: MIGRATION_GC_PAGE_LIMIT },
+          );
           if (
             pgExists ||
             hasFdbReference ||
             teamIndex ||
             Object.values(current.residue).some(value => value !== 0)
           ) {
+            tn.clear(indexKey);
+            tn.set(
+              this.terminalPinGcKey(current, now + recheckMs),
+              Buffer.alloc(0),
+            );
+            return "retained" as const;
+          }
+          // Prototype operation ledgers are boundedly compacted only after the
+          // pin's full retention window. Delete the pin in the same commit only
+          // when no operation token remains to reference it.
+          for (const [operationKey] of operationRows) {
+            tn.clear(operationKey as Buffer);
+          }
+          if (operationRows.length === MIGRATION_GC_PAGE_LIMIT) {
             tn.clear(indexKey);
             tn.set(
               this.terminalPinGcKey(current, now + recheckMs),

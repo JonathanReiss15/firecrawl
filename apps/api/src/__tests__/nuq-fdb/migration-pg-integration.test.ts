@@ -11,6 +11,7 @@ import { config } from "../../config";
 import {
   finalizeConcurrencyLimitActiveJobRollback,
   getConcurrencyLimitActiveJobsCount,
+  recoverConcurrencyLimitRollbacks,
   removeConcurrencyLimitActiveJob,
   reserveConcurrencyLimitActiveJob,
   rollbackConcurrencyLimitActiveJob,
@@ -94,8 +95,21 @@ async function clearMigrationTeam(teamId: string): Promise<void> {
     const rows = await tn
       .snapshot()
       .getRangeAll(objects.begin as Buffer, objects.end as Buffer);
+    const objectIds = new Set<string>();
     for (const [key, value] of rows) {
-      if (JSON.parse((value as Buffer).toString()).teamId === teamId) {
+      const pin = JSON.parse((value as Buffer).toString());
+      if (pin.teamId === teamId) {
+        objectIds.add(pin.objectId);
+        tn.clear(key as Buffer);
+      }
+    }
+    const gc = fdb.tuple.range(["nuq-migration", 1, "gc"]);
+    const gcRows = await tn
+      .snapshot()
+      .getRangeAll(gc.begin as Buffer, gc.end as Buffer);
+    for (const [key] of gcRows) {
+      const parts = fdb.tuple.unpack(key as Buffer).map(String);
+      if (parts.includes(teamId) || parts.some(part => objectIds.has(part))) {
         tn.clear(key as Buffer);
       }
     }
@@ -243,6 +257,67 @@ describeIf("NuQ PG publication with durable FDB authority", () => {
       ),
     ).resolves.toBe(false);
     await removeConcurrencyLimitActiveJob(capacityTeamId, replacementHolder);
+  });
+
+  test("bounded rollback recovery needs no holder retry and fences a replacement", async () => {
+    const abandoned = randomUUID();
+    const first = await reserveConcurrencyLimitActiveJob(
+      capacityTeamId,
+      abandoned,
+      3,
+      30_000,
+    );
+    expect(first.rollbackToken).toEqual(expect.any(String));
+    await expect(
+      rollbackConcurrencyLimitActiveJob(
+        capacityTeamId,
+        abandoned,
+        first.rollbackToken!,
+        30_000,
+      ),
+    ).resolves.toBe(true);
+    await expect(recoverConcurrencyLimitRollbacks(100)).resolves.toMatchObject({
+      finalized: expect.any(Number),
+    });
+    await expect(
+      getRedisConnection().get(
+        `concurrency-limiter:${capacityTeamId}:reservation:${abandoned}`,
+      ),
+    ).resolves.toBeNull();
+
+    const raced = randomUUID();
+    const racedReservation = await reserveConcurrencyLimitActiveJob(
+      capacityTeamId,
+      raced,
+      3,
+      30_000,
+    );
+    await rollbackConcurrencyLimitActiveJob(
+      capacityTeamId,
+      raced,
+      racedReservation.rollbackToken!,
+      30_000,
+    );
+    const redis = getRedisConnection();
+    await redis.zadd(
+      `concurrency-limiter:${capacityTeamId}`,
+      Date.now() + 30_000,
+      raced,
+    );
+    await redis.set(
+      `concurrency-limiter:${capacityTeamId}:reservation:${raced}`,
+      "held",
+      "PX",
+      30_000,
+    );
+    await recoverConcurrencyLimitRollbacks(100);
+    await expect(
+      redis.zscore(`concurrency-limiter:${capacityTeamId}`, raced),
+    ).resolves.not.toBeNull();
+    await expect(
+      redis.get(`concurrency-limiter:${capacityTeamId}:reservation:${raced}`),
+    ).resolves.toBe("held");
+    await removeConcurrencyLimitActiveJob(capacityTeamId, raced);
   });
 
   test("PG queue and external admissions share one atomic capacity ledger", async () => {

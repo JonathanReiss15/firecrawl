@@ -5,6 +5,7 @@ import { getRedisConnection } from "../services/queue-service";
 import { scrapeQueue, type NuQJob } from "../services/worker/nuq";
 import {
   getCombinedTeamActiveCount,
+  sweepNuQMigrationGc,
   syncFdbLimitToPgOccupancy,
 } from "../services/worker/nuq-router";
 import {
@@ -25,6 +26,7 @@ import {
   restoreConcurrentJob,
 } from "./concurrency-limit";
 import { getCrawl } from "./crawl-redis";
+import { recoverConcurrencyLimitRollbacks } from "./concurrency-redis";
 import { logger as _logger } from "./logger";
 
 interface ReconcileOptions {
@@ -508,6 +510,9 @@ export async function reconcileConcurrencyQueue(
       .filter(id => id.length > 0 && isUUID(id));
     ownerIds = [...new Set([...backlogOwners, ...queueOwners])];
   }
+
+  await recoverConcurrencyLimitRollbacks();
+  await sweepNuQMigrationGc();
 
   const result: ReconcileResult = {
     teamsScanned: ownerIds.length,

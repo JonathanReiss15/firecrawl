@@ -17,6 +17,20 @@ export function getTeamQueueLimit(concurrencyLimit: number): number {
 // unrecoverable anyway — its StoredCrawl in Redis (24h TTL) is gone.
 export const MAX_BACKLOG_TIMEOUT_MS = 172800000; // 48h
 
+const CONCURRENCY_ROLLBACK_QUEUE = "concurrency-rollback-cleanup:v1";
+// Deliberately longer than every normal holder lease. The durable FDB holder
+// deadline remains the recovery authority if Redis itself is lost.
+export const CONCURRENCY_ROLLBACK_MARKER_TTL_MS = 7 * 24 * 60 * 60 * 1000;
+const CONCURRENCY_ROLLBACK_BATCH = 100;
+
+function concurrencyRollbackQueueMember(
+  teamId: string,
+  id: string,
+  token: string,
+): string {
+  return JSON.stringify({ v: 1, teamId, id, token });
+}
+
 export const constructConcurrencyLimitKey = (team_id: string) =>
   "concurrency-limiter:" + team_id;
 
@@ -174,8 +188,10 @@ export async function removeConcurrencyLimitActiveJob(
 const rollbackConcurrencySlotScript = `
 if redis.call('GET', KEYS[2]) ~= 'owner:' .. ARGV[2] then return 0 end
 redis.call('ZREM', KEYS[1], ARGV[1])
-redis.call('SET', KEYS[2], 'cleanup:' .. ARGV[2])
-redis.call('PERSIST', KEYS[2])
+local t = redis.call('TIME')
+local now_ms = t[1] * 1000 + math.floor(t[2] / 1000)
+redis.call('SET', KEYS[2], 'cleanup:' .. ARGV[2], 'PX', ARGV[4])
+redis.call('ZADD', KEYS[3], now_ms, ARGV[3])
 return 1
 `;
 
@@ -183,15 +199,23 @@ export async function rollbackConcurrencyLimitActiveJob(
   teamId: string,
   id: string,
   rollbackToken: string,
+  holderTtlMs = 0,
 ): Promise<boolean> {
+  const markerTtlMs = Math.max(
+    CONCURRENCY_ROLLBACK_MARKER_TTL_MS,
+    holderTtlMs + 24 * 60 * 60 * 1000,
+  );
   return (
     (await getRedisConnection().eval(
       rollbackConcurrencySlotScript,
-      2,
+      3,
       constructConcurrencyLimitKey(teamId),
       constructConcurrencyReservationKey(teamId, id),
+      CONCURRENCY_ROLLBACK_QUEUE,
       id,
       rollbackToken,
+      concurrencyRollbackQueueMember(teamId, id, rollbackToken),
+      markerTtlMs,
     )) === 1
   );
 }
@@ -199,6 +223,7 @@ export async function rollbackConcurrencyLimitActiveJob(
 const finalizeConcurrencyRollbackScript = `
 if redis.call('GET', KEYS[1]) ~= 'cleanup:' .. ARGV[1] then return 0 end
 redis.call('DEL', KEYS[1])
+redis.call('ZREM', KEYS[2], ARGV[2])
 return 1
 `;
 
@@ -210,11 +235,90 @@ export async function finalizeConcurrencyLimitActiveJobRollback(
   return (
     (await getRedisConnection().eval(
       finalizeConcurrencyRollbackScript,
-      1,
+      2,
       constructConcurrencyReservationKey(teamId, id),
+      CONCURRENCY_ROLLBACK_QUEUE,
       rollbackToken,
+      concurrencyRollbackQueueMember(teamId, id, rollbackToken),
     )) === 1
   );
+}
+
+type ConcurrencyRollbackQueueEntry = {
+  v: 1;
+  teamId: string;
+  id: string;
+  token: string;
+};
+
+const recoverConcurrencyRollbackScript = `
+local marker = redis.call('GET', KEYS[1])
+if marker == 'cleanup:' .. ARGV[1] then
+  redis.call('DEL', KEYS[1])
+end
+-- A renewal/reacquire may have replaced the marker. Never delete it, but this
+-- exact old queue item is complete either way.
+redis.call('ZREM', KEYS[2], ARGV[2])
+return marker == 'cleanup:' .. ARGV[1] and 1 or 0
+`;
+
+/** Drains one bounded due page. It never scans Redis keyspace and exact-token
+ * fencing prevents a delayed cleanup from deleting a replacement holder. */
+export async function recoverConcurrencyLimitRollbacks(
+  limit = CONCURRENCY_ROLLBACK_BATCH,
+): Promise<{ read: number; finalized: number; fenced: number }> {
+  if (!Number.isSafeInteger(limit) || limit < 1 || limit > 1000) {
+    throw new TypeError("rollback recovery limit must be between 1 and 1000");
+  }
+  const redis = getRedisConnection();
+  const now = Date.now();
+  const members = await redis.zrangebyscore(
+    CONCURRENCY_ROLLBACK_QUEUE,
+    "-inf",
+    now,
+    "LIMIT",
+    0,
+    limit,
+  );
+  let finalized = 0;
+  let fenced = 0;
+  for (const member of members) {
+    let entry: ConcurrencyRollbackQueueEntry | null = null;
+    try {
+      const decoded = JSON.parse(
+        member,
+      ) as Partial<ConcurrencyRollbackQueueEntry>;
+      if (
+        decoded.v === 1 &&
+        typeof decoded.teamId === "string" &&
+        decoded.teamId.length > 0 &&
+        typeof decoded.id === "string" &&
+        decoded.id.length > 0 &&
+        typeof decoded.token === "string" &&
+        decoded.token.length > 0
+      ) {
+        entry = decoded as ConcurrencyRollbackQueueEntry;
+      }
+    } catch {
+      // Corrupt queue entries carry no authority.
+    }
+    if (!entry) {
+      await redis.zrem(CONCURRENCY_ROLLBACK_QUEUE, member);
+      fenced++;
+      continue;
+    }
+    const removed = await redis.eval(
+      recoverConcurrencyRollbackScript,
+      2,
+      constructConcurrencyReservationKey(entry.teamId, entry.id),
+      CONCURRENCY_ROLLBACK_QUEUE,
+      entry.token,
+      member,
+    );
+    if (removed === 1) finalized++;
+    else fenced++;
+  }
+  return { read: members.length, finalized, fenced };
 }
 
 const renewConcurrencySlotScript = `

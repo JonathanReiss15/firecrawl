@@ -238,9 +238,9 @@ async function legacyGenerationForBackend(
   }
   for (let generation = state.maxGeneration; generation >= 1; generation--) {
     const record = await optionalFdbRead(() =>
-      nuqFdbMigrationStore.inspectGeneration(teamId, generation),
+      nuqFdbMigrationStore.inspectGenerationIfPresent(teamId, generation),
     );
-    if (record.generation.backend === backend) return generation;
+    if (record?.generation.backend === backend) return generation;
   }
   return await fdbMutation(() =>
     nuqFdbMigrationStore.ensureTerminalLegacyGeneration(teamId, backend),
@@ -785,6 +785,96 @@ async function completeRoutingPin(
   );
 }
 
+/** One bounded production GC tick. Runtime FDB rows are checked in the same
+ * transaction as tombstone deletion; PG and Redis-holder probes are bounded
+ * point reads followed by that FDB CAS. */
+export async function sweepNuQMigrationGc(): Promise<void> {
+  if (!fdbQueueEnabled()) return;
+  await nuqFdbMigrationStore.sweepTerminalPins({
+    pgObjectExists: async pin => {
+      if (pin.backend !== "pg") return false;
+      if (pin.kind === "scrape_job") return await pgHasScrapeJob(pin.objectId);
+      if (pin.kind === "group") {
+        return (await crawlGroupPg.getGroup(pin.objectId)) !== null;
+      }
+      if (pin.kind === "crawl_finished") {
+        return (await crawlFinishedQueuePg.getJob(pin.objectId)) !== null;
+      }
+      if (pin.kind === "external_holder") {
+        const prefix = `${pin.teamId}/`;
+        if (!pin.objectId.startsWith(prefix)) return true;
+        return (
+          (await getRedisConnection().zscore(
+            constructConcurrencyLimitKey(pin.teamId),
+            pin.objectId.slice(prefix.length),
+          )) !== null
+        );
+      }
+      return false;
+    },
+    fdbReferenceExistsInTxn: async (tn, pin) => {
+      if (pin.kind === "scrape_job") {
+        const [status, meta, ownerIndex, removal] = await Promise.all([
+          tn.get(scrapeQueueFdb.ks.jobStatus(pin.objectId)),
+          tn.get(scrapeQueueFdb.ks.jobMeta(pin.objectId)),
+          tn.get(scrapeQueueFdb.ks.ownerLiveJob(pin.teamId, pin.objectId)),
+          pgJobRemovalsFdb.hasInTxn(tn, pin.objectId),
+        ]);
+        return Boolean(status || meta || ownerIndex || removal);
+      }
+      if (pin.kind === "crawl_finished") {
+        const [status, meta, ownerIndex] = await Promise.all([
+          tn.get(crawlFinishedQueueFdb.ks.jobStatus(pin.objectId)),
+          tn.get(crawlFinishedQueueFdb.ks.jobMeta(pin.objectId)),
+          tn.get(
+            crawlFinishedQueueFdb.ks.ownerLiveJob(pin.teamId, pin.objectId),
+          ),
+        ]);
+        return Boolean(status || meta || ownerIndex);
+      }
+      if (pin.kind === "group") {
+        const [meta, ownerIndex, cancelTask, legacyCancelTask, cancelCursor] =
+          await Promise.all([
+            tn.get(crawlGroupFdb.ks.groupMeta(pin.objectId)),
+            tn.get(crawlGroupFdb.ks.ongoingGroup(pin.teamId, pin.objectId)),
+            tn.get(crawlGroupFdb.ks.taskGroupCancel(pin.objectId)),
+            tn.get(crawlGroupFdb.ks.pack(["task", "gcancel", pin.objectId])),
+            tn.get(crawlGroupFdb.ks.groupCancelCursor(pin.objectId)),
+          ]);
+        return Boolean(
+          meta || ownerIndex || cancelTask || legacyCancelTask || cancelCursor,
+        );
+      }
+      if (pin.kind === "external_holder") {
+        const prefix = `${pin.teamId}/`;
+        if (!pin.objectId.startsWith(prefix)) return true;
+        return await externalSlotsFdb.hasMigrationReferenceInTxn(
+          tn,
+          pin.teamId,
+          pin.objectId.slice(prefix.length),
+        );
+      }
+      if (pin.kind === "sweeper_task") {
+        const prefix = "group-cancel/";
+        if (!pin.objectId.startsWith(prefix)) return true;
+        const groupId = pin.objectId.slice(prefix.length);
+        const [task, legacyTask, cursor, group] = await Promise.all([
+          tn.get(crawlGroupFdb.ks.taskGroupCancel(groupId)),
+          tn.get(crawlGroupFdb.ks.pack(["task", "gcancel", groupId])),
+          tn.get(crawlGroupFdb.ks.groupCancelCursor(groupId)),
+          tn.get(crawlGroupFdb.ks.groupMeta(groupId)),
+        ]);
+        return Boolean(task || legacyTask || cursor || group);
+      }
+      return false;
+    },
+  });
+  // History is removed before generations so generation-control references
+  // naturally enforce the required ordering.
+  await nuqFdbMigrationStore.sweepControlHistory();
+  await nuqFdbMigrationStore.sweepClosedGenerations();
+}
+
 // === External capacity holders (browser sessions, sync scrapes)
 //
 // Non-queue work that occupies team capacity is durably pinned. Renew/release
@@ -926,6 +1016,7 @@ export async function reserveExternalSlot(
             teamId,
             holderId,
             reservation.rollbackToken,
+            ttlMs,
           )
         ) {
           await finalizeConcurrencyLimitActiveJobRollback(
@@ -994,6 +1085,7 @@ export async function reserveExternalSlot(
           teamId,
           holderId,
           reservation.rollbackToken,
+          ttlMs,
         );
       } catch (cleanupError) {
         throw new AggregateError(
