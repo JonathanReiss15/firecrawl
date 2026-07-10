@@ -383,6 +383,31 @@ describeIf("NuQ FDB transaction-scoped migration generation hooks", () => {
     expect((await residue(teamId)).control_crawl_finished).toBe(0);
   });
 
+  test("rejected enqueue compensation cannot race a successful runtime commit", async () => {
+    const teamId = await managedTeam();
+    const id = randomUUID();
+    await prepareJob(teamId, id);
+    const results = await Promise.allSettled([
+      queue.addJob(id, {}, { ownerId: teamId }, unlimited),
+      queue.compensateRejectedMigrationJobs(teamId, [id]),
+    ]);
+    const pin = await store.inspectPin("scrape_job", id);
+    const job = await queue.getJob(id);
+    if (job) {
+      expect(pin).toMatchObject({
+        lifecycle: "active",
+        residue: { capacity_ready_active: 1, intent_unresolved: 0 },
+      });
+      await queue.removeJob(id);
+    } else {
+      expect(pin).toMatchObject({
+        lifecycle: "terminal",
+        residue: { capacity_ready_active: 0, intent_unresolved: 0 },
+      });
+      expect(results[0]).toMatchObject({ status: "rejected" });
+    }
+  });
+
   test("a live enqueue transaction and final seal cannot both commit", async () => {
     const teamId = await managedTeam();
     const id = randomUUID();

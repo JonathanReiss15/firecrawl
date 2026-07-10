@@ -51,6 +51,7 @@ import {
   crawlGroupFdb,
   externalSlotMigrationObjectId,
   externalSlotsFdb,
+  NuqFdbSweeper,
   nuqFdbMigrationStore,
   scrapeQueueFdb,
 } from "../../services/worker/nuq-fdb";
@@ -62,6 +63,7 @@ import {
 const describeIf = config.FDB_CLUSTER_FILE ? describe : describe.skip;
 const teams = new Set<string>();
 const previousBackend = config.NUQ_BACKEND;
+const previousMetricsActivation = config.NUQ_FDB_METRICS_V2_ACTIVATE;
 
 async function clearTeam(teamId: string): Promise<void> {
   const pins = await nuqFdbMigrationStore.inspectTeamPins(teamId);
@@ -88,6 +90,7 @@ async function makeMetricsReady(): Promise<void> {
 describeIf("NuQ durable migration router", () => {
   beforeAll(async () => {
     config.NUQ_BACKEND = "pg";
+    config.NUQ_FDB_METRICS_V2_ACTIVATE = true;
     controls.fdbFlag = false;
     controls.pgResidue = 0;
     await Promise.all([
@@ -100,6 +103,7 @@ describeIf("NuQ durable migration router", () => {
     controls.fdbFlag = false;
     controls.pgResidue = 0;
     config.NUQ_BACKEND = previousBackend;
+    config.NUQ_FDB_METRICS_V2_ACTIVATE = previousMetricsActivation;
     for (const teamId of teams) await clearTeam(teamId);
   });
 
@@ -122,6 +126,24 @@ describeIf("NuQ durable migration router", () => {
       activeGeneration: 1,
       phase: "PG_ONLY",
     });
+  });
+
+  test("disabled activation invalidates prior READY generations before rollback writers", async () => {
+    const teamId = randomUUID();
+    teams.add(teamId);
+    config.NUQ_FDB_METRICS_V2_ACTIVATE = false;
+    await expect(isFdbTeam(teamId)).rejects.toMatchObject({
+      code: "NUQ_FDB_CORE_METRICS_NOT_ACTIVATED",
+      retryable: true,
+    });
+    await expect(
+      scrapeQueueFdb.getMetricCounterBackfillStatus(),
+    ).resolves.toBeNull();
+    await expect(
+      crawlFinishedQueueFdb.getMetricCounterBackfillStatus(),
+    ).resolves.toBeNull();
+    config.NUQ_FDB_METRICS_V2_ACTIVATE = true;
+    await makeMetricsReady();
   });
 
   test("discovers and drains an uncounted pre-protocol FDB job without dual authority", async () => {
@@ -235,6 +257,41 @@ describeIf("NuQ durable migration router", () => {
       activeBackend: "pg",
       phase: "PG_ONLY",
     });
+    const db = getNuqFdbDatabase();
+    await db.doTn(async tn => {
+      const range = crawlGroupFdb.ks.groupRange(groupId);
+      tn.clearRange(range.begin, range.end);
+      tn.clear(crawlGroupFdb.ks.ongoingGroup(teamId, groupId));
+    });
+  });
+
+  test("cancelled legacy groups remain source residue until their sweeper control finishes", async () => {
+    const teamId = randomUUID();
+    const groupId = randomUUID();
+    teams.add(teamId);
+    controls.fdbFlag = false;
+    controls.pgResidue = 0;
+    await crawlGroupFdb.addGroup(groupId, teamId);
+    await crawlGroupFdb.cancelGroup(groupId);
+
+    await expect(isFdbTeam(teamId)).resolves.toBe(true);
+    await expect(isFdbTeam(teamId)).rejects.toMatchObject({
+      code: "NUQ_MIGRATION_IN_PROGRESS",
+    });
+    const sweeper = new NuqFdbSweeper(
+      [scrapeQueueFdb, crawlFinishedQueueFdb],
+      [],
+    );
+    let finished = await crawlFinishedQueueFdb.getJobToProcess();
+    for (let attempt = 0; attempt < 5 && !finished; attempt++) {
+      await sweeper.sweepOnce();
+      finished = await crawlFinishedQueueFdb.getJobToProcess();
+    }
+    expect(finished?.groupId).toBe(groupId);
+    await crawlFinishedQueueFdb.jobFinish(finished!.id, finished!.lock!, {});
+    await crawlFinishedQueueFdb.removeJob(finished!.id);
+    await expect(isFdbTeam(teamId)).resolves.toBe(false);
+
     const db = getNuqFdbDatabase();
     await db.doTn(async tn => {
       const range = crawlGroupFdb.ks.groupRange(groupId);

@@ -2008,6 +2008,37 @@ export class NuQFdbQueue<JobData = any, JobReturnValue = any> {
       );
   }
 
+  // Atomically reconcile a router-prepared intent after enqueue rejected
+  // before creating runtime records. Reading the job status in the same FDB
+  // transaction makes this conflict with a concurrent successful enqueue.
+  public async compensateRejectedMigrationJobs(
+    teamId: string,
+    ids: readonly string[],
+  ): Promise<void> {
+    if (ids.length === 0) return;
+    const ks = this.ks;
+    await this.db.doTn(async tn => {
+      for (const id of ids) {
+        if (await tn.get(ks.jobStatus(id))) continue;
+        const pin = await nuqFdbMigrationStore.inspectPinInTxn(
+          tn,
+          ks.migrationObjectKind,
+          id,
+        );
+        if (!pin || pin.teamId !== teamId || pin.lifecycle !== "prepared") {
+          continue;
+        }
+        await nuqFdbMigrationStore.completePinnedObjectInTxn(tn, {
+          teamId,
+          kind: ks.migrationObjectKind,
+          objectId: id,
+          operationId: `nuq-router/v1/fdb-enqueue-rejected/${id}`,
+          fromLifecycle: "prepared",
+        });
+      }
+    });
+  }
+
   // === Introspection used by status/admin endpoints
 
   // Maintained transactionally with every live/terminal job transition. The

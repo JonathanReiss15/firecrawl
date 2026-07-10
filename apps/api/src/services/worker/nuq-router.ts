@@ -123,7 +123,7 @@ async function hasAuthoritativeFdbTeamResidue(
       crawlFinishedPending,
       crawlFinishedActive,
       crawlFinishedIndexedLive,
-      groups,
+      unfinishedGroups,
     ] = await Promise.all([
       scrapeQueueFdb.getTeamPendingCount(teamId),
       scrapeQueueFdb.getTeamActiveCount(teamId),
@@ -131,7 +131,7 @@ async function hasAuthoritativeFdbTeamResidue(
       crawlFinishedQueueFdb.getTeamPendingCount(teamId),
       crawlFinishedQueueFdb.getTeamActiveCount(teamId),
       crawlFinishedQueueFdb.hasReadyOrActiveJobForOwner(teamId),
-      crawlGroupFdb.getOngoingByOwner(teamId),
+      crawlGroupFdb.hasUnfinishedByOwner(teamId),
     ]);
     return hasLegacyFdbTeamResidue({
       scrapePending,
@@ -140,12 +140,28 @@ async function hasAuthoritativeFdbTeamResidue(
       crawlFinishedPending,
       crawlFinishedActive,
       crawlFinishedIndexedLive,
-      activeGroups: groups.length,
+      activeGroups: unfinishedGroups ? 1 : 0,
     });
   });
 }
 
 async function requireFdbCoreMetricReadiness(): Promise<void> {
+  // Release A (and rollback) runs with activation disabled. Invalidate any
+  // prior READY generation before it can be trusted by a later deployment;
+  // this is the production rollback caller for the core protocol.
+  if (!config.NUQ_FDB_METRICS_V2_ACTIVATE) {
+    await fdbMutation(() =>
+      Promise.all([
+        scrapeQueueFdb.invalidateMetricCounterGeneration(),
+        crawlFinishedQueueFdb.invalidateMetricCounterGeneration(),
+      ]),
+    );
+    throw new NuQRouterError(
+      "NUQ_FDB_CORE_METRICS_NOT_ACTIVATED",
+      "NuQ FDB migration is frozen until corrected-core metric activation is enabled",
+      true,
+    );
+  }
   const [scrape, crawlFinished] = await optionalFdbRead(() =>
     Promise.all([
       scrapeQueueFdb.getMetricCounterBackfillStatus(),
@@ -919,80 +935,109 @@ export async function fdbEnqueueScrapeJobs(
       );
     }
   }
-  let teamLimit: number | null = null;
-  if (!isSelfHosted() && !fdbForced()) {
-    const acuc = await getACUCTeam(teamId, false, true, RateLimiterMode.Crawl);
-    teamLimit = acuc?.concurrency ?? 2;
-  } else if (!isSelfHosted()) {
-    const acuc = await getACUCTeam(teamId, false, true, RateLimiterMode.Crawl);
-    teamLimit = acuc?.concurrency ?? null;
-  }
+  try {
+    let teamLimit: number | null = null;
+    if (!isSelfHosted() && !fdbForced()) {
+      const acuc = await getACUCTeam(
+        teamId,
+        false,
+        true,
+        RateLimiterMode.Crawl,
+      );
+      teamLimit = acuc?.concurrency ?? 2;
+    } else if (!isSelfHosted()) {
+      const acuc = await getACUCTeam(
+        teamId,
+        false,
+        true,
+        RateLimiterMode.Crawl,
+      );
+      teamLimit = acuc?.concurrency ?? null;
+    }
 
-  const queueCap =
-    teamLimit === null ? Number.MAX_SAFE_INTEGER : getTeamQueueLimit(teamLimit);
+    const queueCap =
+      teamLimit === null
+        ? Number.MAX_SAFE_INTEGER
+        : getTeamQueueLimit(teamLimit);
 
-  // API-key-scoped concurrency: applies when every job in the batch was
-  // requested with the same key (batches always are; child jobs inherit the
-  // kickoff's apiKeyId) and that key has a limit configured.
-  let keyGate: { id: string; limit: number } | null = null;
-  if (teamLimit !== null) {
-    const keyIds = new Set(jobs.map(j => j.data.apiKeyId ?? null));
-    const apiKeyId = keyIds.size === 1 ? [...keyIds][0] : null;
-    if (apiKeyId !== null) {
-      const keyLimit = await getApiKeyConcurrencyLimit(apiKeyId);
-      if (keyLimit !== null) {
-        keyGate = { id: String(apiKeyId), limit: keyLimit };
+    // API-key-scoped concurrency: applies when every job in the batch was
+    // requested with the same key (batches always are; child jobs inherit the
+    // kickoff's apiKeyId) and that key has a limit configured.
+    let keyGate: { id: string; limit: number } | null = null;
+    if (teamLimit !== null) {
+      const keyIds = new Set(jobs.map(j => j.data.apiKeyId ?? null));
+      const apiKeyId = keyIds.size === 1 ? [...keyIds][0] : null;
+      if (apiKeyId !== null) {
+        const keyLimit = await getApiKeyConcurrencyLimit(apiKeyId);
+        if (keyLimit !== null) {
+          keyGate = { id: String(apiKeyId), limit: keyLimit };
+        }
       }
     }
-  }
 
-  const results = await fdbMutation(() =>
-    scrapeQueueFdb.addJobs(
-      jobs.map(j => ({
-        id: j.jobId,
-        data: j.data,
-        options: {
-          priority: j.priority,
-          listenable: j.listenable ?? false,
-          ownerId: j.data.team_id ?? undefined,
-          groupId: j.data.crawl_id ?? undefined,
-          bypassGate:
-            options?.bypassGate ||
-            j.data.mode === "kickoff" ||
-            j.data.mode === "kickoff_sitemap",
-          timesOutAt: new Date(Date.now() + j.backlogTimeoutMs),
-        },
-      })),
-      { teamLimit, queueCap, key: keyGate },
-    ),
-  );
-
-  const tagged = results.map(r => tagFdbJob(r as NuQJob<ScrapeJobData>));
-  await Promise.all(
-    tagged.map((job, index) =>
-      activateRoutingPin(
-        pins[index],
-        job.status === "backlog"
-          ? { capacity_team_pending: 1 }
-          : { capacity_ready_active: 1 },
-        "fdb-job-active",
+    const results = await fdbMutation(() =>
+      scrapeQueueFdb.addJobs(
+        jobs.map(j => ({
+          id: j.jobId,
+          data: j.data,
+          options: {
+            priority: j.priority,
+            listenable: j.listenable ?? false,
+            ownerId: j.data.team_id ?? undefined,
+            groupId: j.data.crawl_id ?? undefined,
+            bypassGate:
+              options?.bypassGate ||
+              j.data.mode === "kickoff" ||
+              j.data.mode === "kickoff_sitemap",
+            timesOutAt: new Date(Date.now() + j.backlogTimeoutMs),
+          },
+        })),
+        { teamLimit, queueCap, key: keyGate },
       ),
-    ),
-  );
-  for (const job of tagged) {
-    void markJobBackend(job.id, "fdb").catch(error =>
-      _logger.warn("Failed to cache FDB job backend", {
-        module: "nuq-router",
-        jobId: job.id,
-        error,
-      }),
     );
+
+    const tagged = results.map(r => tagFdbJob(r as NuQJob<ScrapeJobData>));
+    await Promise.all(
+      tagged.map((job, index) =>
+        activateRoutingPin(
+          pins[index],
+          job.status === "backlog"
+            ? { capacity_team_pending: 1 }
+            : { capacity_ready_active: 1 },
+          "fdb-job-active",
+        ),
+      ),
+    );
+    for (const job of tagged) {
+      void markJobBackend(job.id, "fdb").catch(error =>
+        _logger.warn("Failed to cache FDB job backend", {
+          module: "nuq-router",
+          jobId: job.id,
+          error,
+        }),
+      );
+    }
+    return {
+      jobs: tagged,
+      backloggedCount: tagged.filter(j => j.status === "backlog").length,
+      teamLimit,
+    };
+  } catch (error) {
+    try {
+      await fdbMutation(() =>
+        scrapeQueueFdb.compensateRejectedMigrationJobs(
+          teamId,
+          jobs.map(job => job.jobId),
+        ),
+      );
+    } catch (cleanupError) {
+      throw new AggregateError(
+        [error, cleanupError],
+        "FDB enqueue rejection and prepared-intent compensation both failed",
+      );
+    }
+    throw error;
   }
-  return {
-    jobs: tagged,
-    backloggedCount: tagged.filter(j => j.status === "backlog").length,
-    teamLimit,
-  };
 }
 
 // === Routed scrape queue

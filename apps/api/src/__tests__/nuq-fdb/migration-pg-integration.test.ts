@@ -30,6 +30,7 @@ import { scrapeQueue as routedScrapeQueue } from "../../services/worker/nuq-rout
 const describeIf =
   config.FDB_CLUSTER_FILE && config.NUQ_DATABASE_URL ? describe : describe.skip;
 const previousBackend = config.NUQ_BACKEND;
+const previousMetricsActivation = config.NUQ_FDB_METRICS_V2_ACTIVATE;
 
 async function makeMetricsReady(): Promise<void> {
   for (const queue of [scrapeQueueFdb, crawlFinishedQueueFdb]) {
@@ -61,6 +62,7 @@ describeIf("NuQ PG publication with durable FDB authority", () => {
 
   beforeAll(async () => {
     config.NUQ_BACKEND = "pg";
+    config.NUQ_FDB_METRICS_V2_ACTIVATE = true;
     await makeMetricsReady();
     await getRedisConnection().del(
       `concurrency-limiter:${teamId}`,
@@ -90,6 +92,7 @@ describeIf("NuQ PG publication with durable FDB authority", () => {
       clearMigrationTeam(conflictTeamId),
     ]);
     config.NUQ_BACKEND = previousBackend;
+    config.NUQ_FDB_METRICS_V2_ACTIVATE = previousMetricsActivation;
     await nuqShutdown();
   });
 

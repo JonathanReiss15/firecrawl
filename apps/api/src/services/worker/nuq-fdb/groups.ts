@@ -346,6 +346,23 @@ export class NuQFdbJobGroup {
     });
   }
 
+  public async hasUnfinishedByOwner(ownerId: string): Promise<boolean> {
+    const owner = normalizeOwnerId(ownerId);
+    if (owner === null) return false;
+    return await this.db.doTn(async tn => {
+      const range = this.ks.ongoingGroupRange(owner);
+      const rows = await tn.getRangeAll(range.begin, range.end);
+      for (const [key] of rows) {
+        const gid = this.ks.unpackId(key as Buffer);
+        const group = decodeJson<GroupMeta>(
+          await tn.get(this.ks.groupMeta(gid)),
+        );
+        if (group?.s === "active" || group?.s === "cancelled") return true;
+      }
+      return false;
+    });
+  }
+
   public async getOngoingByOwner(
     ownerId: string,
     logger: Logger = _logger,
@@ -390,7 +407,8 @@ export class NuQFdbJobGroup {
         encodeJson({ ...g, s: "cancelled" } satisfies GroupMeta),
       );
       tn.set(this.ks.taskGroupCancel(id), EMPTY);
-      tn.clear(this.ks.ongoingGroup(g.o, id));
+      // Retain the owner index until completion so migration discovery can
+      // fence the cancelled group's still-pending sweeper/control work.
       return true;
     });
   }
