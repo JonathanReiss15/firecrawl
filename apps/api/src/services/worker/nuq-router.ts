@@ -912,8 +912,12 @@ type NuQMigrationGcSweepDependencies = {
   fdbEnabled(): boolean;
   inspectFdb(
     now: number,
+    signal?: AbortSignal,
   ): Promise<Record<"pin" | "control" | "generation", MigrationGcBacklog>>;
-  inspectRedis(now: number): Promise<ConcurrencyRollbackCleanupBacklog>;
+  inspectRedis(
+    now: number,
+    signal?: AbortSignal,
+  ): Promise<ConcurrencyRollbackCleanupBacklog>;
   sweepCategory(
     category: NuQMigrationGcCategory,
     now: number,
@@ -933,13 +937,48 @@ type NuQMigrationGcSweepOptions = {
   dependencies?: NuQMigrationGcSweepDependencies;
 };
 
+const GC_EXTERNAL_OPERATION_TIMEOUT_MS = 10_000;
+
+async function boundedGcOperation<T>(
+  operation: Promise<T>,
+  signal?: AbortSignal,
+): Promise<T> {
+  if (signal?.aborted) throw signal.reason ?? new Error("GC aborted");
+  let timer: NodeJS.Timeout | undefined;
+  let abort: (() => void) | undefined;
+  const stop = new Promise<never>((_, reject) => {
+    timer = setTimeout(
+      () => reject(new Error("GC external operation timed out")),
+      GC_EXTERNAL_OPERATION_TIMEOUT_MS,
+    );
+    if (signal) {
+      abort = () => reject(signal.reason ?? new Error("GC aborted"));
+      signal.addEventListener("abort", abort, { once: true });
+    }
+  });
+  try {
+    return await Promise.race([operation, stop]);
+  } finally {
+    if (timer) clearTimeout(timer);
+    if (signal && abort) signal.removeEventListener("abort", abort);
+  }
+}
+
 const productionMigrationGcDependencies: NuQMigrationGcSweepDependencies = {
   fdbEnabled: fdbQueueEnabled,
-  inspectFdb: now => nuqFdbMigrationStore.inspectGcBacklog(now),
-  inspectRedis: getConcurrencyRollbackCleanupBacklog,
+  inspectFdb: (now, signal) =>
+    boundedGcOperation(
+      nuqFdbMigrationStore.inspectGcBacklog(now, signal),
+      signal,
+    ),
+  inspectRedis: (now, signal) =>
+    boundedGcOperation(getConcurrencyRollbackCleanupBacklog(now), signal),
   sweepCategory: async (category, now, limit, signal) => {
     if (category === "redis_cleanup") {
-      const result = await recoverConcurrencyLimitRollbacks(limit);
+      const result = await boundedGcOperation(
+        recoverConcurrencyLimitRollbacks(limit),
+        signal,
+      );
       return {
         read: result.read,
         removed: result.finalized,
@@ -1008,6 +1047,18 @@ export async function sweepNuQMigrationGc(
   const dependencies =
     options.dependencies ?? productionMigrationGcDependencies;
   const started = monotonicNow();
+  const runController = new AbortController();
+  let budgetDeadlineReached = false;
+  const abortFromParent = () =>
+    runController.abort(options.signal?.reason ?? new Error("GC aborted"));
+  if (options.signal?.aborted) abortFromParent();
+  else
+    options.signal?.addEventListener("abort", abortFromParent, { once: true });
+  const budgetTimer = setTimeout(() => {
+    budgetDeadlineReached = true;
+    runController.abort(new Error("GC work budget exhausted"));
+  }, workBudgetMs);
+  const runSignal = runController.signal;
   const categories: Record<
     NuQMigrationGcCategory,
     NuQMigrationGcCategoryStats
@@ -1022,7 +1073,7 @@ export async function sweepNuQMigrationGc(
 
   const observeFdb = async () => {
     if (!dependencies.fdbEnabled()) return;
-    const observed = await dependencies.inspectFdb(wallNow());
+    const observed = await dependencies.inspectFdb(wallNow(), runSignal);
     const mappings: Array<[NuQMigrationGcCategory, MigrationGcBacklog]> = [
       ["terminal_pin", observed.pin],
       ["control_history", observed.control],
@@ -1037,7 +1088,7 @@ export async function sweepNuQMigrationGc(
   };
   const observeRedis = async () => {
     const observed: ConcurrencyRollbackCleanupBacklog =
-      await dependencies.inspectRedis(wallNow());
+      await dependencies.inspectRedis(wallNow(), runSignal);
     categories.redis_cleanup.dueBacklog = observed.due;
     categories.redis_cleanup.oldestOverdueMs = observed.oldestOverdueMs;
     remaining.set("redis_cleanup", observed.due);
@@ -1071,8 +1122,8 @@ export async function sweepNuQMigrationGc(
   let stopReason: NuQMigrationGcSweepStats["stopReason"] = "idle";
 
   while (pages < maxPages) {
-    if (options.signal?.aborted) {
-      stopReason = "aborted";
+    if (runSignal.aborted) {
+      stopReason = budgetDeadlineReached ? "budget" : "aborted";
       break;
     }
     if (monotonicNow() - started >= workBudgetMs) {
@@ -1105,7 +1156,7 @@ export async function sweepNuQMigrationGc(
         category,
         now,
         pageLimit,
-        options.signal,
+        runSignal,
       );
       if (result) {
         read = result.read;
@@ -1151,7 +1202,7 @@ export async function sweepNuQMigrationGc(
 
   // Do not add observation work after shutdown was requested. The conservative
   // remaining estimate keeps the worker on backlog cadence if it restarts.
-  if (!options.signal?.aborted) {
+  if (!runSignal.aborted) {
     try {
       await observeFdb();
     } catch (error) {
@@ -1178,6 +1229,8 @@ export async function sweepNuQMigrationGc(
     }),
     { processed: 0, removed: 0, retained: 0, stale: 0, errors: 0 },
   );
+  clearTimeout(budgetTimer);
+  options.signal?.removeEventListener("abort", abortFromParent);
   return {
     pages,
     ...totals,
@@ -1185,7 +1238,11 @@ export async function sweepNuQMigrationGc(
       totals.errors > 0 ||
       Object.values(categories).some(category => category.dueBacklog > 0),
     elapsedMs: Math.max(0, monotonicNow() - started),
-    stopReason: options.signal?.aborted ? "aborted" : stopReason,
+    stopReason: runSignal.aborted
+      ? budgetDeadlineReached
+        ? "budget"
+        : "aborted"
+      : stopReason,
     categories,
   };
 }

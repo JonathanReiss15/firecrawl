@@ -4,7 +4,7 @@ import "../sentry";
 import { setSentryServiceTag } from "../sentry";
 import { logger as _logger } from "../../lib/logger";
 import { reconcileConcurrencyQueue } from "../../lib/concurrency-queue-reconciler";
-import { Counter, Gauge, register } from "prom-client";
+import { Counter, Gauge, Histogram, register } from "prom-client";
 import Express from "express";
 
 const reconcilerRunsTotal = new Counter({
@@ -52,6 +52,16 @@ const migrationGcOldestOverdueSeconds = new Gauge({
   help: "Age in seconds of the oldest due NuQ migration GC item",
   labelNames: ["category"] as const,
 });
+const migrationGcRunDurationSeconds = new Histogram({
+  name: "nuq_migration_gc_run_duration_seconds",
+  help: "Duration of each bounded migration GC run",
+  buckets: [0.1, 0.25, 0.5, 1, 2.5, 5, 10, 20, 40, 60],
+});
+const migrationGcProcessedRate = new Gauge({
+  name: "nuq_migration_gc_processed_items_per_second",
+  help: "Observed item processing rate during the latest GC run",
+  labelNames: ["category"] as const,
+});
 
 (async () => {
   setSentryServiceTag("nuq-reconciler-worker");
@@ -71,7 +81,9 @@ const migrationGcOldestOverdueSeconds = new Gauge({
     }
   });
   app.get("/health", (_, res) => {
-    res.status(200).send("OK");
+    res
+      .status(isShuttingDown ? 503 : 200)
+      .send(isShuttingDown ? "STOPPING" : "OK");
   });
 
   const server = app.listen(
@@ -96,16 +108,22 @@ const migrationGcOldestOverdueSeconds = new Gauge({
     isShuttingDown = true;
     shutdownController.abort();
     _logger.info("NuQ reconciler worker shutting down");
+    server.close();
 
-    while (reconcilerInFlight) {
-      _logger.info("Waiting for in-flight reconciliation to complete...");
-      await new Promise(resolve => setTimeout(resolve, 1000));
+    const graceMs = 15_000;
+    const deadline = Date.now() + graceMs;
+    while (reconcilerInFlight && Date.now() < deadline) {
+      await new Promise(resolve => setTimeout(resolve, 100));
     }
-
-    server.close(() => {
-      _logger.info("NuQ reconciler worker shut down");
-      process.exit(0);
-    });
+    if (reconcilerInFlight) {
+      _logger.error("Reconciler did not stop within shutdown grace", {
+        graceMs,
+      });
+      server.closeAllConnections();
+      process.exit(1);
+    }
+    _logger.info("NuQ reconciler worker shut down");
+    process.exit(0);
   }
 
   if (require.main === module) {
@@ -146,6 +164,9 @@ const migrationGcOldestOverdueSeconds = new Gauge({
         nextIntervalMs = summary.migrationGc.hasMore
           ? config.NUQ_RECONCILER_BACKLOG_RETRY_MS
           : config.NUQ_RECONCILER_IDLE_INTERVAL_MS;
+        migrationGcRunDurationSeconds.observe(
+          summary.migrationGc.elapsedMs / 1000,
+        );
         for (const [category, stats] of Object.entries(
           summary.migrationGc.categories,
         )) {
@@ -172,6 +193,12 @@ const migrationGcOldestOverdueSeconds = new Gauge({
           migrationGcOldestOverdueSeconds.set(
             { category },
             stats.oldestOverdueMs / 1000,
+          );
+          migrationGcProcessedRate.set(
+            { category },
+            summary.migrationGc.elapsedMs > 0
+              ? (stats.processed * 1000) / summary.migrationGc.elapsedMs
+              : 0,
           );
         }
 

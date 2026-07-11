@@ -50,6 +50,34 @@ async function begin(
   });
 }
 
+async function withGcPostCommitReplay<T>(body: () => Promise<T>): Promise<T> {
+  const db = getNuqFdbDatabase();
+  const originalDoTn = db.doTn.bind(db);
+  let replaying = false;
+  const outcomes = new Set(["removed", "stale", "retained"]);
+  const hook = vi
+    .spyOn(db, "doTn")
+    .mockImplementation(async (closure, opts) => {
+      const result = await originalDoTn(closure, opts);
+      if (!replaying && outcomes.has(String(result))) {
+        replaying = true;
+        try {
+          // Deterministically model doTn re-entering a closure after its first
+          // commit succeeded but the commit acknowledgement was lost.
+          await originalDoTn(closure, opts);
+        } finally {
+          replaying = false;
+        }
+      }
+      return result;
+    });
+  try {
+    return await body();
+  } finally {
+    hook.mockRestore();
+  }
+}
+
 describeIf("NuQ global FDB migration control plane", () => {
   afterAll(async () => {
     const fdb = getFdb();
@@ -1247,12 +1275,15 @@ describeIf("NuQ global FDB migration control plane", () => {
         true,
       );
 
-      for (let pass = 0; pass < 3; pass++) {
-        for (let partition = 0; partition < 32; partition++) {
-          const result = await restartedStore.sweepTerminalPins(authority);
-          expect(result?.read ?? 0).toBeLessThanOrEqual(100);
+      await withGcPostCommitReplay(async () => {
+        for (let pass = 0; pass < 3; pass++) {
+          for (let partition = 0; partition < 32; partition++) {
+            const result = await restartedStore.sweepTerminalPins(authority);
+            expect(result?.read ?? 0).toBeLessThanOrEqual(100);
+            await store.inspectGcBacklog();
+          }
         }
-      }
+      });
       await expect(
         store.inspectPin("scrape_job", retainedId),
       ).resolves.toMatchObject({ lifecycle: "terminal" });
@@ -1265,9 +1296,12 @@ describeIf("NuQ global FDB migration control plane", () => {
       clock.mockReturnValue(
         base + 46 * 24 * 60 * 60 * 1000 + 2 * 60 * 60 * 1000,
       );
-      for (let partition = 0; partition < 32; partition++) {
-        await restartedStore.sweepTerminalPins(authority);
-      }
+      await withGcPostCommitReplay(async () => {
+        for (let partition = 0; partition < 32; partition++) {
+          await restartedStore.sweepTerminalPins(authority);
+          await store.inspectGcBacklog();
+        }
+      });
       await expect(
         store.inspectPin("scrape_job", retainedId),
       ).resolves.toBeNull();
@@ -1276,6 +1310,83 @@ describeIf("NuQ global FDB migration control plane", () => {
           ids.includes(pin.objectId),
         ),
       ).toBe(false);
+    } finally {
+      clock.mockRestore();
+    }
+  });
+
+  test("expired lease takeover fences an authority probe from every final mutation", async () => {
+    const base = 1_825_000_000_000;
+    const due = base + 46 * 24 * 60 * 60 * 1000;
+    const clock = vi.spyOn(Date, "now").mockReturnValue(base);
+    try {
+      const teamId = team();
+      const objectId = object();
+      await initialize(teamId, "pg");
+      await store.preparePinnedObject({
+        teamId,
+        kind: "scrape_job",
+        objectId,
+        admission: { type: "new-root" },
+      });
+      await store.completePinnedObject({
+        teamId,
+        kind: "scrape_job",
+        objectId,
+        operationId: randomUUID(),
+        fromLifecycle: "prepared",
+      });
+
+      let releaseProbe!: () => void;
+      const probeGate = new Promise<void>(resolve => {
+        releaseProbe = resolve;
+      });
+      let markProbeStarted!: () => void;
+      const probeStarted = new Promise<void>(resolve => {
+        markProbeStarted = resolve;
+      });
+      let calls = 0;
+      const authority = {
+        pgObjectExists: vi.fn(async () => {
+          calls++;
+          if (calls === 1) {
+            markProbeStarted();
+            await probeGate;
+          }
+          return false;
+        }),
+        fdbReferenceExistsInTxn: vi.fn(async () => false),
+      };
+
+      clock.mockReturnValue(due);
+      const expiredOwners = Promise.allSettled(
+        Array.from({ length: 32 }, () =>
+          store.sweepTerminalPins(authority, { limit: 1 }),
+        ),
+      );
+      await probeStarted;
+      clock.mockReturnValue(due + 31_000);
+      await Promise.all(
+        Array.from({ length: 32 }, () =>
+          store.sweepTerminalPins(authority, { limit: 1 }),
+        ),
+      );
+      releaseProbe();
+      const expiredResults = await expiredOwners;
+
+      expect(
+        expiredResults.some(
+          result =>
+            result.status === "rejected" &&
+            result.reason?.code === "NUQ_MIGRATION_GC_LEASE_LOST",
+        ),
+      ).toBe(true);
+      await expect(
+        store.inspectPin("scrape_job", objectId),
+      ).resolves.toBeNull();
+      await expect(store.inspectGcBacklog()).resolves.toMatchObject({
+        pin: { due: expect.any(Number) },
+      });
     } finally {
       clock.mockRestore();
     }
@@ -1378,16 +1489,36 @@ describeIf("NuQ global FDB migration control plane", () => {
       await store.finalSeal({ teamId, transitionOperationId });
       // Simulate a delayed writer restoring the target's now-stale closed
       // generation entry. The open generation/version CAS must make it a no-op.
-      await getNuqFdbDatabase().doTn(async tn =>
-        tn.set(targetGcEntry![0], targetGcEntry![1]),
-      );
+      await getNuqFdbDatabase().doTn(async tn => {
+        tn.set(targetGcEntry![0], targetGcEntry![1]);
+        const parts = fdb.tuple.unpack(targetGcEntry![0] as Buffer);
+        const partition = Number(parts[4]);
+        const dueAt = Number(parts[5]);
+        let node = BigInt(dueAt) + 1n;
+        while (node <= 1n << 53n) {
+          tn.add(
+            store.pack([
+              "gc",
+              "due-count",
+              "generation",
+              partition,
+              node.toString(),
+            ]),
+            encodeI64(1),
+          );
+          node += node & -node;
+        }
+      });
       clock.mockReturnValue(base + 46 * 24 * 60 * 60 * 1000);
 
       let staleGenerationEntries = 0;
-      for (let partition = 0; partition < 32; partition++) {
-        staleGenerationEntries +=
-          (await store.sweepClosedGenerations())?.stale ?? 0;
-      }
+      await withGcPostCommitReplay(async () => {
+        for (let partition = 0; partition < 32; partition++) {
+          staleGenerationEntries +=
+            (await store.sweepClosedGenerations())?.stale ?? 0;
+          await store.inspectGcBacklog();
+        }
+      });
       expect(staleGenerationEntries).toBeGreaterThan(0);
       await expect(
         store.inspectGenerationIfPresent(teamId, 1),
@@ -1397,16 +1528,20 @@ describeIf("NuQ global FDB migration control plane", () => {
         pgObjectExists: async () => false,
         fdbReferenceExistsInTxn: async () => false,
       };
-      for (let partition = 0; partition < 32; partition++) {
-        await store.sweepTerminalPins(authority);
-        await store.sweepControlHistory();
-      }
-      clock.mockReturnValue(
-        base + 46 * 24 * 60 * 60 * 1000 + 2 * 60 * 60 * 1000,
-      );
-      for (let partition = 0; partition < 32; partition++) {
-        await store.sweepClosedGenerations();
-      }
+      await withGcPostCommitReplay(async () => {
+        for (let partition = 0; partition < 32; partition++) {
+          await store.sweepTerminalPins(authority);
+          await store.sweepControlHistory();
+          await store.inspectGcBacklog();
+        }
+        clock.mockReturnValue(
+          base + 46 * 24 * 60 * 60 * 1000 + 2 * 60 * 60 * 1000,
+        );
+        for (let partition = 0; partition < 32; partition++) {
+          await store.sweepClosedGenerations();
+          await store.inspectGcBacklog();
+        }
+      });
       await expect(
         store.inspectGenerationIfPresent(teamId, 1),
       ).resolves.toBeNull();

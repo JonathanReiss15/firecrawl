@@ -7,7 +7,7 @@ This repository builds the `nuq-reconciler-worker`; it does not own the producti
 - `minReplicas: 2` (production must not remain at the current single replica).
 - `maxReplicas: 32`. GC has 32 globally leased FDB partitions per category, so replicas above 32 cannot add useful FDB concurrency.
 - Scale on `nuq_migration_gc_due_backlog` using an external/object metric target of **100 due items per replica**. The adapter must take the **maximum**, not sum, of this global gauge across worker pods.
-- Also scale on `nuq_migration_gc_oldest_overdue_seconds` with a target of **300 seconds**. Kubernetes chooses the largest replica recommendation from the backlog and age metrics.
+- Also scale on `nuq_migration_gc_oldest_overdue_seconds` with a target of **300 seconds**. The adapter must use the **maximum oldest age across pods** (never a sum or average). Kubernetes chooses the largest replica recommendation from the backlog and age metrics.
 - Use a fast scale-up policy (no scale-up stabilization; at least 100% or 8 pods per minute) and a conservative scale-down window of at least 10 minutes.
 - Keep the reconciler's normal CPU/memory safeguards. Backlog-aware cadence does not skip normal concurrency reconciliation: every retry performs both bounded GC and the ordinary team pass.
 
@@ -33,8 +33,10 @@ Operational counters:
 - `nuq_migration_gc_pages_total{category}`
 - `nuq_migration_gc_items_total{category,outcome}` (`processed`, `removed`, `retained`, `stale`)
 - `nuq_migration_gc_errors_total{category}`
+- `nuq_migration_gc_run_duration_seconds`
+- `nuq_migration_gc_processed_items_per_second{category}`
 
-Alert on any sustained error increase, oldest overdue age above 15 minutes, or backlog growth while replicas are below 32. At 32 replicas, sustained growth is a page latency/storage dependency incident rather than an HPA problem.
+Alert on any sustained error increase, oldest overdue age above 15 minutes, or backlog growth while replicas are below 32. Add a distinct critical alert for sustained backlog growth when the HPA is already at `maxReplicas=32`; at that point this is a page-latency/storage-dependency incident, not an HPA problem.
 
 FDB counts are maintained transactionally in 32 sharded timestamp trees and oldest timestamps use one limit-1 read from each index partition; collection performs no global range scan. Redis uses native `ZCARD`/`ZCOUNT` and a limit-1 oldest-score read.
 
@@ -48,7 +50,11 @@ Safe validated defaults:
 - `NUQ_RECONCILER_BACKLOG_RETRY_MS=5000`
 - `NUQ_RECONCILER_IDLE_INTERVAL_MS=60000`
 
-A page never exceeds 100 items. The independent page and wall-clock caps bound shutdown and reserve time for normal reconciliation. Retained rows are rescheduled one hour into the future and therefore do not cause a hot retry loop.
+A page never exceeds 100 items. The independent page and wall-clock caps bound shutdown and reserve time for normal reconciliation. Every storage transaction and external authority probe also has a 10-second operation bound, and the wall budget aborts page work between individual items. Retained rows are rescheduled one hour into the future and therefore do not cause a hot retry loop.
+
+## Isolated page-loop capacity evidence
+
+The deterministic isolated-service benchmark in `nuq-router-gc.test.ts` uses a 10,000-item due cohort, a representative 20 ms storage-page latency, one replica, 100-item pages, and the production `maxPages=128` contract. Its acceptance target is **at least 2,000 items/second**, comfortably above the documented planning arrival target of **1,000 due items/second per replica** while still asserting that no page exceeds 100 items. Production capacity must additionally be verified from `nuq_migration_gc_processed_items_per_second` and run-duration histograms because PG/Redis/FDB latency, rather than scheduler overhead, is the expected limiter.
 
 ## Infrastructure refresh note
 

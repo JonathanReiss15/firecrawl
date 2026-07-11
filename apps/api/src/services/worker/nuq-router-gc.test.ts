@@ -1,5 +1,34 @@
 import { vi } from "vitest";
 
+vi.mock("../../controllers/auth", () => ({
+  getACUCTeam: vi.fn(),
+}));
+
+vi.mock("../../lib/deployment", () => ({
+  isSelfHosted: vi.fn(() => false),
+}));
+
+vi.mock("./nuq", () => ({
+  scrapeQueue: {},
+  crawlFinishedQueue: {},
+  crawlGroup: {},
+  getNuQPgOwnerLiveResidue: vi.fn(),
+}));
+
+vi.mock("../../lib/concurrency-redis", () => ({
+  constructConcurrencyLimitKey: vi.fn(),
+  finalizeConcurrencyLimitActiveJobRollback: vi.fn(),
+  getConcurrencyLimitActiveJobsCount: vi.fn(),
+  getConcurrencyRollbackCleanupBacklog: vi.fn(),
+  getTeamQueueLimit: vi.fn(),
+  pushConcurrencyLimitActiveJob: vi.fn(),
+  recoverConcurrencyLimitRollbacks: vi.fn(),
+  removeConcurrencyLimitActiveJob: vi.fn(),
+  renewConcurrencyLimitActiveJob: vi.fn(),
+  reserveConcurrencyLimitActiveJob: vi.fn(),
+  rollbackConcurrencyLimitActiveJob: vi.fn(),
+}));
+
 vi.mock("../../services/rate-limiter", () => ({
   redisRateLimitClient: { on: vi.fn() },
   getRateLimiter: vi.fn(),
@@ -14,6 +43,16 @@ vi.mock("../../services/redis", () => ({
   getValue: vi.fn(),
   setValue: vi.fn(),
   deleteKey: vi.fn(),
+}));
+
+vi.mock("../queue-service", () => ({
+  getRedisConnection: () => ({
+    eval: vi.fn(),
+    zscore: vi.fn(),
+    zrangebyscore: vi.fn(),
+    zcard: vi.fn(),
+    zcount: vi.fn(),
+  }),
 }));
 
 import { sweepNuQMigrationGc, type NuQMigrationGcCategory } from "./nuq-router";
@@ -89,6 +128,34 @@ describe("NuQ migration GC work scheduler", () => {
       fake.dependencies.sweepCategory.mock.calls.every(call => call[2] <= 100),
     ).toBe(true);
   });
+
+  test("one isolated replica exceeds the documented arrival target at representative page latency", async () => {
+    const fake = scheduler({ terminal_pin: 10_000 });
+    fake.dependencies.sweepCategory.mockImplementation(
+      async (category: NuQMigrationGcCategory, _now: number, limit: number) => {
+        await new Promise(resolve => setTimeout(resolve, 20));
+        fake.calls.push(category);
+        const read = Math.min(limit, fake.due[category]);
+        fake.due[category] -= read;
+        return { read, removed: read, retained: 0, stale: 0 };
+      },
+    );
+
+    const result = await sweepNuQMigrationGc({
+      dependencies: fake.dependencies,
+      pageLimit: 100,
+      maxPages: 128,
+      workBudgetMs: 10_000,
+    });
+    const rate = (result.processed * 1000) / result.elapsedMs;
+
+    expect(result.processed).toBe(10_000);
+    expect(result.hasMore).toBe(false);
+    expect(rate).toBeGreaterThanOrEqual(2_000);
+    expect(
+      fake.dependencies.sweepCategory.mock.calls.every(call => call[2] <= 100),
+    ).toBe(true);
+  }, 15_000);
 
   test("page cap leaves exact backlog for a short retry", async () => {
     const fake = scheduler({ terminal_pin: 350 });

@@ -1,5 +1,8 @@
 import { randomUUID } from "crypto";
-import type { Transaction } from "foundationdb";
+import type {
+  Transaction,
+  TransactionOptionCode as FdbTransactionOptionCode,
+} from "foundationdb";
 import { getFdb, getNuqFdbDatabase } from "./client";
 import { encodeI64 } from "./keyspace";
 
@@ -101,11 +104,44 @@ export const MIGRATION_GC_PAGE_LIMIT = 100;
 // collected while a surviving hint is still expected to route callers.
 export const MIGRATION_GC_MIN_RETENTION_MS = 45 * 24 * 60 * 60 * 1000;
 export const MIGRATION_GC_RECHECK_MS = 60 * 60 * 1000;
+const MIGRATION_GC_LEASE_MS = 30_000;
+const MIGRATION_GC_TRANSACTION_TIMEOUT_MS = 10_000;
+const TransactionOptionCode = {
+  Timeout: 500 as FdbTransactionOptionCode,
+};
+
+async function withGcDeadline<T>(
+  operation: Promise<T>,
+  signal?: AbortSignal,
+): Promise<T> {
+  if (signal?.aborted) throw signal.reason ?? new Error("GC aborted");
+  let timer: NodeJS.Timeout | undefined;
+  let abort: (() => void) | undefined;
+  const deadline = new Promise<never>((_, reject) => {
+    timer = setTimeout(
+      () => reject(new Error("GC authority operation timed out")),
+      MIGRATION_GC_TRANSACTION_TIMEOUT_MS,
+    );
+    if (signal) {
+      abort = () => reject(signal.reason ?? new Error("GC aborted"));
+      signal.addEventListener("abort", abort, { once: true });
+    }
+  });
+  try {
+    return await Promise.race([operation, deadline]);
+  } finally {
+    if (timer) clearTimeout(timer);
+    if (signal && abort) signal.removeEventListener("abort", abort);
+  }
+}
 
 export type MigrationGcAuthority = {
   /** Must use only bounded point reads. This is run before the FDB CAS for PG
    * objects, and must return true whenever the canonical PG object may live. */
-  pgObjectExists(pin: MigrationObjectPin): Promise<boolean>;
+  pgObjectExists(
+    pin: MigrationObjectPin,
+    signal?: AbortSignal,
+  ): Promise<boolean>;
   /** Conflict-safe FDB point reads for runtime rows, task rows, durable PG
    * holder intents and deletion intents. */
   fdbReferenceExistsInTxn(
@@ -897,26 +933,35 @@ export class NuqFdbMigrationStore {
     }
   }
 
-  private setGcIndexInTxn(
+  private async setGcIndexInTxn(
     tn: Transaction,
     category: MigrationGcCategory,
     partition: number,
     dueAt: number,
     key: Buffer,
-  ): void {
+  ): Promise<boolean> {
+    // This must be a normal read. Besides making the counter conditional, its
+    // conflict range makes a commit-unknown closure replay and overlapping GC
+    // workers converge on exactly one increment.
+    if ((await tn.get(key)) !== undefined) return false;
     tn.set(key, Buffer.alloc(0));
     this.mutateGcDueCountInTxn(tn, category, partition, dueAt, 1);
+    return true;
   }
 
-  private clearGcIndexInTxn(
+  private async clearGcIndexInTxn(
     tn: Transaction,
     category: MigrationGcCategory,
     partition: number,
     dueAt: number,
     key: Buffer,
-  ): void {
+  ): Promise<boolean> {
+    // Never decrement from a scan result alone: it may have been consumed by a
+    // committed transaction whose result was lost, or by an expired owner.
+    if ((await tn.get(key)) === undefined) return false;
     tn.clear(key);
     this.mutateGcDueCountInTxn(tn, category, partition, dueAt, -1);
+    return true;
   }
 
   private controlOperationKey(teamId: string, operationId: string): Buffer {
@@ -1024,11 +1069,11 @@ export class NuqFdbMigrationStore {
     ]);
   }
 
-  private writeGenerationInTxn(
+  private async writeGenerationInTxn(
     tn: Transaction,
     previous: MigrationGeneration | null,
     generation: MigrationGeneration,
-  ): void {
+  ): Promise<void> {
     tn.set(
       this.generationKey(generation.teamId, generation.generation),
       encodeJson(generation),
@@ -1047,7 +1092,7 @@ export class NuqFdbMigrationStore {
     );
     if (previousIndexed && !sameIndex) {
       const dueAt = previous.terminalAt! + MIGRATION_GC_MIN_RETENTION_MS;
-      this.clearGcIndexInTxn(
+      await this.clearGcIndexInTxn(
         tn,
         "generation",
         partition,
@@ -1057,7 +1102,7 @@ export class NuqFdbMigrationStore {
     }
     if (nextIndexed && !sameIndex) {
       const dueAt = generation.terminalAt! + MIGRATION_GC_MIN_RETENTION_MS;
-      this.setGcIndexInTxn(
+      await this.setGcIndexInTxn(
         tn,
         "generation",
         partition,
@@ -1076,12 +1121,12 @@ export class NuqFdbMigrationStore {
     ];
   }
 
-  private writeControlOperationInTxn(
+  private async writeControlOperationInTxn(
     tn: Transaction,
     teamId: string,
     previous: ControlOperation | null,
     operation: ControlOperation,
-  ): void {
+  ): Promise<void> {
     const previousIndexed = previous?.terminalAt !== undefined;
     const nextIndexed = operation.terminalAt !== undefined;
     const sameIndex =
@@ -1104,7 +1149,7 @@ export class NuqFdbMigrationStore {
       }
       if (previousIndexed && !sameIndex) {
         const dueAt = previous.terminalAt! + MIGRATION_GC_MIN_RETENTION_MS;
-        this.clearGcIndexInTxn(
+        await this.clearGcIndexInTxn(
           tn,
           "control",
           partition,
@@ -1125,7 +1170,7 @@ export class NuqFdbMigrationStore {
     }
     if (nextIndexed && !sameIndex) {
       const dueAt = operation.terminalAt! + MIGRATION_GC_MIN_RETENTION_MS;
-      this.setGcIndexInTxn(
+      await this.setGcIndexInTxn(
         tn,
         "control",
         partition,
@@ -1135,11 +1180,11 @@ export class NuqFdbMigrationStore {
     }
   }
 
-  private writePinInTxn(
+  private async writePinInTxn(
     tn: Transaction,
     previous: MigrationObjectPin | null,
     pin: MigrationObjectPin,
-  ): void {
+  ): Promise<void> {
     const encoded = encodeJson(pin);
     tn.set(this.objectKey(pin.kind, pin.objectId), encoded);
     tn.set(this.generationObjectKey(pin), Buffer.alloc(0));
@@ -1161,7 +1206,7 @@ export class NuqFdbMigrationStore {
     }
     if (previousIndexed && !sameIndex) {
       const dueAt = previous.terminalAt! + MIGRATION_GC_MIN_RETENTION_MS;
-      this.clearGcIndexInTxn(
+      await this.clearGcIndexInTxn(
         tn,
         "pin",
         partition,
@@ -1171,7 +1216,7 @@ export class NuqFdbMigrationStore {
     }
     if (nextIndexed && !sameIndex) {
       const dueAt = pin.terminalAt! + MIGRATION_GC_MIN_RETENTION_MS;
-      this.setGcIndexInTxn(
+      await this.setGcIndexInTxn(
         tn,
         "pin",
         partition,
@@ -1792,7 +1837,7 @@ export class NuqFdbMigrationStore {
         ? { terminalAt: Date.now(), terminalVersion: revision }
         : {}),
     };
-    this.writePinInTxn(tn, pin, next);
+    await this.writePinInTxn(tn, pin, next);
     return next;
   }
 
@@ -1915,8 +1960,8 @@ export class NuqFdbMigrationStore {
         terminalVersion: state.revision,
       };
       tn.set(this.teamStateKey(teamId), encodeJson(state));
-      this.writeGenerationInTxn(tn, null, generation);
-      this.writeControlOperationInTxn(tn, teamId, null, op);
+      await this.writeGenerationInTxn(tn, null, generation);
+      await this.writeControlOperationInTxn(tn, teamId, null, op);
       return state;
     });
   }
@@ -1963,7 +2008,7 @@ export class NuqFdbMigrationStore {
       revision: nextRevision(state),
       maxGeneration: generationNumber,
     };
-    this.writeGenerationInTxn(tn, null, generation);
+    await this.writeGenerationInTxn(tn, null, generation);
     tn.set(this.teamStateKey(teamId), encodeJson(next));
     return generationNumber;
   }
@@ -2036,7 +2081,7 @@ export class NuqFdbMigrationStore {
           terminalAt: Date.now(),
           terminalVersion: state.revision,
         };
-        this.writeControlOperationInTxn(tn, teamId, null, op);
+        await this.writeControlOperationInTxn(tn, teamId, null, op);
         return state;
       }
 
@@ -2098,10 +2143,10 @@ export class NuqFdbMigrationStore {
         outcome: "pending",
         state: next,
       };
-      this.writeGenerationInTxn(tn, source, drainingSource);
-      this.writeGenerationInTxn(tn, null, target);
+      await this.writeGenerationInTxn(tn, source, drainingSource);
+      await this.writeGenerationInTxn(tn, null, target);
       tn.set(this.teamStateKey(teamId), encodeJson(next));
-      this.writeControlOperationInTxn(tn, teamId, null, op);
+      await this.writeControlOperationInTxn(tn, teamId, null, op);
       return next;
     });
   }
@@ -2203,9 +2248,9 @@ export class NuqFdbMigrationStore {
         terminalAt: Date.now(),
         terminalVersion: next.revision,
       };
-      this.writeGenerationInTxn(tn, source, reopened);
+      await this.writeGenerationInTxn(tn, source, reopened);
       tn.set(this.teamStateKey(teamId), encodeJson(next));
-      this.writeControlOperationInTxn(tn, teamId, op, cancelledOp);
+      await this.writeControlOperationInTxn(tn, teamId, op, cancelledOp);
       return next;
     });
   }
@@ -2400,7 +2445,7 @@ export class NuqFdbMigrationStore {
       normalizeResidue(undefined),
       initialResidue,
     );
-    this.writePinInTxn(tn, null, pin);
+    await this.writePinInTxn(tn, null, pin);
     return pin;
   }
 
@@ -2528,7 +2573,7 @@ export class NuqFdbMigrationStore {
             resultRevision: legacyOperation.result.revision,
           },
         };
-        this.writePinInTxn(tn, pin, migratedPin);
+        await this.writePinInTxn(tn, pin, migratedPin);
         tn.clear(legacyOperationKey);
       }
       return legacyOperation.result;
@@ -2591,7 +2636,7 @@ export class NuqFdbMigrationStore {
         resultRevision: revision,
       },
     };
-    this.writePinInTxn(tn, pin, next);
+    await this.writePinInTxn(tn, pin, next);
     return next;
   }
 
@@ -2660,6 +2705,7 @@ export class NuqFdbMigrationStore {
    * and oldest timestamps use one limit-1 read from each of 32 partitions. */
   public async inspectGcBacklog(
     now = Date.now(),
+    signal?: AbortSignal,
   ): Promise<Record<MigrationGcCategory, MigrationGcBacklog>> {
     if (!isNonnegativeInteger(now)) {
       throw new MigrationStoreError(
@@ -2667,8 +2713,11 @@ export class NuqFdbMigrationStore {
         "GC observation time must be a nonnegative safe integer",
       );
     }
+    if (signal?.aborted) throw signal.reason ?? new Error("GC aborted");
     const categories: MigrationGcCategory[] = ["pin", "control", "generation"];
     return await this.db.doTn(async tn => {
+      this.configureGcTransaction(tn);
+      if (signal?.aborted) throw signal.reason ?? new Error("GC aborted");
       const snapshots = await Promise.all(
         categories.map(async category => {
           const partitions = await Promise.all(
@@ -2741,6 +2790,13 @@ export class NuqFdbMigrationStore {
     });
   }
 
+  private configureGcTransaction(tn: Transaction): void {
+    tn.setOption(
+      TransactionOptionCode.Timeout,
+      MIGRATION_GC_TRANSACTION_TIMEOUT_MS,
+    );
+  }
+
   private async claimGcPartition(
     category: string,
     now: number,
@@ -2748,6 +2804,7 @@ export class NuqFdbMigrationStore {
     for (let attempt = 0; attempt < MIGRATION_GC_PARTITIONS; attempt++) {
       const token = randomUUID();
       const claim = await this.db.doTn(async tn => {
+        this.configureGcTransaction(tn);
         const cursorKey = this.gcCursorKey(category);
         const cursor = Number(
           parseJson(await tn.get(cursorKey), `GC ${category} cursor`) ?? 0,
@@ -2783,12 +2840,65 @@ export class NuqFdbMigrationStore {
           );
         }
         if (lease && (lease.expiresAt as number) > now) return null;
-        tn.set(leaseKey, encodeJson({ token, expiresAt: now + 5 * 60 * 1000 }));
+        tn.set(
+          leaseKey,
+          encodeJson({ token, expiresAt: now + MIGRATION_GC_LEASE_MS }),
+        );
         return { partition, token };
       });
       if (claim) return claim;
     }
     return null;
+  }
+
+  private async assertGcLeaseInTxn(
+    tn: Transaction,
+    category: string,
+    partition: number,
+    token: string,
+    now: number,
+  ): Promise<void> {
+    const lease = parseJson(
+      await tn.get(this.gcLeaseKey(category, partition)),
+      `GC ${category} lease`,
+    ) as { token?: unknown; expiresAt?: unknown } | null;
+    if (
+      lease?.token !== token ||
+      !isNonnegativeInteger(lease.expiresAt) ||
+      (lease.expiresAt as number) <= now
+    ) {
+      throw new MigrationStoreError(
+        "NUQ_MIGRATION_GC_LEASE_LOST",
+        `GC ${category} partition ${partition} lease lost`,
+      );
+    }
+  }
+
+  private async renewGcPartition(
+    category: string,
+    partition: number,
+    token: string,
+    now: number,
+  ): Promise<boolean> {
+    return await this.db.doTn(async tn => {
+      this.configureGcTransaction(tn);
+      try {
+        await this.assertGcLeaseInTxn(tn, category, partition, token, now);
+      } catch (error) {
+        if (
+          error instanceof MigrationStoreError &&
+          error.code === "NUQ_MIGRATION_GC_LEASE_LOST"
+        ) {
+          return false;
+        }
+        throw error;
+      }
+      tn.set(
+        this.gcLeaseKey(category, partition),
+        encodeJson({ token, expiresAt: now + MIGRATION_GC_LEASE_MS }),
+      );
+      return true;
+    });
   }
 
   private async releaseGcPartition(
@@ -2797,6 +2907,7 @@ export class NuqFdbMigrationStore {
     token: string,
   ): Promise<void> {
     await this.db.doTn(async tn => {
+      this.configureGcTransaction(tn);
       const key = this.gcLeaseKey(category, partition);
       const lease = parseJson(await tn.get(key), `GC ${category} lease`) as {
         token?: unknown;
@@ -2847,12 +2958,33 @@ export class NuqFdbMigrationStore {
     };
     try {
       const range = this.terminalPinGcRange(claim.partition, now + 1);
-      const rows = (await this.db.doTn(async tn =>
-        tn.snapshot().getRangeAll(range.begin, range.end, { limit }),
-      )) as [Buffer, Buffer][];
+      const rows = (await this.db.doTn(async tn => {
+        this.configureGcTransaction(tn);
+        await this.assertGcLeaseInTxn(
+          tn,
+          "pin",
+          claim.partition,
+          claim.token,
+          Date.now(),
+        );
+        return await tn.snapshot().getRangeAll(range.begin, range.end, {
+          limit,
+        });
+      })) as [Buffer, Buffer][];
       result.hasMore = rows.length === limit;
       for (const [indexKey] of rows) {
         if (options.signal?.aborted) {
+          result.hasMore = true;
+          break;
+        }
+        if (
+          !(await this.renewGcPartition(
+            "pin",
+            claim.partition,
+            claim.token,
+            Date.now(),
+          ))
+        ) {
           result.hasMore = true;
           break;
         }
@@ -2884,6 +3016,14 @@ export class NuqFdbMigrationStore {
           observed.terminalAt === terminalAt;
         if (!matches) {
           const cleared = await this.db.doTn(async tn => {
+            this.configureGcTransaction(tn);
+            await this.assertGcLeaseInTxn(
+              tn,
+              "pin",
+              claim.partition,
+              claim.token,
+              Date.now(),
+            );
             const current = await this.inspectPinInTxn(tn, kind, objectId);
             if (
               current?.lifecycle === "terminal" &&
@@ -2895,8 +3035,13 @@ export class NuqFdbMigrationStore {
             }
             // The canonical read conflicts with a concurrent replacement before
             // this index/accounting pair is cleared.
-            this.clearGcIndexInTxn(tn, "pin", claim.partition, dueAt, indexKey);
-            return true;
+            return await this.clearGcIndexInTxn(
+              tn,
+              "pin",
+              claim.partition,
+              dueAt,
+              indexKey,
+            );
           });
           if (cleared) result.stale++;
           else result.retained++;
@@ -2905,9 +3050,24 @@ export class NuqFdbMigrationStore {
 
         const pgExists =
           observed.backend === "pg"
-            ? await authority.pgObjectExists(observed)
+            ? await withGcDeadline(
+                authority.pgObjectExists(observed, options.signal),
+                options.signal,
+              )
             : false;
+        if (options.signal?.aborted) {
+          result.hasMore = true;
+          break;
+        }
         const outcome = await this.db.doTn(async tn => {
+          this.configureGcTransaction(tn);
+          await this.assertGcLeaseInTxn(
+            tn,
+            "pin",
+            claim.partition,
+            claim.token,
+            Date.now(),
+          );
           const current = await this.inspectPinInTxn(tn, kind, objectId);
           if (
             !current ||
@@ -2916,7 +3076,13 @@ export class NuqFdbMigrationStore {
             current.terminalVersion !== terminalVersion ||
             current.terminalAt !== terminalAt
           ) {
-            this.clearGcIndexInTxn(tn, "pin", claim.partition, dueAt, indexKey);
+            await this.clearGcIndexInTxn(
+              tn,
+              "pin",
+              claim.partition,
+              dueAt,
+              indexKey,
+            );
             return "stale" as const;
           }
           const teamIndex = await tn.get(
@@ -2942,8 +3108,14 @@ export class NuqFdbMigrationStore {
             teamIndex ||
             Object.values(current.residue).some(value => value !== 0)
           ) {
-            this.clearGcIndexInTxn(tn, "pin", claim.partition, dueAt, indexKey);
-            this.setGcIndexInTxn(
+            await this.clearGcIndexInTxn(
+              tn,
+              "pin",
+              claim.partition,
+              dueAt,
+              indexKey,
+            );
+            await this.setGcIndexInTxn(
               tn,
               "pin",
               claim.partition,
@@ -2959,8 +3131,14 @@ export class NuqFdbMigrationStore {
             tn.clear(operationKey as Buffer);
           }
           if (operationRows.length === MIGRATION_GC_PAGE_LIMIT) {
-            this.clearGcIndexInTxn(tn, "pin", claim.partition, dueAt, indexKey);
-            this.setGcIndexInTxn(
+            await this.clearGcIndexInTxn(
+              tn,
+              "pin",
+              claim.partition,
+              dueAt,
+              indexKey,
+            );
+            await this.setGcIndexInTxn(
               tn,
               "pin",
               claim.partition,
@@ -2971,7 +3149,13 @@ export class NuqFdbMigrationStore {
           }
           tn.clear(this.objectKey(kind, objectId));
           tn.clear(this.generationObjectKey(current));
-          this.clearGcIndexInTxn(tn, "pin", claim.partition, dueAt, indexKey);
+          await this.clearGcIndexInTxn(
+            tn,
+            "pin",
+            claim.partition,
+            dueAt,
+            indexKey,
+          );
           return "removed" as const;
         });
         result[outcome]++;
@@ -3017,12 +3201,33 @@ export class NuqFdbMigrationStore {
     };
     try {
       const range = this.gcRange("control", claim.partition, now + 1);
-      const rows = (await this.db.doTn(async tn =>
-        tn.snapshot().getRangeAll(range.begin, range.end, { limit }),
-      )) as [Buffer, Buffer][];
+      const rows = (await this.db.doTn(async tn => {
+        this.configureGcTransaction(tn);
+        await this.assertGcLeaseInTxn(
+          tn,
+          "control",
+          claim.partition,
+          claim.token,
+          Date.now(),
+        );
+        return await tn.snapshot().getRangeAll(range.begin, range.end, {
+          limit,
+        });
+      })) as [Buffer, Buffer][];
       result.hasMore = rows.length === limit;
       for (const [indexKey] of rows) {
         if (options.signal?.aborted) {
+          result.hasMore = true;
+          break;
+        }
+        if (
+          !(await this.renewGcPartition(
+            "control",
+            claim.partition,
+            claim.token,
+            Date.now(),
+          ))
+        ) {
           result.hasMore = true;
           break;
         }
@@ -3046,11 +3251,19 @@ export class NuqFdbMigrationStore {
           );
         }
         const outcome = await this.db.doTn(async tn => {
+          this.configureGcTransaction(tn);
+          await this.assertGcLeaseInTxn(
+            tn,
+            "control",
+            claim.partition,
+            claim.token,
+            Date.now(),
+          );
           const raw = await tn.get(
             this.controlOperationKey(teamId, operationId),
           );
           if (!raw) {
-            this.clearGcIndexInTxn(
+            await this.clearGcIndexInTxn(
               tn,
               "control",
               claim.partition,
@@ -3068,7 +3281,7 @@ export class NuqFdbMigrationStore {
             operation.terminalAt !== terminalAt ||
             operation.outcome === "pending"
           ) {
-            this.clearGcIndexInTxn(
+            await this.clearGcIndexInTxn(
               tn,
               "control",
               claim.partition,
@@ -3079,14 +3292,14 @@ export class NuqFdbMigrationStore {
           }
           const state = await this.readState(tn, teamId);
           if (state?.transitionOperationId === operationId) {
-            this.clearGcIndexInTxn(
+            await this.clearGcIndexInTxn(
               tn,
               "control",
               claim.partition,
               dueAt,
               indexKey,
             );
-            this.setGcIndexInTxn(
+            await this.setGcIndexInTxn(
               tn,
               "control",
               claim.partition,
@@ -3103,7 +3316,7 @@ export class NuqFdbMigrationStore {
               this.controlGenerationRefKey(teamId, generation, operationId),
             );
           }
-          this.clearGcIndexInTxn(
+          await this.clearGcIndexInTxn(
             tn,
             "control",
             claim.partition,
@@ -3155,12 +3368,33 @@ export class NuqFdbMigrationStore {
     };
     try {
       const range = this.gcRange("generation", claim.partition, now + 1);
-      const rows = (await this.db.doTn(async tn =>
-        tn.snapshot().getRangeAll(range.begin, range.end, { limit }),
-      )) as [Buffer, Buffer][];
+      const rows = (await this.db.doTn(async tn => {
+        this.configureGcTransaction(tn);
+        await this.assertGcLeaseInTxn(
+          tn,
+          "generation",
+          claim.partition,
+          claim.token,
+          Date.now(),
+        );
+        return await tn.snapshot().getRangeAll(range.begin, range.end, {
+          limit,
+        });
+      })) as [Buffer, Buffer][];
       result.hasMore = rows.length === limit;
       for (const [indexKey] of rows) {
         if (options.signal?.aborted) {
+          result.hasMore = true;
+          break;
+        }
+        if (
+          !(await this.renewGcPartition(
+            "generation",
+            claim.partition,
+            claim.token,
+            Date.now(),
+          ))
+        ) {
           result.hasMore = true;
           break;
         }
@@ -3184,6 +3418,14 @@ export class NuqFdbMigrationStore {
           );
         }
         const outcome = await this.db.doTn(async tn => {
+          this.configureGcTransaction(tn);
+          await this.assertGcLeaseInTxn(
+            tn,
+            "generation",
+            claim.partition,
+            claim.token,
+            Date.now(),
+          );
           const generation = await this.readGeneration(
             tn,
             teamId,
@@ -3196,7 +3438,7 @@ export class NuqFdbMigrationStore {
             generation.terminalVersion !== version ||
             generation.terminalAt !== terminalAt
           ) {
-            this.clearGcIndexInTxn(
+            await this.clearGcIndexInTxn(
               tn,
               "generation",
               claim.partition,
@@ -3238,14 +3480,14 @@ export class NuqFdbMigrationStore {
             objects.length > 0 ||
             controls.length > 0
           ) {
-            this.clearGcIndexInTxn(
+            await this.clearGcIndexInTxn(
               tn,
               "generation",
               claim.partition,
               dueAt,
               indexKey,
             );
-            this.setGcIndexInTxn(
+            await this.setGcIndexInTxn(
               tn,
               "generation",
               claim.partition,
@@ -3258,7 +3500,7 @@ export class NuqFdbMigrationStore {
           for (const counter of MIGRATION_RESIDUE_COUNTERS) {
             tn.clear(this.residueKey(teamId, generationNumber, counter));
           }
-          this.clearGcIndexInTxn(
+          await this.clearGcIndexInTxn(
             tn,
             "generation",
             claim.partition,
@@ -3397,10 +3639,10 @@ export class NuqFdbMigrationStore {
         terminalAt: Date.now(),
         terminalVersion: next.revision,
       };
-      this.writeGenerationInTxn(tn, source, closedSource);
-      this.writeGenerationInTxn(tn, target, openTarget);
+      await this.writeGenerationInTxn(tn, source, closedSource);
+      await this.writeGenerationInTxn(tn, target, openTarget);
       tn.set(this.teamStateKey(teamId), encodeJson(next));
-      this.writeControlOperationInTxn(tn, teamId, op, completedOp);
+      await this.writeControlOperationInTxn(tn, teamId, op, completedOp);
       return next;
     });
   }
