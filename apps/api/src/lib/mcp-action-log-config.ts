@@ -1,4 +1,4 @@
-export type McpActionLogConfigInput = {
+type McpActionLogConfigInput = {
   MCP_ACTION_LOG_STORAGE_ENABLED?: boolean;
   MCP_ACTION_LOG_WRITES_ENABLED?: boolean;
   MCP_ACTION_LOG_SECRET?: string;

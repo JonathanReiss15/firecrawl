@@ -68,7 +68,7 @@ function text(value: unknown, field: string, max = 128, required = false) {
   return normalized || null;
 }
 
-export type McpActionLogInput = {
+type McpActionLogInput = {
   team_id: string;
   user_id: string | null;
   api_key_id: number | null;
@@ -191,7 +191,7 @@ export async function resolveMcpActionLogTeamPolicy(db: any, teamId: string) {
   return { flags: rows[0].flags ?? null };
 }
 
-export async function cleanupExpiredMcpActionLogs(db: any) {
+async function cleanupExpiredMcpActionLogs(db: any) {
   await db.execute(sql`
     with expired as (
       select id from mcp_action_logs

@@ -19,7 +19,7 @@ type ListResponse =
   | { success: true; data: unknown[]; nextCursor: string | null }
   | ErrorResponse;
 
-export function isMcpActionLogZdrTeam(flags: TeamFlags | undefined) {
+function isMcpActionLogZdrTeam(flags: TeamFlags | undefined) {
   return (
     flags?.forceZDR === true ||
     flags?.scrapeZDR === "forced" ||
