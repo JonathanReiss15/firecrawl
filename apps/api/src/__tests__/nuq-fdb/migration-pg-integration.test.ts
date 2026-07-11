@@ -1,11 +1,22 @@
 import { randomUUID } from "crypto";
 import { vi } from "vitest";
 
+const isolation = vi.hoisted(() => ({
+  abTestJob: vi.fn(),
+  getCrawl: vi.fn(),
+}));
+
 vi.mock("../../controllers/auth", () => ({
   getACUCTeam: vi.fn(async () => ({ flags: { nuqFdb: false } })),
 }));
 vi.mock("../../lib/deployment", () => ({ isSelfHosted: vi.fn(() => false) }));
-vi.mock("../../services/ab-test", () => ({ abTestJob: vi.fn() }));
+// Queue publication depends on crawl/scraper helpers only for unrelated crawl
+// and A/B paths. Keep those boundaries out of this real PG + Redis + FDB suite;
+// in particular, core CI intentionally installs without native scraper builds.
+vi.mock("../../lib/crawl-redis", () => ({ getCrawl: isolation.getCrawl }));
+vi.mock("../../services/ab-test", () => ({
+  abTestJob: isolation.abTestJob,
+}));
 
 import { config } from "../../config";
 import {
