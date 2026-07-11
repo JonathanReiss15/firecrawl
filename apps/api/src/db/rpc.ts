@@ -139,6 +139,37 @@ export function monitoringClaimDueMonitors<T = Record<string, any>>(params: {
   );
 }
 
+type OAuthCacheInvalidationRow = {
+  id: string;
+  access_token_hash: string;
+  access_token_expires_at: string | Date;
+  reason: string;
+  attempts: number;
+};
+
+export function oauthClaimCacheInvalidations(params: {
+  limit: number;
+  leaseSeconds: number;
+}): Promise<OAuthCacheInvalidationRow[]> {
+  return execRows(
+    db,
+    sql`select * from oauth_claim_cache_invalidations(p_limit => ${params.limit}, p_lease_seconds => ${params.leaseSeconds})`,
+  );
+}
+
+export async function oauthAckCacheInvalidation(params: {
+  id: string;
+  attempt: number;
+  succeeded: boolean;
+  error: string | null;
+}): Promise<boolean> {
+  const rows = await execRows<{ oauth_ack_cache_invalidation: boolean }>(
+    db,
+    sql`select oauth_ack_cache_invalidation(p_id => ${params.id}::bigint, p_claim_attempt => ${params.attempt}, p_succeeded => ${params.succeeded}, p_error => ${params.error})`,
+  );
+  return rows[0]?.oauth_ack_cache_invalidation === true;
+}
+
 export async function updateTallyTeam(i_team_id: string): Promise<void> {
   await db.execute(sql`select update_tally_10_team(i_team_id => ${i_team_id})`);
 }

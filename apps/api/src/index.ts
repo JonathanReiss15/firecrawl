@@ -41,6 +41,7 @@ import { initializeEngineForcing } from "./scraper/WebScraper/utils/engine-forci
 import responseTime from "response-time";
 import { shutdownWebhookQueue } from "./services/webhook";
 import { shutdownIndexerQueue } from "./services/indexing/indexer-queue";
+import { startOAuthCacheInvalidationWorkerIfEnabled } from "./services/oauth-cache-invalidation";
 
 const { createBullBoard } = require("@bull-board/api");
 const { BullMQAdapter } = require("@bull-board/api/bullMQAdapter");
@@ -151,6 +152,11 @@ async function startServer(port = DEFAULT_PORT) {
     enabled: config.MCP_ACTION_LOG_STORAGE_ENABLED,
     db,
   });
+  const oauthCacheInvalidation = startOAuthCacheInvalidationWorkerIfEnabled({
+    enabled:
+      config.OAUTH_CACHE_INVALIDATION_ENABLED &&
+      config.USE_DB_AUTHENTICATION === true,
+  });
 
   const server = app.listen(Number(port), HOST, (error?: Error) => {
     if (error) {
@@ -164,6 +170,7 @@ async function startServer(port = DEFAULT_PORT) {
   const exitHandler = async () => {
     logger.info("SIGTERM signal received: closing HTTP server");
     mcpActionLogRetention?.stop();
+    oauthCacheInvalidation?.stop();
     if (config.IS_KUBERNETES) {
       // Account for GCE load balancer drain timeout
       logger.info("Waiting 60s for GCE load balancer drain timeout");
