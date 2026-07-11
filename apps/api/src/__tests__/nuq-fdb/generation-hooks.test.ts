@@ -33,6 +33,11 @@ const finishedQueue = new NuQFdbQueue<any, any>(finishedQueueName, {
 });
 const groups = new NuQFdbJobGroup(queue.ks, queue.groupOps!);
 const slots = new NuqFdbExternalSlots(queue.ks);
+// A production replica retains one sweeper identity while its partition leases
+// are live. Reuse that identity here too: constructing a new replica per test
+// leaves the exact partition under the prior replica's 15-second lease and
+// makes bounded promotion checks depend on suite runtime.
+const sweeper = new NuqFdbSweeper([queue, finishedQueue], []);
 const teams = new Set<string>();
 
 const unlimited = {
@@ -279,7 +284,6 @@ describeIf("NuQ FDB transaction-scoped migration generation hooks", () => {
         residue: { control_groups: 1 },
       }),
     );
-    const sweeper = new NuqFdbSweeper([queue, finishedQueue], []);
     for (let attempt = 0; attempt < 20; attempt++) {
       if ((await groups.getGroup(groupId))?.status === "completed") break;
       await sweeper.sweepOnce();
@@ -519,7 +523,6 @@ describeIf("NuQ FDB transaction-scoped migration generation hooks", () => {
     });
 
     await new Promise(resolve => setTimeout(resolve, 1_100));
-    const sweeper = new NuqFdbSweeper([queue, finishedQueue], []);
     let promotedResidue = await residue(teamId);
     for (
       let attempt = 0;
@@ -748,7 +751,6 @@ describeIf("NuQ FDB transaction-scoped migration generation hooks", () => {
 
     await forceSealCorruptResidueForStaleGenerationTest(teamId);
     await new Promise(resolve => setTimeout(resolve, 1_100));
-    const sweeper = new NuqFdbSweeper([queue, finishedQueue], []);
     let staleError: unknown;
     for (let attempt = 0; attempt < 10 && !staleError; attempt++) {
       try {
