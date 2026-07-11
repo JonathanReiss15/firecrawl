@@ -50,6 +50,54 @@ async function begin(
   });
 }
 
+type GcClaim = { partition: number; token: string };
+type GcClaimTestStore = {
+  claimGcPartition(category: string): Promise<GcClaim | null>;
+  releaseGcPartition(
+    category: string,
+    partition: number,
+    token: string,
+  ): Promise<void>;
+};
+
+async function clearGcClaimState(category: string): Promise<void> {
+  const range = getFdb().tuple.range([
+    "nuq-migration",
+    1,
+    "gc",
+    "lease",
+    category,
+  ]);
+  await getNuqFdbDatabase().doTn(async tn => {
+    tn.clearRange(range.begin as Buffer, range.end as Buffer);
+    tn.clear(store.pack(["gc", "cursor", category]));
+  });
+}
+
+async function readGcClaimState(category: string): Promise<{
+  cursor: number;
+  leases: Array<{ partition: number; token: string; expiresAt: number }>;
+}> {
+  const fdb = getFdb();
+  const range = fdb.tuple.range(["nuq-migration", 1, "gc", "lease", category]);
+  return await getNuqFdbDatabase().doTn(async tn => {
+    const [cursorValue, rows] = await Promise.all([
+      tn.get(store.pack(["gc", "cursor", category])),
+      tn.getRangeAll(range.begin as Buffer, range.end as Buffer),
+    ]);
+    return {
+      cursor: Number(JSON.parse(cursorValue?.toString() ?? "0")),
+      leases: rows.map(([key, value]) => ({
+        partition: Number(fdb.tuple.unpack(key as Buffer)[5]),
+        ...(JSON.parse(value.toString()) as {
+          token: string;
+          expiresAt: number;
+        }),
+      })),
+    };
+  });
+}
+
 async function withGcPostCommitReplay<T>(body: () => Promise<T>): Promise<T> {
   const db = getNuqFdbDatabase();
   const originalDoTn = db.doTn.bind(db);
@@ -1196,6 +1244,207 @@ describeIf("NuQ global FDB migration control plane", () => {
       });
     } finally {
       doTn.mockRestore();
+    }
+  });
+
+  test("GC claims reconcile repeated commit-unknown closure replay", async () => {
+    const claimStore = store as unknown as GcClaimTestStore;
+    const db = getNuqFdbDatabase();
+    const originalDoTn = db.doTn.bind(db);
+    const base = 1_795_000_000_000;
+    const clock = vi.spyOn(Date, "now").mockReturnValue(base);
+    const categories = {
+      replay: `claim-replay-${RUN}`,
+      expired: `claim-expired-${RUN}`,
+      replaced: `claim-replaced-${RUN}`,
+      duplicates: `claim-duplicates-${RUN}`,
+    };
+    try {
+      // One lost acknowledgement, followed by repeated callback re-entry, must
+      // return the original claim without consuming more cursor positions.
+      await clearGcClaimState(categories.replay);
+      await db.doTn(async tn =>
+        tn.set(
+          store.pack(["gc", "cursor", categories.replay]),
+          Buffer.from(JSON.stringify(7)),
+        ),
+      );
+      const replayed: GcClaim[] = [];
+      let replaying = false;
+      const replayHook = vi
+        .spyOn(db, "doTn")
+        .mockImplementation(async (closure, opts) => {
+          let result = await originalDoTn(closure, opts);
+          if (!replaying) {
+            replaying = true;
+            try {
+              replayed.push(result as GcClaim);
+              for (let attempt = 0; attempt < 3; attempt++) {
+                result = await originalDoTn(closure, opts);
+                replayed.push(result as GcClaim);
+              }
+            } finally {
+              replaying = false;
+            }
+          }
+          return result;
+        });
+      const claim = await claimStore.claimGcPartition(categories.replay);
+      replayHook.mockRestore();
+      expect(claim).not.toBeNull();
+      expect(replayed).toEqual(Array.from({ length: 4 }, () => claim));
+      await expect(readGcClaimState(categories.replay)).resolves.toEqual({
+        cursor: 8,
+        leases: [
+          {
+            partition: 7,
+            token: claim!.token,
+            expiresAt: base + 30_000,
+          },
+        ],
+      });
+      await claimStore.releaseGcPartition(
+        categories.replay,
+        claim!.partition,
+        claim!.token,
+      );
+      await expect(readGcClaimState(categories.replay)).resolves.toEqual({
+        cursor: 8,
+        leases: [],
+      });
+      const concurrent = await (
+        new NuqFdbMigrationStore() as unknown as GcClaimTestStore
+      ).claimGcPartition(categories.replay);
+      expect(concurrent?.partition).toBe(8);
+      await claimStore.releaseGcPartition(
+        categories.replay,
+        concurrent!.partition,
+        concurrent!.token,
+      );
+
+      // Crossing the local deadline during replay renews an unchanged token.
+      await clearGcClaimState(categories.expired);
+      const expiryHook = vi
+        .spyOn(db, "doTn")
+        .mockImplementation(async (closure, opts) => {
+          const result = await originalDoTn(closure, opts);
+          clock.mockReturnValue(base + 31_000);
+          const reconciled = await originalDoTn(closure, opts);
+          expect(reconciled).toEqual(result);
+          return result;
+        });
+      const expired = await claimStore.claimGcPartition(categories.expired);
+      expiryHook.mockRestore();
+      await expect(readGcClaimState(categories.expired)).resolves.toEqual({
+        cursor: 1,
+        leases: [
+          {
+            partition: 0,
+            token: expired!.token,
+            expiresAt: base + 61_000,
+          },
+        ],
+      });
+
+      // If another owner really replaced the key, replay cannot resurrect it;
+      // it claims the next fair partition and leaves exactly one own lease.
+      clock.mockReturnValue(base);
+      await clearGcClaimState(categories.replaced);
+      let replacementReplay: GcClaim | null = null;
+      const replacementHook = vi
+        .spyOn(db, "doTn")
+        .mockImplementation(async (closure, opts) => {
+          const result = (await originalDoTn(closure, opts)) as GcClaim;
+          await originalDoTn(async tn =>
+            tn.set(
+              store.pack([
+                "gc",
+                "lease",
+                categories.replaced,
+                result.partition,
+              ]),
+              Buffer.from(
+                JSON.stringify({
+                  token: "replacement-owner",
+                  expiresAt: base + 60_000,
+                }),
+              ),
+            ),
+          );
+          replacementReplay = (await originalDoTn(closure, opts)) as GcClaim;
+          return replacementReplay;
+        });
+      const replaced = await claimStore.claimGcPartition(categories.replaced);
+      replacementHook.mockRestore();
+      expect(replaced?.partition).toBe(1);
+      expect(replacementReplay).toEqual(replaced);
+      const replacementState = await readGcClaimState(categories.replaced);
+      expect(replacementState.cursor).toBe(2);
+      expect(
+        replacementState.leases.filter(item => item.token === replaced!.token),
+      ).toEqual([
+        {
+          partition: 1,
+          token: replaced!.token,
+          expiresAt: base + 30_000,
+        },
+      ]);
+      expect(replacementState.leases).toContainEqual({
+        partition: 0,
+        token: "replacement-owner",
+        expiresAt: base + 60_000,
+      });
+
+      // Repair old duplicate-token leases in the same bounded transaction. The
+      // cursor says partition 15 was the last committed claim, so it wins.
+      await clearGcClaimState(categories.duplicates);
+      let duplicateReplay: GcClaim | null = null;
+      const duplicateHook = vi
+        .spyOn(db, "doTn")
+        .mockImplementation(async (closure, opts) => {
+          const result = (await originalDoTn(closure, opts)) as GcClaim;
+          await originalDoTn(async tn => {
+            for (const partition of [12, 15]) {
+              tn.set(
+                store.pack(["gc", "lease", categories.duplicates, partition]),
+                Buffer.from(
+                  JSON.stringify({
+                    token: result.token,
+                    expiresAt: base + 30_000,
+                  }),
+                ),
+              );
+            }
+            tn.set(
+              store.pack(["gc", "cursor", categories.duplicates]),
+              Buffer.from(JSON.stringify(16)),
+            );
+          });
+          duplicateReplay = (await originalDoTn(closure, opts)) as GcClaim;
+          return duplicateReplay;
+        });
+      const duplicated = await claimStore.claimGcPartition(
+        categories.duplicates,
+      );
+      duplicateHook.mockRestore();
+      expect(duplicated?.partition).toBe(15);
+      expect(duplicateReplay).toEqual(duplicated);
+      await expect(readGcClaimState(categories.duplicates)).resolves.toEqual({
+        cursor: 16,
+        leases: [
+          {
+            partition: 15,
+            token: duplicated!.token,
+            expiresAt: base + 30_000,
+          },
+        ],
+      });
+    } finally {
+      vi.restoreAllMocks();
+      clock.mockRestore();
+      for (const category of Object.values(categories)) {
+        await clearGcClaimState(category);
+      }
     }
   });
 

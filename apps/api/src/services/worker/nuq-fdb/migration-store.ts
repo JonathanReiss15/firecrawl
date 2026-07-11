@@ -2819,42 +2819,84 @@ export class NuqFdbMigrationStore {
         );
       }
 
-      // Select and advance in one transaction. Advancing once per unavailable
-      // partition let racing callers consume a complete cursor rotation while
-      // old owners were still finishing empty shards, so an expired owner with
-      // real work could be skipped indefinitely. A successful claim is now the
-      // only operation that advances the cursor; the lease reads also conflict
-      // with concurrent claims and releases.
+      // Read one complete, bounded rotation before choosing. Besides preserving
+      // the conflict reads used by ordinary claims, this lets a doTn closure
+      // replay after commit_unknown_result find the lease committed by its
+      // first attempt instead of treating it as busy and advancing again.
+      const leases: Array<{
+        partition: number;
+        key: Buffer;
+        lease: { token: string; expiresAt: number } | null;
+      }> = [];
       for (let offset = 0; offset < MIGRATION_GC_PARTITIONS; offset++) {
         const partition = (cursor + offset) % MIGRATION_GC_PARTITIONS;
-        const leaseKey = this.gcLeaseKey(category, partition);
-        const lease = parseJson(
-          await tn.get(leaseKey),
-          `GC ${category} lease`,
-        ) as { token?: unknown; expiresAt?: unknown } | null;
+        const key = this.gcLeaseKey(category, partition);
+        const value = parseJson(await tn.get(key), `GC ${category} lease`) as {
+          token?: unknown;
+          expiresAt?: unknown;
+        } | null;
         if (
-          lease &&
-          (typeof lease.token !== "string" ||
-            lease.token.length === 0 ||
-            !isNonnegativeInteger(lease.expiresAt))
+          value &&
+          (typeof value.token !== "string" ||
+            value.token.length === 0 ||
+            !isNonnegativeInteger(value.expiresAt))
         ) {
           throw new MigrationCorruptionError(
             `GC ${category} lease`,
             "invalid lease fields",
           );
         }
-        if (lease && (lease.expiresAt as number) > leaseNow) continue;
+        leases.push({
+          partition,
+          key,
+          lease: value
+            ? {
+                token: value.token as string,
+                expiresAt: value.expiresAt as number,
+              }
+            : null,
+        });
+      }
+
+      const ownLeases = leases.filter(item => item.lease?.token === token);
+      if (ownLeases.length > 0) {
+        // A successful claim leaves the cursor immediately after its partition.
+        // Prefer that lease when repairing duplicates left by older buggy
+        // commit-unknown replays; otherwise cursor order is deterministic.
+        const committedPartition =
+          (cursor + MIGRATION_GC_PARTITIONS - 1) % MIGRATION_GC_PARTITIONS;
+        const keeper =
+          ownLeases.find(item => item.partition === committedPartition) ??
+          ownLeases[0];
+        for (const duplicate of ownLeases) {
+          if (duplicate.partition !== keeper.partition) tn.clear(duplicate.key);
+        }
+        // The same invocation may replay after its local lease deadline. The
+        // key still names it, so no replacement won that partition and renewal
+        // is safe. Deliberately do not move the already-committed cursor.
         tn.set(
-          leaseKey,
+          keeper.key,
           encodeJson({ token, expiresAt: leaseNow + MIGRATION_GC_LEASE_MS }),
         );
-        tn.set(
-          cursorKey,
-          encodeJson((partition + 1) % MIGRATION_GC_PARTITIONS),
-        );
-        return { partition, token };
+        return { partition: keeper.partition, token };
       }
-      return null;
+
+      // Advancing once per unavailable partition let racing callers consume a
+      // complete cursor rotation while old owners were still finishing empty
+      // shards. Only a successful new claim advances the cursor.
+      const available = leases.find(
+        item => !item.lease || item.lease.expiresAt <= leaseNow,
+      );
+      if (!available) return null;
+      tn.set(
+        available.key,
+        encodeJson({ token, expiresAt: leaseNow + MIGRATION_GC_LEASE_MS }),
+      );
+      tn.set(
+        cursorKey,
+        encodeJson((available.partition + 1) % MIGRATION_GC_PARTITIONS),
+      );
+      return { partition: available.partition, token };
     });
   }
 
