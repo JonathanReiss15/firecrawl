@@ -556,6 +556,24 @@ export const requests = pgTable("requests", {
   api_key_id: bigintNum("api_key_id"),
 });
 
+export const mcp_action_logs = pgTable("mcp_action_logs", {
+  id: uuid("id").defaultRandom().primaryKey(),
+  team_id: uuid("team_id").notNull(),
+  user_id: uuid("user_id"),
+  api_key_id: bigintNum("api_key_id"),
+  oauth_client_id: text("oauth_client_id"),
+  auth_type: text("auth_type").notNull(),
+  tool_name: text("tool_name").notNull(),
+  status: text("status").notNull(),
+  request_id: uuid("request_id").notNull(),
+  client_name: text("client_name"),
+  client_version: text("client_version"),
+  error_class: text("error_class"),
+  resource: text("resource").notNull(),
+  created_at: ts("created_at").notNull().defaultNow(),
+  expires_at: ts("expires_at").notNull(),
+});
+
 export const scrapes = pgTable("scrapes", {
   id: uuid("id").notNull(),
   request_id: uuid("request_id").notNull(),
