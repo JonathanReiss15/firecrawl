@@ -1,0 +1,109 @@
+import bodyParser from "body-parser";
+import express, { NextFunction, Request, Response } from "express";
+import request from "supertest";
+import { beforeEach, describe, expect, it, vi } from "vitest";
+import { config } from "../../config";
+
+const { ingest } = vi.hoisted(() => ({
+  ingest: vi.fn(async (_req: Request, res: Response) =>
+    res.status(202).json({ success: true }),
+  ),
+}));
+
+vi.mock("../../controllers/v2/mcp-action-logs", () => ({
+  ingestMcpActionLogController: ingest,
+}));
+vi.mock("../../routes/shared", () => ({
+  wrap:
+    (controller: any) => (req: Request, res: Response, next: NextFunction) =>
+      Promise.resolve(controller(req, res)).catch(next),
+}));
+
+import {
+  createMcpActionLogRateLimitMiddleware,
+  registerMcpActionLogIngestRoute,
+  timingSafeSecretEqual,
+} from "../../routes/mcp-action-logs";
+
+function app(rateLimit = createMcpActionLogRateLimitMiddleware()) {
+  const server = express();
+  registerMcpActionLogIngestRoute(server, { rateLimit });
+  server.use(bodyParser.json({ limit: "10mb" }));
+  server.use(
+    (error: any, _req: Request, res: Response, _next: NextFunction) => {
+      if (error?.status === 413) {
+        return res
+          .status(413)
+          .json({ success: false, error: "Request body is too large" });
+      }
+      return res.status(500).json({ success: false, error: "unexpected" });
+    },
+  );
+  return server;
+}
+
+describe("MCP action log ingest route", () => {
+  beforeEach(() => {
+    config.MCP_ACTION_LOG_SECRET = "test-secret";
+    config.MCP_ACTION_LOG_STORAGE_ENABLED = true;
+    config.MCP_ACTION_LOG_WRITES_ENABLED = true;
+    ingest.mockClear();
+  });
+
+  it("is disabled by default through an explicit write flag", async () => {
+    config.MCP_ACTION_LOG_WRITES_ENABLED = false;
+    const response = await request(app())
+      .post("/v2/mcp/action-logs")
+      .set("Authorization", "Bearer test-secret")
+      .send({});
+    expect(response.status).toBe(503);
+    expect(ingest).not.toHaveBeenCalled();
+  });
+
+  it("defensively rejects writes when storage is disabled", async () => {
+    config.MCP_ACTION_LOG_STORAGE_ENABLED = false;
+    const response = await request(app())
+      .post("/v2/mcp/action-logs")
+      .set("Authorization", "Bearer test-secret")
+      .send({});
+    expect(response.status).toBe(503);
+    expect(ingest).not.toHaveBeenCalled();
+  });
+
+  it("uses a timing-safe shared-secret comparison", async () => {
+    expect(timingSafeSecretEqual("test-secret", "test-secret")).toBe(true);
+    expect(timingSafeSecretEqual("short", "long-secret")).toBe(false);
+    const response = await request(app()).post("/v2/mcp/action-logs").send({});
+    expect(response.status).toBe(401);
+    expect(ingest).not.toHaveBeenCalled();
+  });
+
+  it("enforces the dedicated 64 KB body limit before the global parser", async () => {
+    const response = await request(app())
+      .post("/v2/mcp/action-logs")
+      .set("Authorization", "Bearer test-secret")
+      .send({ padding: "x".repeat(65 * 1024) });
+    expect(response.status).toBe(413);
+    expect(ingest).not.toHaveBeenCalled();
+  });
+
+  it("rate limits accepted writers with Retry-After", async () => {
+    const server = app(
+      createMcpActionLogRateLimitMiddleware({
+        limit: 1,
+        windowMs: 10_000,
+        now: () => 1_000,
+      }),
+    );
+    const send = () =>
+      request(server)
+        .post("/v2/mcp/action-logs")
+        .set("Authorization", "Bearer test-secret")
+        .send({});
+    expect((await send()).status).toBe(202);
+    const blocked = await send();
+    expect(blocked.status).toBe(429);
+    expect(blocked.headers["retry-after"]).toBe("10");
+    expect(ingest).toHaveBeenCalledTimes(1);
+  });
+});

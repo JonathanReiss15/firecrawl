@@ -1,5 +1,6 @@
 import "dotenv/config";
 import { z } from "zod";
+import { getMcpActionLogConfigErrors } from "./lib/mcp-action-log-config";
 
 /* Codecs */
 const delimitedList = (separator = ",") => {
@@ -102,6 +103,9 @@ const configSchema = z.object({
   // OAuth token introspection
   OAUTH_INTROSPECT_URL: z.string().optional(),
   OAUTH_INTROSPECT_SECRET: z.string().optional(),
+  MCP_ACTION_LOG_SECRET: z.string().optional(),
+  MCP_ACTION_LOG_STORAGE_ENABLED: z.stringbool().default(false),
+  MCP_ACTION_LOG_WRITES_ENABLED: z.stringbool().default(false),
 
   // Agent auth discovery (RFC 9728 WWW-Authenticate on 401)
   AGENT_AUTH_RESOURCE_METADATA_URL: z
@@ -379,4 +383,14 @@ const configSchema = z.object({
   CODE_SANDBOX_URL: z.string().default("ws://code-sandbox:3001"),
 });
 
-export const config = configSchema.parse(process.env);
+const validatedConfigSchema = configSchema.superRefine((value, context) => {
+  for (const error of getMcpActionLogConfigErrors(value)) {
+    context.addIssue({
+      code: "custom",
+      path: [error.path],
+      message: error.message,
+    });
+  }
+});
+
+export const config = validatedConfigSchema.parse(process.env);
