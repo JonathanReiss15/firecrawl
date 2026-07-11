@@ -12,18 +12,21 @@ vi.mock("./highlights", () => ({
 
 import { config } from "../config";
 import { applySearchHighlights, highlightsEnvReady } from "./highlights";
-import { runSearchHighlightsShadow } from "./highlights-shadow";
+import { createSearchHighlightsShadowRunner } from "./highlights-shadow";
 
 const logger = {
   info: vi.fn(),
   warn: vi.fn(),
 } as any;
 
+let runSearchHighlightsShadow = createSearchHighlightsShadowRunner();
+
 afterEach(() => {
   vi.clearAllMocks();
   config.HIGHLIGHT_SHADOW_RATE = 1;
   config.HIGHLIGHT_SHADOW_MAX_INFLIGHT = 1;
   vi.mocked(highlightsEnvReady).mockReturnValue(true);
+  runSearchHighlightsShadow = createSearchHighlightsShadowRunner();
 });
 
 describe("runSearchHighlightsShadow", () => {
@@ -50,7 +53,7 @@ describe("runSearchHighlightsShadow", () => {
     expect(applySearchHighlights).toHaveBeenCalledWith(
       {},
       "private query",
-      logger,
+      expect.objectContaining({ silent: true }),
       {
         applyResults: false,
         suppressSummaryLog: true,

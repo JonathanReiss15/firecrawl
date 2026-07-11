@@ -1,11 +1,10 @@
-import type { Logger } from "winston";
+import { createLogger, type Logger } from "winston";
 import type { SearchV2Response } from "../lib/entities";
 import { config } from "../config";
 import { applySearchHighlights, highlightsEnvReady } from "./highlights";
 
 const CANONICAL_LOG = "search/highlights-shadow";
-
-let inFlight = 0;
+const shadowLogger = createLogger({ silent: true });
 
 function sampled(requestId: string, rate: number): boolean {
   if (rate <= 0) return false;
@@ -19,75 +18,81 @@ function sampled(requestId: string, rate: number): boolean {
   return (hash >>> 0) / 0x1_0000_0000 < rate;
 }
 
-export function runSearchHighlightsShadow(options: {
+export function createSearchHighlightsShadowRunner(): (options: {
   response: SearchV2Response;
   query: string;
   requestId: string;
   teamId: string;
   zeroDataRetention: boolean;
   logger: Logger;
-}): "skipped" | "dropped" | "started" {
-  if (
-    options.zeroDataRetention ||
-    !highlightsEnvReady() ||
-    !sampled(options.requestId, config.HIGHLIGHT_SHADOW_RATE)
-  ) {
-    return "skipped";
-  }
+}) => "skipped" | "dropped" | "started" {
+  let inFlight = 0;
 
-  if (inFlight >= config.HIGHLIGHT_SHADOW_MAX_INFLIGHT) {
-    options.logger.info("Search highlights shadow dropped", {
-      canonicalLog: CANONICAL_LOG,
-      outcome: "dropped",
-      reason: "max_inflight",
-      requestId: options.requestId,
-      teamId: options.teamId,
-      inFlight,
-      maxInFlight: config.HIGHLIGHT_SHADOW_MAX_INFLIGHT,
-      sampleRate: config.HIGHLIGHT_SHADOW_RATE,
-    });
-    return "dropped";
-  }
+  return options => {
+    if (
+      options.zeroDataRetention ||
+      !highlightsEnvReady() ||
+      !sampled(options.requestId, config.HIGHLIGHT_SHADOW_RATE)
+    ) {
+      return "skipped";
+    }
 
-  inFlight++;
-  const startedAt = Date.now();
-  void applySearchHighlights(options.response, options.query, options.logger, {
-    applyResults: false,
-    suppressSummaryLog: true,
-    suppressPayloadLog: true,
-    allowLegacyFallback: false,
-  })
-    .then(result => {
-      options.logger.info("Search highlights shadow completed", {
+    if (inFlight >= config.HIGHLIGHT_SHADOW_MAX_INFLIGHT) {
+      options.logger.info("Search highlights shadow dropped", {
         canonicalLog: CANONICAL_LOG,
-        outcome: result.succeeded ? "completed" : "failed",
+        outcome: "dropped",
+        reason: "max_inflight",
         requestId: options.requestId,
         teamId: options.teamId,
-        attempted: result.attempted,
-        indexHits: result.indexHits,
-        wouldReplace: result.replaced,
-        timeTakenMs: Date.now() - startedAt,
         inFlight,
         maxInFlight: config.HIGHLIGHT_SHADOW_MAX_INFLIGHT,
         sampleRate: config.HIGHLIGHT_SHADOW_RATE,
       });
-    })
-    .catch(error => {
-      options.logger.warn("Search highlights shadow failed", {
-        canonicalLog: CANONICAL_LOG,
-        outcome: "failed",
-        requestId: options.requestId,
-        teamId: options.teamId,
-        errorType: error instanceof Error ? error.name : "unknown",
-        timeTakenMs: Date.now() - startedAt,
-        inFlight,
-        maxInFlight: config.HIGHLIGHT_SHADOW_MAX_INFLIGHT,
-        sampleRate: config.HIGHLIGHT_SHADOW_RATE,
-      });
-    })
-    .finally(() => {
-      inFlight--;
-    });
+      return "dropped";
+    }
 
-  return "started";
+    inFlight++;
+    const startedAt = Date.now();
+    void applySearchHighlights(options.response, options.query, shadowLogger, {
+      applyResults: false,
+      suppressSummaryLog: true,
+      suppressPayloadLog: true,
+      allowLegacyFallback: false,
+    })
+      .then(result => {
+        options.logger.info("Search highlights shadow completed", {
+          canonicalLog: CANONICAL_LOG,
+          outcome: result.succeeded ? "completed" : "failed",
+          requestId: options.requestId,
+          teamId: options.teamId,
+          attempted: result.attempted,
+          indexHits: result.indexHits,
+          wouldReplace: result.replaced,
+          timeTakenMs: Date.now() - startedAt,
+          inFlight,
+          maxInFlight: config.HIGHLIGHT_SHADOW_MAX_INFLIGHT,
+          sampleRate: config.HIGHLIGHT_SHADOW_RATE,
+        });
+      })
+      .catch(error => {
+        options.logger.warn("Search highlights shadow failed", {
+          canonicalLog: CANONICAL_LOG,
+          outcome: "failed",
+          requestId: options.requestId,
+          teamId: options.teamId,
+          errorType: error instanceof Error ? error.name : "unknown",
+          timeTakenMs: Date.now() - startedAt,
+          inFlight,
+          maxInFlight: config.HIGHLIGHT_SHADOW_MAX_INFLIGHT,
+          sampleRate: config.HIGHLIGHT_SHADOW_RATE,
+        });
+      })
+      .finally(() => {
+        inFlight--;
+      });
+
+    return "started";
+  };
 }
+
+export const runSearchHighlightsShadow = createSearchHighlightsShadowRunner();
