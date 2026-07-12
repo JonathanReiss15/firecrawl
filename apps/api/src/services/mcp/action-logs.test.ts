@@ -26,7 +26,7 @@ const REQUEST_ID = "00000000-0000-4000-8000-000000000003";
 function input(overrides: Record<string, unknown> = {}) {
   return normalizeMcpActionLogInput({
     team_id: TEAM_ID,
-    api_key_id: 123,
+    api_key_id: "123",
     auth_type: "api-key",
     tool_name: "firecrawl_scrape",
     status: "success",
@@ -37,6 +37,30 @@ function input(overrides: Record<string, unknown> = {}) {
 }
 
 describe("MCP action log contract", () => {
+  it("preserves decimal API-key IDs beyond JavaScript's safe integer range", () => {
+    expect(input({ api_key_id: "9007199254740993" }).api_key_id).toBe(
+      "9007199254740993",
+    );
+  });
+
+  it.each([
+    "",
+    "0",
+    "01",
+    "-1",
+    "+1",
+    "1.0",
+    "1e3",
+    " 1",
+    "1 ",
+    "abc",
+    "9223372036854775808",
+  ])("rejects malformed API-key ID %j", apiKeyId => {
+    expect(() => input({ api_key_id: apiKeyId })).toThrow(
+      "api_key_id must be a positive decimal string",
+    );
+  });
+
   it("accepts only terminal, attributable events for canonical MCP resources", () => {
     expect(input()).toMatchObject({
       auth_type: "api-key",

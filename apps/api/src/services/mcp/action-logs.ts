@@ -11,6 +11,7 @@ const RESOURCES = new Set([
 ]);
 const UUID_PATTERN =
   /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
+const POSTGRES_BIGINT_MAX = 9_223_372_036_854_775_807n;
 const SECRET_PATTERN =
   /(?:\bBearer\s+\S+|\beyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\b|\b(?:sk-|fc-|fco_|fcr_)[A-Za-z0-9_-]+)/i;
 const RETENTION_DAYS = 30;
@@ -36,6 +37,14 @@ export class McpActionLogAuthorizationError extends Error {}
 
 function invalid(message: string): never {
   throw new McpActionLogValidationError(message);
+}
+
+function isCanonicalApiKeyId(value: unknown): value is string {
+  return (
+    typeof value === "string" &&
+    /^[1-9]\d*$/.test(value) &&
+    BigInt(value) <= POSTGRES_BIGINT_MAX
+  );
 }
 
 function uuid(value: unknown, field: string, required = true): string | null {
@@ -71,7 +80,7 @@ function text(value: unknown, field: string, max = 128, required = false) {
 type McpActionLogInput = {
   team_id: string;
   user_id: string | null;
-  api_key_id: number | null;
+  api_key_id: string | null;
   oauth_client_id: string | null;
   auth_type: (typeof AUTH_TYPES)[number];
   tool_name: string;
@@ -98,13 +107,8 @@ export function normalizeMcpActionLogInput(
     invalid("status must be success or error");
   }
   const apiKeyId = payload.api_key_id;
-  if (
-    apiKeyId != null &&
-    (typeof apiKeyId !== "number" ||
-      !Number.isSafeInteger(apiKeyId) ||
-      apiKeyId <= 0)
-  ) {
-    invalid("api_key_id must be a positive integer");
+  if (apiKeyId != null && !isCanonicalApiKeyId(apiKeyId)) {
+    invalid("api_key_id must be a positive decimal string");
   }
   const userId = uuid(payload.user_id, "user_id", false);
   const oauthClientId = text(payload.oauth_client_id, "oauth_client_id");
@@ -124,7 +128,7 @@ export function normalizeMcpActionLogInput(
   return {
     team_id: uuid(payload.team_id, "team_id")!,
     user_id: userId,
-    api_key_id: (apiKeyId as number | null | undefined) ?? null,
+    api_key_id: (apiKeyId as string | null | undefined) ?? null,
     oauth_client_id: oauthClientId,
     auth_type: authType as McpActionLogInput["auth_type"],
     tool_name: text(payload.tool_name, "tool_name", 128, true)!,
@@ -152,7 +156,7 @@ export async function validateMcpActionLogActor(
         .from(schema.api_keys)
         .where(
           and(
-            eq(schema.api_keys.id, input.api_key_id!),
+            sql`${schema.api_keys.id} = cast(${input.api_key_id!} as bigint)`,
             eq(schema.api_keys.team_id, input.team_id),
           ),
         )
@@ -269,7 +273,14 @@ export async function recordMcpActionLog(db: any, input: McpActionLogInput) {
   ).toISOString();
   const rows = await db
     .insert(schema.mcp_action_logs)
-    .values({ ...input, expires_at: expiresAt })
+    .values({
+      ...input,
+      api_key_id:
+        input.api_key_id === null
+          ? null
+          : sql`cast(${input.api_key_id} as bigint)`,
+      expires_at: expiresAt,
+    })
     .onConflictDoNothing({
       target: [
         schema.mcp_action_logs.team_id,
