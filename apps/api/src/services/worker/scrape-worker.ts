@@ -185,7 +185,6 @@ async function billScrapeJob(
           "bill_team",
           {
             team_id: job.data.team_id,
-            subscription_id: undefined,
             credits: creditsToBeBilled,
             billing,
             is_extract: false,

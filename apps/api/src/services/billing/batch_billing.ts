@@ -127,7 +127,7 @@ export async function processBillingBatch() {
       `📦 Processing batch of ${operations.length} billing operations`,
     );
 
-    // Group operations by team_id and subscription_id
+    // Group operations by team_id, endpoint, is_extract, and api_key_id
     const groupedOperations = new Map<string, GroupedBillingOperation>();
 
     for (const op of operations) {
