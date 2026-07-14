@@ -16,6 +16,11 @@ import { v7 as uuidv7 } from "uuid";
 import { isBaseDomain, extractBaseDomain } from "../../lib/url-utils";
 import { getScrapeZDR } from "../../lib/zdr-helpers";
 import { resolveViaAvgrab } from "../../lib/avgrab-resolve";
+import {
+  checkUrlsAgainstThreatPolicy,
+  resolveThreatProtection,
+} from "../../lib/threat-protection/request";
+import { calculateThreatScanCredits } from "../../lib/scrape-billing";
 
 configDotenv();
 
@@ -38,7 +43,22 @@ export async function mapController(
   const originalRequest = req.body;
   req.body = mapRequestSchema.parse(req.body);
 
-  const permissions = checkPermissions(req.body, req.acuc?.flags);
+  const threatProtection = await resolveThreatProtection({
+    teamId: req.auth.team_id,
+    orgId: req.acuc?.org_id ?? null,
+    flags: req.acuc?.flags ?? null,
+    override: req.body.threatProtection,
+  });
+  if (threatProtection.error) {
+    return res.status(403).json({
+      success: false,
+      error: threatProtection.error,
+    });
+  }
+
+  const permissions = checkPermissions(req.body, req.acuc?.flags, {
+    threatProtectionOrgConfig: threatProtection.orgConfig,
+  });
   if (permissions.error) {
     return res.status(403).json({
       success: false,
@@ -80,13 +100,10 @@ export async function mapController(
     if (avgrabResults !== null) {
       const creditsCost = avgrabResults.length;
 
-      billTeam(
-        req.auth.team_id,
-        req.acuc?.sub_id ?? undefined,
-        creditsCost,
-        req.acuc?.api_key_id ?? null,
-        { endpoint: "map", jobId: mapId },
-      ).catch(error => {
+      billTeam(req.auth.team_id, creditsCost, req.acuc?.api_key_id ?? null, {
+        endpoint: "map",
+        jobId: mapId,
+      }).catch(error => {
         logger.error(
           `Failed to bill team ${req.auth.team_id} for ${creditsCost} credits: ${error}`,
         );
@@ -189,17 +206,34 @@ export async function mapController(
     }
   }
 
-  // Bill the team
-  billTeam(
-    req.auth.team_id,
-    req.acuc?.sub_id ?? undefined,
-    1,
-    req.acuc?.api_key_id ?? null,
-    { endpoint: "map", jobId: mapId },
-  ).catch(error => {
-    logger.error(
-      `Failed to bill team ${req.auth.team_id} for 1 credit: ${error}`,
+  // Threat protection: remove blocked links from the returned URL list
+  // entirely. Checks are URL-level; scan fees bill +2 per unique scanned
+  // URL (see calculateThreatScanCredits).
+  let threatScanCredits = 0;
+  if (threatProtection.policy && result.mapResults.length > 0) {
+    const { decisionsByUrl } = await checkUrlsAgainstThreatPolicy(
+      result.mapResults.map(x => x.url),
+      threatProtection.policy,
+      { teamId: req.auth.team_id },
     );
+    threatScanCredits = calculateThreatScanCredits(decisionsByUrl.values());
+    result.mapResults = result.mapResults.filter(x => {
+      const decision = decisionsByUrl.get(x.url);
+      return decision === undefined || decision.allowed;
+    });
+  }
+
+  // Bill the team
+  const creditsToBill = 1 + threatScanCredits;
+  billTeam(req.auth.team_id, creditsToBill, req.acuc?.api_key_id ?? null, {
+    endpoint: "map",
+    jobId: mapId,
+  }).catch(error => {
+    logger.error("Failed to bill team for map credits", {
+      teamId: req.auth.team_id,
+      creditsToBill,
+      error,
+    });
   });
 
   logMap({
@@ -217,7 +251,7 @@ export async function mapController(
       location: req.body.location,
     },
     results: result.mapResults,
-    credits_cost: 1,
+    credits_cost: creditsToBill,
     zeroDataRetention: false, // not supported
   }).catch(error => {
     logger.error(`Failed to log job for team ${req.auth.team_id}: ${error}`);

@@ -9,7 +9,7 @@ import {
 import { addExtractJobToQueue } from "../../services/queue-service";
 import { saveExtract } from "../../lib/extract/extract-redis";
 import { getTeamIdSyncB } from "../../lib/extract/team-id-sync";
-import { ExtractResult } from "../../lib/extract/extraction-service";
+import { ExtractResult } from "../../lib/extract/types";
 import { performExtraction_F0 } from "../../lib/extract/fire-0/extraction-service-f0";
 import { UNSUPPORTED_SITE_MESSAGE } from "../../lib/strings";
 import { isUrlBlocked } from "../../scraper/WebScraper/utils/blocklist";
@@ -23,6 +23,13 @@ import { logRequest } from "../../services/logging/log_job";
 import { getScrapeZDR } from "../../lib/zdr-helpers";
 
 import { config } from "../../config";
+import {
+  checkUrlsAgainstThreatPolicy,
+  resolveThreatProtection,
+} from "../../lib/threat-protection/request";
+import { UnsafeDomainBlockedError } from "../../lib/threat-protection/error";
+import { calculateThreatScanCredits } from "../../lib/scrape-billing";
+import { billTeam } from "../../services/billing/credit_billing";
 async function oldExtract(
   req: RequestWithAuth<{}, ExtractResponse, ExtractRequest>,
   res: Response<ExtractResponse>,
@@ -60,7 +67,6 @@ async function oldExtract(
     result = await performExtraction_F0(extractId, {
       request,
       teamId: req.auth.team_id,
-      subId: req.acuc?.sub_id ?? undefined,
       apiKeyId: req.acuc?.api_key_id ?? null,
     });
 
@@ -133,6 +139,61 @@ export async function extractController(
     }
   }
 
+  // Threat protection: check target URLs before fetching. Blocked URLs are
+  // reported via invalidURLs (with ignoreInvalidURLs) or reject the request.
+  // Discovered URLs are enforced in the scrape pipeline via the policy
+  // threaded through the extract job.
+  const threatProtection = await resolveThreatProtection({
+    teamId: req.auth.team_id,
+    orgId: req.acuc?.org_id ?? null,
+    flags: req.acuc?.flags ?? null,
+    override: req.body.threatProtection,
+  });
+  if (threatProtection.error) {
+    return res.status(403).json({
+      success: false,
+      error: threatProtection.error,
+    });
+  }
+  if (threatProtection.policy && (req.body.urls?.length ?? 0) > 0) {
+    const { blocked, decisionsByUrl } = await checkUrlsAgainstThreatPolicy(
+      req.body.urls ?? [],
+      threatProtection.policy,
+      { teamId: req.auth.team_id },
+    );
+    // Consulted decisions bill the scan fee (+2 per unique scanned URL) —
+    // including when the request is rejected below: the scans already
+    // happened.
+    const threatScanCredits = calculateThreatScanCredits(
+      decisionsByUrl.values(),
+    );
+    if (threatScanCredits > 0) {
+      billTeam(
+        req.auth.team_id,
+        threatScanCredits,
+        req.acuc?.api_key_id ?? null,
+        { endpoint: "extract" },
+      ).catch(error => {
+        _logger.error(
+          `Failed to bill team ${req.auth.team_id} for ${threatScanCredits} threat scan credit(s): ${error}`,
+        );
+      });
+    }
+    if (blocked.length > 0) {
+      if (req.body.ignoreInvalidURLs) {
+        invalidURLs.push(...blocked.map(x => x.url));
+      } else {
+        const first = blocked[0];
+        const error = new UnsafeDomainBlockedError(first.url, first.decision);
+        return res.status(403).json({
+          success: false,
+          code: error.code,
+          error: error.message,
+        });
+      }
+    }
+  }
+
   const extractId = uuidv7();
 
   _logger.info("Extract starting...", {
@@ -140,7 +201,6 @@ export async function extractController(
     originalRequest,
     teamId: req.auth.team_id,
     team_id: req.auth.team_id,
-    subId: req.acuc?.sub_id,
     extractId,
     zeroDataRetention: getScrapeZDR(req.acuc?.flags) === "forced",
   });
@@ -171,7 +231,6 @@ export async function extractController(
       scrapeOptions,
     },
     teamId: req.auth.team_id,
-    subId: req.acuc?.sub_id,
     extractId,
     agent: req.body.agent,
     apiKeyId: req.acuc?.api_key_id ?? null,

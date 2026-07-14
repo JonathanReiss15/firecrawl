@@ -23,13 +23,16 @@ import { ScrapeJobTimeoutError } from "../../lib/error";
 import { scrapeQueue } from "../../services/worker/nuq-router";
 import { defaultOrigin } from "../../lib/default-values";
 import { getSearchZDR } from "../../lib/zdr-helpers";
+import {
+  isThreatProtectionForced,
+  THREAT_PROTECTION_V0_UNSUPPORTED_MESSAGE,
+} from "../../lib/threat-protection/request";
 import { applyAgentAuthDiscoveryHeader } from "../../lib/agent-auth-discovery";
 
 async function searchHelper(
   jobId: string,
   req: Request,
   team_id: string,
-  subscription_id: string | null | undefined,
   crawlerOptions: any,
   pageOptions: PageOptions,
   searchOptions: SearchOptions,
@@ -83,7 +86,6 @@ async function searchHelper(
     const searchCredits = Math.ceil(res.length / 10) * 2;
     billTeam(
       team_id,
-      subscription_id,
       searchCredits,
       api_key_id,
       { endpoint: "search", jobId },
@@ -192,6 +194,12 @@ export async function searchController(req: Request, res: Response) {
       });
     }
 
+    if (isThreatProtectionForced(chunk?.flags)) {
+      return res.status(403).json({
+        error: THREAT_PROTECTION_V0_UNSUPPORTED_MESSAGE,
+      });
+    }
+
     const jobId = uuidv7();
 
     await logRequest({
@@ -238,7 +246,10 @@ export async function searchController(req: Request, res: Response) {
       const autumnResult = await autumnService.checkCredits({
         teamId: team_id,
         value: 1,
-        properties: { source: "v0/search" },
+        properties: {
+          source: "v0/search",
+          apiKeyId: chunk?.api_key_id ?? null,
+        },
       });
       // null = Autumn unavailable / self-hosted -> fail open, matching v1/v2.
       if (autumnResult !== null && !autumnResult.allowed) {
@@ -254,7 +265,6 @@ export async function searchController(req: Request, res: Response) {
       jobId,
       req,
       team_id,
-      chunk?.sub_id,
       crawlerOptions,
       pageOptions,
       searchOptions,

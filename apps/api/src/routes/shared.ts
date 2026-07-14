@@ -29,6 +29,11 @@ import {
   CREDITS_FEATURE_ID,
 } from "../services/autumn/autumn.service";
 import { getTeamBalance } from "../services/autumn/usage";
+import {
+  getDataLayerAccessForRequest,
+  getThirdPartyDataTermsRequiredResponse,
+} from "../lib/data-layer";
+import { getScrapeZDR } from "../lib/zdr-helpers";
 
 export function checkCreditsMiddleware(
   _minimum?: number,
@@ -72,10 +77,10 @@ export function checkCreditsMiddleware(
           }
 
           // Enforce 50-credit cap for unverified agent keys. Autumn is the
-          // source of truth for credit usage now (not ACUC.adjusted_credits_used):
-          // getTeamBalance().usage is the team's credits used this period. If
-          // Autumn is unavailable we fail open (skip the cap), matching the
-          // Autumn-outage behavior of the main credit check below.
+          // source of truth for credit usage: getTeamBalance().usage is the
+          // team's credits used this period. If Autumn is unavailable we fail
+          // open (skip the cap), matching the Autumn-outage behavior of the
+          // main credit check below.
           const UNVERIFIED_CREDIT_LIMIT = 50;
           let unverifiedCreditsUsed: number | null = null;
           try {
@@ -143,6 +148,7 @@ export function checkCreditsMiddleware(
         properties: {
           source: "checkCreditsMiddleware",
           path: req.path,
+          apiKeyId: req.acuc?.api_key_id ?? null,
         },
         featureId,
       });
@@ -254,13 +260,6 @@ export function authMiddleware(
 
       req.auth = { team_id, org_id };
       req.acuc = chunk ?? undefined;
-      if (chunk) {
-        req.account = {
-          remainingCredits: chunk.price_should_be_graceful
-            ? chunk.remaining_credits + chunk.price_credits
-            : chunk.remaining_credits,
-        };
-      }
       next();
     })().catch(err => next(err));
   };
@@ -291,21 +290,53 @@ export function blocklistMiddleware(
   res: Response,
   next: NextFunction,
 ) {
-  if (
-    typeof req.body.url === "string" &&
-    isUrlBlocked(req.body.url, req.acuc?.flags ?? null, {
-      team_id: req.acuc?.team_id ?? null,
-      origin: typeof req.body.origin === "string" ? req.body.origin : null,
-    })
-  ) {
-    if (!res.headersSent) {
-      return res.status(403).json({
-        success: false,
-        error: UNSUPPORTED_SITE_MESSAGE,
-      });
+  (async () => {
+    const zeroDataRetention =
+      getScrapeZDR(req.acuc?.flags) === "forced" ||
+      req.body?.zeroDataRetention === true ||
+      req.body?.lockdown === true;
+    const dataLayerAccess =
+      typeof req.body.url === "string" &&
+      (await getDataLayerAccessForRequest({
+        url: req.body.url,
+        formats: req.body.formats,
+        actions: req.body.actions,
+        headers: req.body.headers,
+        waitFor: req.body.waitFor,
+        mobile: req.body.mobile,
+        location: req.body.location,
+        proxy: req.body.proxy,
+        blockAds: req.body.blockAds,
+        zeroDataRetention,
+        lockdown: req.body.lockdown,
+        flags: req.acuc?.flags ?? null,
+      }));
+    const canUseDataLayer =
+      typeof dataLayerAccess === "object" && dataLayerAccess.allowed;
+
+    if (typeof dataLayerAccess === "object" && dataLayerAccess.termsRequired) {
+      if (!res.headersSent) {
+        return res.status(403).json(getThirdPartyDataTermsRequiredResponse());
+      }
     }
-  }
-  next();
+
+    if (
+      typeof req.body.url === "string" &&
+      !canUseDataLayer &&
+      isUrlBlocked(req.body.url, req.acuc?.flags ?? null, {
+        team_id: req.acuc?.team_id ?? null,
+        origin: typeof req.body.origin === "string" ? req.body.origin : null,
+      })
+    ) {
+      if (!res.headersSent) {
+        return res.status(403).json({
+          success: false,
+          error: UNSUPPORTED_SITE_MESSAGE,
+        });
+      }
+    }
+    next();
+  })().catch(err => next(err));
 }
 
 export function countryCheck(

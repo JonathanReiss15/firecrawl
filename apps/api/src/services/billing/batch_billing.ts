@@ -1,9 +1,8 @@
 import { logger } from "../../lib/logger";
 import { getRedisConnection } from "../queue-service";
-import { billTeam6 } from "../../db/rpc";
+import { billTeam7 } from "../../db/rpc";
 import * as Sentry from "@sentry/node";
 import { withAuth } from "../../lib/withAuth";
-import { setCachedACUC, setCachedACUCTeam } from "../../controllers/auth";
 import {
   autumnService,
   featureIdForBillingEndpoint,
@@ -25,7 +24,6 @@ const LOCK_TIMEOUT = 30000; // 30 seconds lock timeout
 // Define interfaces for billing operations
 interface BillingOperation {
   team_id: string;
-  subscription_id: string | null;
   credits: number;
   billing?: BillingMetadata;
   endpoint?: BillingEndpoint;
@@ -38,7 +36,6 @@ interface BillingOperation {
 // Grouped billing operations for batch processing
 interface GroupedBillingOperation {
   team_id: string;
-  subscription_id: string | null;
   total_credits: number;
   billing: BillingMetadata;
   is_extract: boolean;
@@ -80,7 +77,6 @@ async function refundRequestTrackedCredits(group: GroupedBillingOperation) {
         source: "processBillingBatch",
         ...toAutumnBillingProperties(group.billing),
         apiKeyId: group.api_key_id,
-        subscriptionId: group.subscription_id,
       },
       featureId: featureIdForBillingEndpoint(group.billing.endpoint),
     });
@@ -103,7 +99,7 @@ async function refundRequestTrackedCredits(group: GroupedBillingOperation) {
 
 /**
  * Dequeues pending billing operations from Redis, groups them by team, and
- * commits each group to Supabase via the `bill_team_6` RPC.
+ * commits each group to Supabase via the `bill_team_7` RPC.
  */
 export async function processBillingBatch() {
   const redis = getRedisConnection();
@@ -131,7 +127,7 @@ export async function processBillingBatch() {
       `📦 Processing batch of ${operations.length} billing operations`,
     );
 
-    // Group operations by team_id and subscription_id
+    // Group operations by team_id, endpoint, is_extract, and api_key_id
     const groupedOperations = new Map<string, GroupedBillingOperation>();
 
     for (const op of operations) {
@@ -140,12 +136,11 @@ export async function processBillingBatch() {
           op.billing ?? (op.endpoint ? { endpoint: op.endpoint } : undefined),
         isExtract: op.is_extract,
       });
-      const key = `${op.team_id}:${op.subscription_id ?? "null"}:${billing.endpoint}:${op.is_extract}:${op.api_key_id}`;
+      const key = `${op.team_id}:${billing.endpoint}:${op.is_extract}:${op.api_key_id}`;
 
       if (!groupedOperations.has(key)) {
         groupedOperations.set(key, {
           team_id: op.team_id,
-          subscription_id: op.subscription_id,
           total_credits: 0,
           billing,
           is_extract: op.is_extract,
@@ -165,7 +160,6 @@ export async function processBillingBatch() {
         `🔄 Billing team ${group.team_id} for ${group.total_credits} credits`,
         {
           team_id: group.team_id,
-          subscription_id: group.subscription_id,
           total_credits: group.total_credits,
           billing: group.billing,
           operation_count: group.operations.length,
@@ -186,7 +180,6 @@ export async function processBillingBatch() {
           message: "No DB, bypassed.",
         })(
           group.team_id,
-          group.subscription_id,
           group.total_credits,
           group.api_key_id,
           logger,
@@ -264,7 +257,6 @@ export function startBillingBatchProcessing() {
  */
 export async function queueBillingOperation(
   team_id: string,
-  subscription_id: string | null | undefined,
   credits: number,
   api_key_id: number | null,
   billing: BillingMetadata,
@@ -279,7 +271,6 @@ export async function queueBillingOperation(
 
   logger.info(`Queueing billing operation for team ${team_id}`, {
     team_id,
-    subscription_id,
     credits,
     billing,
     is_extract,
@@ -288,7 +279,6 @@ export async function queueBillingOperation(
   try {
     const operation: BillingOperation = {
       team_id,
-      subscription_id: subscription_id ?? null,
       credits,
       billing,
       is_extract,
@@ -319,38 +309,6 @@ export async function queueBillingOperation(
       );
       await processBillingBatch();
     }
-    // TODO is there a better way to do this?
-
-    // Update cached credits used immediately to provide accurate feedback to users
-    // This is optimistic - actual billing happens in batch
-    // Should we add this?
-    // I guess batch is fast enough that it's fine
-
-    // if (config.USE_DB_AUTHENTICATION) {
-    //   (async () => {
-    //     // Get API keys for this team to update in cache
-    //     const { data } = await supabase_service
-    //       .from("api_keys")
-    //       .select("key")
-    //       .eq("team_id", team_id);
-
-    //     for (const apiKey of (data ?? []).map(x => x.key)) {
-    //       await setCachedACUC(apiKey, (acuc) =>
-    //         acuc
-    //           ? {
-    //               ...acuc,
-    //               credits_used: acuc.credits_used + credits,
-    //               adjusted_credits_used: acuc.adjusted_credits_used + credits,
-    //               remaining_credits: acuc.remaining_credits - credits,
-    //             }
-    //           : null,
-    //       );
-    //     }
-    //   })().catch(error => {
-    //     logger.error("Failed to update cached credits", { error, team_id });
-    //   });
-    // }
-
     return { success: true };
   } catch (error) {
     logger.error("Error queueing billing operation", { error, team_id });
@@ -368,7 +326,6 @@ export async function queueBillingOperation(
 // Modified version of the billing function for batch operations
 async function supaBillTeam(
   team_id: string,
-  subscription_id: string | null | undefined,
   credits: number,
   api_key_id: number | null,
   __logger?: any,
@@ -378,7 +335,6 @@ async function supaBillTeam(
     module: "credit_billing",
     method: "supaBillTeam",
     teamId: team_id,
-    subscriptionId: subscription_id,
     credits,
   });
 
@@ -391,10 +347,9 @@ async function supaBillTeam(
   // Perform the actual database operation
   let data: { api_key: string }[];
   try {
-    data = await billTeam6({
+    data = await billTeam7({
       team_id,
-      subscription_id: subscription_id ?? null,
-      fetch_subscription: subscription_id === undefined,
+      subscription_id: null,
       credits,
       api_key_id: api_key_id ?? null,
       is_extract,
@@ -404,42 +359,6 @@ async function supaBillTeam(
     _logger.error("Failed to bill team.", { error });
     return { success: false, error };
   }
-
-  // Fire-and-forget — a Redis failure here must not trigger a false Autumn refund
-  // after bill_team_6 has already committed.
-  getRedisConnection()
-    .sadd("billed_teams", team_id)
-    .catch(err => {
-      _logger.warn("Failed to add team to billed_teams set", { err, team_id });
-    });
-
-  // Update cached ACUC to reflect the new credit usage
-  (async () => {
-    for (const apiKey of (data ?? []).map(x => x.api_key)) {
-      await setCachedACUC(apiKey, is_extract, acuc =>
-        acuc
-          ? {
-              ...acuc,
-              credits_used: acuc.credits_used + credits,
-              adjusted_credits_used: acuc.adjusted_credits_used + credits,
-              remaining_credits: acuc.remaining_credits - credits,
-            }
-          : null,
-      );
-      await setCachedACUCTeam(team_id, is_extract, acuc =>
-        acuc
-          ? {
-              ...acuc,
-              credits_used: acuc.credits_used + credits,
-              adjusted_credits_used: acuc.adjusted_credits_used + credits,
-              remaining_credits: acuc.remaining_credits - credits,
-            }
-          : null,
-      );
-    }
-  })().catch(error => {
-    _logger.error("Failed to update cached credits", { error, team_id });
-  });
 
   return { success: true, data };
 }
