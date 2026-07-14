@@ -173,13 +173,6 @@ export type Meta = {
   winnerEngine?: Engine;
   abortHandle?: NodeJS.Timeout;
   audioCookies?: BrowserCookie[];
-  /**
-   * Markdown produced by a postprocessor (e.g. the YouTube transcript). It
-   * can't be rebuilt from the stored HTML, so the index has to persist it
-   * verbatim for cache hits. Captured before transformers (cleanContent,
-   * redactPII) mutate document.markdown per-request.
-   */
-  postprocessedMarkdown?: string;
   /** Threat protection decisions made during this scrape, in order (mutable, like logs). */
   threatDecisions: ThreatDecision[];
 };
@@ -984,13 +977,7 @@ async function scrapeURLLoop(meta: Meta): Promise<ScrapeUrlResponse> {
     ).audioCookies;
 
     for (const postprocessor of postprocessors) {
-      if (
-        postprocessor.shouldRun(
-          meta,
-          new URL(engineResult.url),
-          engineResult.postprocessorsUsed,
-        )
-      ) {
+      if (postprocessor.shouldRun(meta, new URL(engineResult.url))) {
         meta.logger.info("Running postprocessor " + postprocessor.name);
         try {
           engineResult = await postprocessor.run(
@@ -1011,13 +998,6 @@ async function scrapeURLLoop(meta: Meta): Promise<ScrapeUrlResponse> {
           );
         }
       }
-    }
-
-    if (
-      (engineResult.postprocessorsUsed?.length ?? 0) > 0 &&
-      typeof engineResult.markdown === "string"
-    ) {
-      meta.postprocessedMarkdown = engineResult.markdown;
     }
 
     let document: Document = {

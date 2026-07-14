@@ -120,7 +120,6 @@ export async function sendDocumentToIndex(meta: Meta, document: Document) {
               : undefined,
           contentType: document.metadata.contentType,
           postprocessorsUsed: document.metadata.postprocessorsUsed,
-          postprocessedMarkdown: meta.postprocessedMarkdown,
           proxyUsed: document.metadata.proxyUsed,
         });
       } catch (error) {
@@ -540,20 +539,6 @@ export async function scrapeURLWithIndex(
     }
   }
 
-  // The YouTube postprocessor replaces markdown with content (transcript,
-  // metadata) that can't be rebuilt from the stored HTML. Entries written
-  // before postprocessedMarkdown was persisted would serve the raw page
-  // instead — treat them as misses so a live scrape re-runs the postprocessor.
-  if (
-    doc.postprocessorsUsed?.includes("youtube") &&
-    typeof doc.postprocessedMarkdown !== "string"
-  ) {
-    logLookup("debug", "hit", {
-      postprocessorMismatch: "cached_entry_missing_postprocessed_markdown",
-    });
-    throw new IndexMissError();
-  }
-
   logLookup("debug", "hit", {
     age: Date.now() - new Date(selectedRow.created_at).getTime(),
     status: selectedRow.status,
@@ -564,10 +549,6 @@ export async function scrapeURLWithIndex(
   return {
     url: doc.url,
     html: doc.html,
-    markdown:
-      typeof doc.postprocessedMarkdown === "string"
-        ? doc.postprocessedMarkdown
-        : undefined,
     json: doc.json,
     statusCode: doc.statusCode,
     error: doc.error,

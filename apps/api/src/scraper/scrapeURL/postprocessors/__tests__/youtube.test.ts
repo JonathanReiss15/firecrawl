@@ -27,7 +27,7 @@ describe("youtubePostprocessor.shouldRun", () => {
     ).toBe(true);
   });
 
-  it("does not run for non-video YouTube paths or already processed URLs", () => {
+  it("does not run for non-video YouTube paths", () => {
     expect(
       youtubePostprocessor.shouldRun(meta, new URL("https://www.youtube.com/")),
     ).toBe(false);
@@ -35,13 +35,6 @@ describe("youtubePostprocessor.shouldRun", () => {
       youtubePostprocessor.shouldRun(
         meta,
         new URL("https://www.youtube.com/live/"),
-      ),
-    ).toBe(false);
-    expect(
-      youtubePostprocessor.shouldRun(
-        meta,
-        new URL("https://www.youtube.com/live/H4fUJQCIV5E"),
-        ["youtube"],
       ),
     ).toBe(false);
   });

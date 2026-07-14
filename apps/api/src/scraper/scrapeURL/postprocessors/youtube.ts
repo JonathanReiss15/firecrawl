@@ -139,11 +139,9 @@ async function getYouTubeMetadata(
 
 export const youtubePostprocessor: Postprocessor = {
   name: "youtube",
-  shouldRun: (_meta: Meta, url: URL, postProcessorsUsed?: string[]) => {
-    if (postProcessorsUsed?.includes("youtube")) {
-      return false;
-    }
-
+  // Runs on index cache hits too (the stored raw HTML can't reproduce the
+  // transcript/metadata markdown, but avgrab only needs the URL).
+  shouldRun: (_meta: Meta, url: URL) => {
     if (
       url.hostname.endsWith(".youtube.com") ||
       url.hostname === "youtube.com"
@@ -172,8 +170,7 @@ export const youtubePostprocessor: Postprocessor = {
       ...engineResult,
       markdown,
       postprocessorsUsed: [
-        ...(engineResult.postprocessorsUsed ?? []),
-        "youtube",
+        ...new Set([...(engineResult.postprocessorsUsed ?? []), "youtube"]),
       ],
     };
   },

@@ -125,12 +125,6 @@ export async function saveIndexToGCS(
     pdfMetadata?: PdfMetadata;
     contentType?: string;
     postprocessorsUsed?: string[];
-    /**
-     * Final markdown from a markdown-replacing postprocessor (e.g. the
-     * YouTube transcript). Stored because it cannot be re-derived from
-     * `html` on a cache hit.
-     */
-    postprocessedMarkdown?: string;
     proxyUsed?: "basic" | "stealth";
   },
 ): Promise<void> {

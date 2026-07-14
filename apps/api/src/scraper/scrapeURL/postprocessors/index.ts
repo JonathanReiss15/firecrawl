@@ -4,7 +4,7 @@ import { youtubePostprocessor } from "./youtube";
 
 export interface Postprocessor {
   name: string;
-  shouldRun: (meta: Meta, url: URL, postProcessorsUsed?: string[]) => boolean;
+  shouldRun: (meta: Meta, url: URL) => boolean;
   run: (
     meta: Meta,
     engineResult: EngineScrapeResult,
