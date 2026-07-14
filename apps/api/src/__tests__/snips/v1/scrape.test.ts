@@ -384,7 +384,6 @@ describe("Scrape tests", () => {
 
           expect((response3.metadata as any).cache).toEqual({
             source: "firecrawl-index",
-
             cachedAt: response3.metadata.cachedAt,
           });
 
@@ -925,7 +924,6 @@ describe("Scrape tests", () => {
 
           expect((response3.metadata as any).cache).toEqual({
             source: "firecrawl-index",
-
             cachedAt: response3.metadata.cachedAt,
           });
           // Should still be parsed text, not base64
