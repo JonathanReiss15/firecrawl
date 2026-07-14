@@ -13,9 +13,14 @@ import { fetchResult } from "./result";
 import { FIRE_PDF_ASYNC_MIN_REMAINING_MS } from "./routing";
 import { POLL_FLOOR_MS, POLL_TIMEOUT_BUFFER_MS } from "./schema";
 import { submitJob, SubmitJobMayHaveBeenAcceptedError } from "./submit";
-import { computeDeadlineMs, defaultSleep, failAsync } from "./utils";
+import {
+  computeDeadlineMs,
+  defaultSleep,
+  failAsync,
+  FirePdfAsyncFailure,
+} from "./utils";
 
-export { FirePdfAsyncFailure } from "./utils";
+export { FirePdfAsyncFailure };
 
 type FirePdfAsyncDeps = {
   fetchImpl?: typeof undiciFetch;
@@ -126,7 +131,16 @@ export async function scrapePDFWithFirePDFAsync(
   } catch (error) {
     const submitMayHaveBeenAccepted =
       error instanceof SubmitJobMayHaveBeenAcceptedError;
-    if ((submissionAccepted || submitMayHaveBeenAccepted) && !terminalReached) {
+    const jobAlreadyTerminal =
+      error instanceof FirePdfAsyncFailure &&
+      (error.reason === "terminal_failed" ||
+        error.reason === "terminal_expired" ||
+        error.reason === "terminal_cancelled");
+    if (
+      (submissionAccepted || submitMayHaveBeenAccepted) &&
+      !terminalReached &&
+      !jobAlreadyTerminal
+    ) {
       await cancelJob({ baseUrl, scrapeId: meta.id, meta, fetchImpl });
     }
     throw submitMayHaveBeenAccepted ? error.originalError : error;

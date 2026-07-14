@@ -468,9 +468,10 @@ describe("scrapePDFWithFirePDFAsync", () => {
   });
 
   it("throws FirePdfAsyncFailure when polling returns terminal failed (502)", async () => {
-    const { fetchImpl } = makeFetchFromSequence([
+    const { fetchImpl, calls } = makeFetchFromSequence([
       {
         matchUrl: /\/jobs$/,
+        matchMethod: "POST",
         response: {
           status: 202,
           body: { scrape_id: "x", status: "queued", lane: "fast" },
@@ -478,6 +479,7 @@ describe("scrapePDFWithFirePDFAsync", () => {
       },
       {
         matchUrl: /\/jobs\/scrape-id-test$/,
+        matchMethod: "GET",
         response: {
           status: 502,
           body: {
@@ -503,12 +505,14 @@ describe("scrapePDFWithFirePDFAsync", () => {
     expect(err).toBeInstanceOf(FirePdfAsyncFailure);
     expect(err.reason).toBe("terminal_failed");
     expect(fallback).not.toHaveBeenCalled();
+    expect(calls.map(call => call.method)).toEqual(["POST", "GET"]);
   });
 
   it("throws FirePdfAsyncFailure when polling returns 410 (expired)", async () => {
-    const { fetchImpl } = makeFetchFromSequence([
+    const { fetchImpl, calls } = makeFetchFromSequence([
       {
         matchUrl: /\/jobs$/,
+        matchMethod: "POST",
         response: {
           status: 202,
           body: { scrape_id: "x", status: "queued", lane: "fast" },
@@ -516,6 +520,7 @@ describe("scrapePDFWithFirePDFAsync", () => {
       },
       {
         matchUrl: /\/jobs\/scrape-id-test$/,
+        matchMethod: "GET",
         response: {
           status: 410,
           body: { scrape_id: "x", status: "expired" },
@@ -536,6 +541,41 @@ describe("scrapePDFWithFirePDFAsync", () => {
     expect(err).toBeInstanceOf(FirePdfAsyncFailure);
     expect(err.reason).toBe("terminal_expired");
     expect(fallback).not.toHaveBeenCalled();
+    expect(calls.map(call => call.method)).toEqual(["POST", "GET"]);
+  });
+
+  it("does not cancel a job already reported as terminal cancelled", async () => {
+    const { fetchImpl, calls } = makeFetchFromSequence([
+      {
+        matchUrl: /\/jobs$/,
+        matchMethod: "POST",
+        response: {
+          status: 202,
+          body: { scrape_id: "x", status: "queued", lane: "fast" },
+        },
+      },
+      {
+        matchUrl: /\/jobs\/scrape-id-test$/,
+        matchMethod: "GET",
+        response: {
+          status: 410,
+          body: { scrape_id: "x", status: "cancelled" },
+        },
+      },
+    ]);
+
+    const err = await scrapePDFWithFirePDFAsync(
+      makeMeta(),
+      "BASE64",
+      undefined,
+      undefined,
+      undefined,
+      { fetchImpl, fallbackImpl: vi.fn(), sleepImpl: noopSleep },
+    ).catch(error => error);
+
+    expect(err).toBeInstanceOf(FirePdfAsyncFailure);
+    expect(err.reason).toBe("terminal_cancelled");
+    expect(calls.map(call => call.method)).toEqual(["POST", "GET"]);
   });
 
   it("throws FirePdfAsyncFailure when polling exceeds deadline + buffer", async () => {
