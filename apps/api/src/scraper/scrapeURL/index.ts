@@ -88,6 +88,7 @@ import path from "node:path";
 import { tmpdir } from "node:os";
 import { randomUUID } from "node:crypto";
 import type { DataLayerScrapeMetadata } from "../../lib/data-layer";
+import { buildCacheMetadata } from "./cacheMetadata";
 import {
   checkUrl,
   type ThreatCheckDedup,
@@ -1028,18 +1029,13 @@ async function scrapeURLLoop(meta: Meta): Promise<ScrapeUrlResponse> {
         contentType: engineResult.contentType,
         timezone: engineResult.timezone,
         proxyUsed: engineResult.proxyUsed ?? "basic",
-        ...(fallbackList.find(x =>
-          ["index", "index;documents"].includes(x.engine),
-        )
-          ? engineResult.cacheInfo
-            ? {
-                cacheState: "hit",
-                cachedAt: engineResult.cacheInfo.created_at.toISOString(),
-              }
-            : {
-                cacheState: "miss",
-              }
-          : {}),
+        ...buildCacheMetadata({
+          cacheInfo: engineResult.cacheInfo,
+          indexWasEligible: fallbackList.some(x =>
+            ["index", "index;documents"].includes(x.engine),
+          ),
+          legacyMissEnabled: config.LEGACY_CACHE_MISS_METADATA_ENABLED,
+        }),
         postprocessorsUsed: engineResult.postprocessorsUsed,
       },
     };
@@ -1066,6 +1062,8 @@ async function scrapeURLLoop(meta: Meta): Promise<ScrapeUrlResponse> {
       "engine.content_type": document.metadata.contentType,
       "engine.proxy_used": document.metadata.proxyUsed,
       "engine.cache_state": document.metadata.cacheState,
+      "engine.cache_source": document.metadata.cache?.source,
+      "engine.cache_cached_at": document.metadata.cache?.cachedAt,
       "engine.postprocessors_used": engineResult.postprocessorsUsed?.join(","),
     });
 

@@ -542,6 +542,15 @@ impl From<&str> for AgentWebhookConfig {
     }
 }
 
+/// Cache provenance metadata for documents served from an attested Firecrawl-owned cache.
+#[serde_with::skip_serializing_none]
+#[derive(Deserialize, Serialize, Debug, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct CacheMetadata {
+    pub source: String,
+    pub cached_at: String,
+}
+
 /// Document metadata returned from scrape operations.
 #[serde_with::skip_serializing_none]
 #[derive(Deserialize, Serialize, Debug, Default, Clone)]
@@ -628,6 +637,8 @@ pub struct DocumentMetadata {
     pub timezone: Option<String>,
     #[serde(default, deserialize_with = "deserialize_string_or_array")]
     pub proxy_used: Option<String>,
+    /// Present only for attested Firecrawl-owned cache hits; absence is not a miss/freshness/liveness signal.
+    pub cache: Option<CacheMetadata>,
     #[serde(default, deserialize_with = "deserialize_string_or_array")]
     pub cache_state: Option<String>,
     #[serde(default, deserialize_with = "deserialize_string_or_array")]
@@ -1057,6 +1068,30 @@ mod tests {
         assert_eq!(meta.og_image, Some("https://img.jpg".to_string()));
         assert_eq!(meta.language, Some("en".to_string()));
         assert_eq!(meta.keywords, Some("rust, sdk, firecrawl".to_string()));
+    }
+
+    #[test]
+    fn test_document_metadata_cache_provenance() {
+        let json = json!({
+            "markdown": "# Cached",
+            "metadata": {
+                "cache": {
+                    "source": "firecrawl-index",
+                    "cachedAt": "2026-07-14T12:00:00.000Z"
+                },
+                "cacheState": "hit",
+                "cachedAt": "2026-07-14T12:00:00.000Z"
+            }
+        });
+
+        let doc: Document = serde_json::from_value(json).unwrap();
+        let meta = doc.metadata.unwrap();
+        let cache = meta.cache.unwrap();
+
+        assert_eq!(cache.source, "firecrawl-index");
+        assert_eq!(cache.cached_at, "2026-07-14T12:00:00.000Z");
+        assert_eq!(meta.cache_state, Some("hit".to_string()));
+        assert_eq!(meta.cached_at, Some("2026-07-14T12:00:00.000Z".to_string()));
     }
 
     #[test]

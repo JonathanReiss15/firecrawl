@@ -485,7 +485,7 @@ describe("Scrape tests", () => {
             identity,
           );
 
-          expect(response1.metadata.cacheState).toBe("miss");
+          expect(response1.metadata.cacheState).toBeUndefined();
 
           await new Promise(resolve => setTimeout(resolve, indexCooldown));
 
@@ -497,7 +497,7 @@ describe("Scrape tests", () => {
             identity,
           );
 
-          expect(response2.metadata.cacheState).toBe("miss");
+          expect(response2.metadata.cacheState).toBeUndefined();
 
           await new Promise(resolve => setTimeout(resolve, indexCooldown));
 
@@ -512,6 +512,12 @@ describe("Scrape tests", () => {
           expect(response3.metadata.cacheState).toBe("hit");
           expect(response3.metadata.cachedAt).toBeDefined();
 
+          expect(response3.metadata.cache).toEqual({
+            source: "firecrawl-index",
+
+            cachedAt: response3.metadata.cachedAt,
+          });
+
           const response4 = await scrape(
             {
               url,
@@ -520,7 +526,7 @@ describe("Scrape tests", () => {
             identity,
           );
 
-          expect(response4.metadata.cacheState).toBe("miss");
+          expect(response4.metadata.cacheState).toBeUndefined();
         },
         scrapeTimeout * 4 + 2 * indexCooldown,
       );
@@ -538,7 +544,7 @@ describe("Scrape tests", () => {
             identity,
           );
 
-          expect(response1.metadata.cacheState).toBe("miss");
+          expect(response1.metadata.cacheState).toBeUndefined();
 
           await new Promise(resolve => setTimeout(resolve, indexCooldown));
 
@@ -594,7 +600,7 @@ describe("Scrape tests", () => {
           );
 
           expect(response3.screenshot).not.toBe(response1.screenshot);
-          expect(response3.metadata.cacheState).toBe("miss");
+          expect(response3.metadata.cacheState).toBeUndefined();
         },
         scrapeTimeout * 3 + 2 * indexCooldown,
       );
@@ -638,7 +644,7 @@ describe("Scrape tests", () => {
           );
 
           expect(response3.screenshot).not.toBe(response1.screenshot);
-          expect(response3.metadata.cacheState).toBe("miss");
+          expect(response3.metadata.cacheState).toBeUndefined();
         },
         scrapeTimeout * 3 + 1 * indexCooldown,
       );
@@ -710,7 +716,7 @@ describe("Scrape tests", () => {
             identity,
           );
 
-          expect(response.metadata.cacheState).toBe("miss");
+          expect(response.metadata.cacheState).toBeUndefined();
         },
         scrapeTimeout * 2 + 1 * indexCooldown,
       );
@@ -761,7 +767,7 @@ describe("Scrape tests", () => {
             identity,
           );
 
-          expect(response1.metadata.cacheState).toBe("miss");
+          expect(response1.metadata.cacheState).toBeUndefined();
 
           await new Promise(resolve => setTimeout(resolve, indexCooldown));
 
@@ -810,7 +816,7 @@ describe("Scrape tests", () => {
             identity,
           );
 
-          expect(response2.metadata.cacheState).toBe("miss");
+          expect(response2.metadata.cacheState).toBeUndefined();
         },
         scrapeTimeout * 2 + 1 * indexCooldown,
       );
@@ -839,7 +845,7 @@ describe("Scrape tests", () => {
             identity,
           );
 
-          expect(response1.metadata.cacheState).toBe("miss");
+          expect(response1.metadata.cacheState).toBeUndefined();
 
           await new Promise(resolve => setTimeout(resolve, indexCooldown));
 
@@ -893,7 +899,7 @@ describe("Scrape tests", () => {
             identity,
           );
 
-          expect(response1.metadata.cacheState).toBe("miss");
+          expect(response1.metadata.cacheState).toBeUndefined();
 
           await new Promise(resolve => setTimeout(resolve, indexCooldown));
 

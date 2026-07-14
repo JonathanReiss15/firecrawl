@@ -1313,6 +1313,15 @@ export type Document = {
     contentType?: string;
     timezone?: string;
     proxyUsed: "basic" | "stealth";
+    /**
+     * Present only when this response was served from an attested Firecrawl-owned cache.
+     * Absence means Firecrawl cannot attest cache provenance; it does not imply a cache miss,
+     * a fresh scrape, cache bypass, or semantic page liveness.
+     */
+    cache?: {
+      source: "firecrawl-index";
+      cachedAt: string;
+    };
     cacheState?: "hit" | "miss";
     cachedAt?: string;
     creditsUsed?: number;

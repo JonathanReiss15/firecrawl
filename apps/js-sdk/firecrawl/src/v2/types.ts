@@ -597,6 +597,15 @@ export interface DocumentMetadata {
   contentType?: string;
   timezone?: string;
   proxyUsed?: "basic" | "stealth";
+  /**
+   * Present only when this document was served from an attested Firecrawl-owned cache.
+   * Absence means Firecrawl cannot attest cache provenance; it does not imply a miss,
+   * fresh scrape, bypass, or semantic page liveness.
+   */
+  cache?: {
+    source: "firecrawl-index";
+    cachedAt: string;
+  };
   cacheState?: "hit" | "miss";
   cachedAt?: string;
   creditsUsed?: number;

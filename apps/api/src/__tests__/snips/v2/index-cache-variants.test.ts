@@ -30,7 +30,7 @@ describeIf(TEST_PRODUCTION)("V2 index lookup variant matching", () => {
         },
         identity,
       );
-      expect(data1.metadata.cacheState).toBe("miss");
+      expect(data1.metadata.cacheState).toBeUndefined();
 
       await new Promise(resolve => setTimeout(resolve, indexCooldown));
 
@@ -60,7 +60,7 @@ describeIf(TEST_PRODUCTION)("V2 index lookup variant matching", () => {
         },
         identity,
       );
-      expect(data1.metadata.cacheState).toBe("miss");
+      expect(data1.metadata.cacheState).toBeUndefined();
 
       await new Promise(resolve => setTimeout(resolve, indexCooldown));
 
@@ -72,7 +72,7 @@ describeIf(TEST_PRODUCTION)("V2 index lookup variant matching", () => {
         },
         identity,
       );
-      expect(data2.metadata.cacheState).toBe("miss");
+      expect(data2.metadata.cacheState).toBeUndefined();
     },
     scrapeTimeout * 2 + indexCooldown,
   );

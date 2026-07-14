@@ -65,6 +65,13 @@ class BaseResponse(BaseModel, Generic[T]):
 
 
 # Document and content types
+class CacheMetadata(BaseModel):
+    """Attested Firecrawl cache provenance metadata."""
+
+    source: Literal["firecrawl-index"]
+    cached_at: str
+
+
 class DocumentMetadata(BaseModel):
     """Metadata for scraped documents (snake_case only; API camelCase normalized in code)."""
 
@@ -127,6 +134,8 @@ class DocumentMetadata(BaseModel):
     content_type: Optional[str] = None
     proxy_used: Optional[Literal["basic", "stealth"]] = None
     timezone: Optional[str] = None
+    # Present only for attested Firecrawl-owned cache hits; absence is not a miss/freshness/liveness signal.
+    cache: Optional[CacheMetadata] = None
     cache_state: Optional[Literal["hit", "miss"]] = None
     cached_at: Optional[str] = None
     credits_used: Optional[int] = None

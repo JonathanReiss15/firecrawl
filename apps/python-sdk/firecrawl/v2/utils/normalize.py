@@ -65,8 +65,20 @@ def _map_metadata_keys(md: Dict[str, Any]) -> Dict[str, Any]:
         except ValueError:
             pass
 
+    if "cache" in out:
+        out["cache"] = _map_cache_metadata(out["cache"])
+
     # Preserve list values for unknown keys; only lightweight coercions above
     return out
+
+
+def _map_cache_metadata(cache: Any) -> Any:
+    if not isinstance(cache, dict):
+        return cache
+    mapped = dict(cache)
+    if "cachedAt" in mapped and "cached_at" not in mapped:
+        mapped["cached_at"] = mapped.pop("cachedAt")
+    return mapped
 
 
 def normalize_document_input(doc: Dict[str, Any]) -> Dict[str, Any]:

@@ -30,7 +30,7 @@ describeIf(TEST_PRODUCTION)("V2 Scrape Lockdown Mode", () => {
       );
 
       expect(seed).toBeDefined();
-      expect(seed.metadata.cacheState).toBe("miss");
+      expect(seed.metadata.cacheState).toBeUndefined();
 
       // Wait for index to be populated
       await new Promise(resolve => setTimeout(resolve, 20000));
@@ -47,6 +47,12 @@ describeIf(TEST_PRODUCTION)("V2 Scrape Lockdown Mode", () => {
       expect(data).toBeDefined();
       expect(data.metadata.cacheState).toBe("hit");
       expect(data.metadata.cachedAt).toBeDefined();
+
+      expect(data.metadata.cache).toEqual({
+        source: "firecrawl-index",
+
+        cachedAt: data.metadata.cachedAt,
+      });
       expect(data.metadata.creditsUsed).toBe(5);
     },
     scrapeTimeout * 2 + 20000,
@@ -81,7 +87,7 @@ describeIf(TEST_PRODUCTION)("V2 Scrape Lockdown Mode", () => {
 
       const seed = await scrape({ url }, identity);
       expect(seed).toBeDefined();
-      expect(seed.metadata.cacheState).toBe("miss");
+      expect(seed.metadata.cacheState).toBeUndefined();
 
       await new Promise(resolve => setTimeout(resolve, 20000));
 
@@ -106,7 +112,7 @@ describeIf(TEST_PRODUCTION)("V2 Scrape Lockdown Mode", () => {
 
       const seed = await scrape({ url }, identity);
       expect(seed).toBeDefined();
-      expect(seed.metadata.cacheState).toBe("miss");
+      expect(seed.metadata.cacheState).toBeUndefined();
 
       await new Promise(resolve => setTimeout(resolve, 20000));
 

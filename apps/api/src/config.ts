@@ -377,6 +377,10 @@ const configSchema = z.object({
   EXTRACT_ANCHOR_MODEL: z.string().default("openai/gpt-oss-120b"),
   EXTRACT_LIGHT_MODEL: z.string().default("openai/gpt-oss-20b"),
   CODE_SANDBOX_URL: z.string().default("ws://code-sandbox:3001"),
+
+  // Temporary startup bridge for deprecated heuristic metadata.cacheState="miss".
+  // Parsed once at process boot; changing it requires restarting API/worker processes.
+  LEGACY_CACHE_MISS_METADATA_ENABLED: z.stringbool().default(false),
 });
 
 export const config = configSchema.parse(process.env);

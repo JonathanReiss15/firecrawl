@@ -28,7 +28,7 @@ describeIf(TEST_PRODUCTION)("V2 Scrape Default maxAge", () => {
       );
 
       expect(data1).toBeDefined();
-      expect(data1.metadata.cacheState).toBe("miss");
+      expect(data1.metadata.cacheState).toBeUndefined();
 
       // Wait for index to be populated
       await new Promise(resolve => setTimeout(resolve, 20000));
@@ -44,6 +44,12 @@ describeIf(TEST_PRODUCTION)("V2 Scrape Default maxAge", () => {
       expect(data2).toBeDefined();
       expect(data2.metadata.cacheState).toBe("hit");
       expect(data2.metadata.cachedAt).toBeDefined();
+
+      expect(data2.metadata.cache).toEqual({
+        source: "firecrawl-index",
+
+        cachedAt: data2.metadata.cachedAt,
+      });
     },
     scrapeTimeout * 2 + 20000,
   );
@@ -63,7 +69,7 @@ describeIf(TEST_PRODUCTION)("V2 Scrape Default maxAge", () => {
       );
 
       expect(data1).toBeDefined();
-      expect(data1.metadata.cacheState).toBe("miss");
+      expect(data1.metadata.cacheState).toBeUndefined();
 
       // Wait for index to be populated
       await new Promise(resolve => setTimeout(resolve, 20000));
@@ -99,7 +105,7 @@ describeIf(TEST_PRODUCTION)("V2 Scrape Default maxAge", () => {
       );
 
       expect(data1).toBeDefined();
-      expect(data1.metadata.cacheState).toBe("miss");
+      expect(data1.metadata.cacheState).toBeUndefined();
 
       // Wait for index to be populated
       await new Promise(resolve => setTimeout(resolve, 20000));
@@ -116,6 +122,12 @@ describeIf(TEST_PRODUCTION)("V2 Scrape Default maxAge", () => {
       expect(data2).toBeDefined();
       expect(data2.metadata.cacheState).toBe("hit");
       expect(data2.metadata.cachedAt).toBeDefined();
+
+      expect(data2.metadata.cache).toEqual({
+        source: "firecrawl-index",
+
+        cachedAt: data2.metadata.cachedAt,
+      });
     },
     scrapeTimeout * 2 + 20000,
   );
@@ -135,7 +147,7 @@ describeIf(TEST_PRODUCTION)("V2 Scrape Default maxAge", () => {
       );
 
       expect(data1).toBeDefined();
-      expect(data1.metadata.cacheState).toBe("miss");
+      expect(data1.metadata.cacheState).toBeUndefined();
 
       // Wait for index to be populated
       await new Promise(resolve => setTimeout(resolve, 20000));
@@ -171,7 +183,7 @@ describeIf(TEST_PRODUCTION)("V2 Scrape Default maxAge", () => {
       );
 
       expect(data1).toBeDefined();
-      expect(data1.metadata.cacheState).toBe("miss");
+      expect(data1.metadata.cacheState).toBeUndefined();
 
       // Wait for index to be populated and for data to age
       await new Promise(resolve => setTimeout(resolve, 35000));
@@ -188,6 +200,12 @@ describeIf(TEST_PRODUCTION)("V2 Scrape Default maxAge", () => {
       expect(data2).toBeDefined();
       expect(data2.metadata.cacheState).toBe("hit");
       expect(data2.metadata.cachedAt).toBeDefined();
+
+      expect(data2.metadata.cache).toEqual({
+        source: "firecrawl-index",
+
+        cachedAt: data2.metadata.cachedAt,
+      });
     },
     scrapeTimeout * 2 + 35000,
   );

@@ -92,3 +92,25 @@ class TestDocumentMetadataExtras:
         md = DocumentMetadata(title="T", **{"x-foo": "bar"})
         # extras accessor should expose unknown keys
         assert md.extras == {"x-foo": "bar"}
+
+    def test_cache_metadata_is_typed_and_normalized(self):
+        raw = {
+            "markdown": "# Cached",
+            "metadata": {
+                "cache": {
+                    "source": "firecrawl-index",
+                    "cachedAt": "2026-07-14T12:00:00.000Z",
+                },
+                "cacheState": "hit",
+                "cachedAt": "2026-07-14T12:00:00.000Z",
+            },
+        }
+
+        doc = Document(**normalize_document_input(raw))
+        md = doc.metadata_typed
+
+        assert md.cache is not None
+        assert md.cache.source == "firecrawl-index"
+        assert md.cache.cached_at == "2026-07-14T12:00:00.000Z"
+        assert md.cache_state == "hit"
+        assert md.cached_at == "2026-07-14T12:00:00.000Z"
