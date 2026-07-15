@@ -35,12 +35,21 @@ vi.mock("../scraper/scrapeURL/lib/removeUnwantedElements", () => ({
 
 vi.mock("./highlight-model", () => ({
   generateHighlightsBatch: vi.fn(),
+  generateHighlightsIndexedBatch: vi.fn(),
 }));
 
-import { generateHighlightsBatch } from "./highlight-model";
+import {
+  generateHighlightsBatch,
+  generateHighlightsIndexedBatch,
+} from "./highlight-model";
 import { config } from "../config";
 import { indexGetRecent5 } from "../db/rpc";
-import { applySearchHighlights, highlightsEnvReady } from "./highlights";
+import {
+  applySearchHighlights,
+  highlightsEnvReady,
+  runIndexedSearchHighlightsShadow,
+  searchHighlightURLs,
+} from "./highlights";
 
 const logger = {
   info: vi.fn(),
@@ -57,6 +66,52 @@ afterEach(() => {
 });
 
 describe("applySearchHighlights", () => {
+  it("resolves lightweight index references without loading page content", async () => {
+    vi.mocked(generateHighlightsIndexedBatch).mockResolvedValue(
+      new Map([["0", { highlights: [], markdown: "shadow highlight" }]]),
+    );
+    const response = {
+      web: [{ url: "https://first.test", description: "fallback" }],
+      news: [{ url: "https://second.test", snippet: "fallback" }],
+    } as any;
+    const urls = searchHighlightURLs(response);
+
+    const result = await runIndexedSearchHighlightsShadow(
+      urls,
+      "query",
+      logger,
+      "request-1",
+    );
+
+    expect(generateHighlightsIndexedBatch).toHaveBeenCalledWith(
+      "query",
+      [
+        {
+          id: "0",
+          url: "https://first.test",
+          indexObject: "index:https://first.test.json",
+        },
+        {
+          id: "1",
+          url: "https://second.test",
+          indexObject: "index:https://second.test.json",
+        },
+      ],
+      {
+        logger,
+        logPayload: false,
+        requestId: "request-1",
+        onFailure: expect.any(Function),
+      },
+    );
+    expect(result).toEqual({
+      attempted: 2,
+      indexHits: 2,
+      replaced: 1,
+      succeeded: true,
+    });
+  });
+
   it("enables the in-cluster service without requiring a bearer token", () => {
     const token = config.HIGHLIGHT_MODEL_TOKEN;
     config.HIGHLIGHT_MODEL_TOKEN = undefined;
