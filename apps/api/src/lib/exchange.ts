@@ -188,15 +188,20 @@ async function getExchangeProviders(): Promise<ExchangeProvider[] | null> {
   if (!providersRequest) {
     providersRequest = fetchExchangeProviders()
       .then(providers => {
-        cachedProviders = {
-          value: providers,
-          expiresAt:
-            Date.now() +
-            (providers === null
-              ? EXCHANGE_PROVIDERS_FAILURE_TTL_MS
-              : EXCHANGE_PROVIDERS_TTL_MS),
-        };
-        return providers;
+        if (providers === null) {
+          // Keep serving the last good catalog through transient outages;
+          // the failure TTL only delays the next refresh attempt.
+          cachedProviders = {
+            value: cachedProviders?.value ?? null,
+            expiresAt: Date.now() + EXCHANGE_PROVIDERS_FAILURE_TTL_MS,
+          };
+        } else {
+          cachedProviders = {
+            value: providers,
+            expiresAt: Date.now() + EXCHANGE_PROVIDERS_TTL_MS,
+          };
+        }
+        return cachedProviders.value;
       })
       .finally(() => {
         providersRequest = undefined;
@@ -425,24 +430,34 @@ export type ExchangeAccess =
 export async function getExchangeAccessForRequest(
   input: RouteInput,
 ): Promise<ExchangeAccess> {
-  if (!isExchangeEligibleRequest(input)) {
+  // The Exchange gate sits on the hot path of every scrape request; no
+  // failure inside it may ever fail the request itself. Anything unexpected
+  // degrades to "not eligible" and the request continues on the normal path.
+  try {
+    if (!isExchangeEligibleRequest(input)) {
+      return { allowed: false, termsRequired: false };
+    }
+
+    const provider = await resolveExchangeProvider(input.url);
+    if (provider === null) {
+      return { allowed: false, termsRequired: false };
+    }
+
+    const decision = getProviderAccessDecision(provider, input.flags);
+    if (decision === "terms_required" && provider.terms !== undefined) {
+      return { allowed: false, termsRequired: true, terms: provider.terms };
+    }
+    if (decision !== "allowed") {
+      return { allowed: false, termsRequired: false };
+    }
+
+    return { allowed: true, termsRequired: false, provider };
+  } catch (error) {
+    rootLogger.warn("Exchange access check errored; treating as ineligible", {
+      error,
+    });
     return { allowed: false, termsRequired: false };
   }
-
-  const provider = await resolveExchangeProvider(input.url);
-  if (provider === null) {
-    return { allowed: false, termsRequired: false };
-  }
-
-  const decision = getProviderAccessDecision(provider, input.flags);
-  if (decision === "terms_required" && provider.terms !== undefined) {
-    return { allowed: false, termsRequired: true, terms: provider.terms };
-  }
-  if (decision !== "allowed") {
-    return { allowed: false, termsRequired: false };
-  }
-
-  return { allowed: true, termsRequired: false, provider };
 }
 
 export async function canUseExchangeForRequest(

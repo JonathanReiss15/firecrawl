@@ -121,6 +121,45 @@ describe("Exchange routing", () => {
     resolveFetch({ ok: false, status: 503 });
   });
 
+  it("keeps serving the last good catalog when a refresh fails", async () => {
+    setExchangeProvidersForTest(TEST_PROVIDERS, -1);
+    vi.mocked(fetch).mockResolvedValue({
+      ok: false,
+      status: 503,
+    } as Awaited<ReturnType<typeof fetch>>);
+
+    await expect(
+      resolveExchangeProvider("https://profiles.example/person/example"),
+    ).resolves.toMatchObject({ id: "acme" });
+
+    // Let the background refresh settle - the failure must not clobber
+    // the catalog, and the failure TTL must throttle the next attempt.
+    await new Promise(resolve => setTimeout(resolve, 0));
+    await expect(
+      resolveExchangeProvider("https://profiles.example/person/example"),
+    ).resolves.toMatchObject({ id: "acme" });
+    expect(fetch).toHaveBeenCalledTimes(1);
+  });
+
+  it("degrades to ineligible when the access check itself throws", async () => {
+    const explodingFlags = new Proxy(
+      {},
+      {
+        get() {
+          throw new Error("flags backend exploded");
+        },
+      },
+    ) as { professionalProfileCompanyDataBeta?: boolean };
+
+    await expect(
+      getExchangeAccessForRequest({
+        url: "https://profiles.example/person/example-person",
+        formats: [{ type: "markdown" }],
+        flags: explodingFlags,
+      }),
+    ).resolves.toEqual({ allowed: false, termsRequired: false });
+  });
+
   it("caches failed provider catalog lookups briefly", async () => {
     clearExchangeProvidersForTest();
     vi.mocked(fetch).mockResolvedValue({
