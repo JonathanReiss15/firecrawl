@@ -202,10 +202,12 @@ async function billScrapeJob(
           },
         );
 
-        // Reconcile the Exchange ledger; fire-and-forget - the service
-        // flags unresolved access events for follow-up on its side.
+        // Reconcile the Exchange ledger. Awaited so the confirmation lands
+        // before any later failure path could attempt to void this access -
+        // the service rejects confirmed->void, making the order decisive.
+        // reportExchangeBilling never throws and is bounded by its timeout.
         if (exchange?.accessEventId !== undefined) {
-          void reportExchangeBilling({
+          await reportExchangeBilling({
             accessEventId: exchange.accessEventId,
             status: "confirmed",
             billingReference: billingJobId,
@@ -978,7 +980,10 @@ async function processJob(job: NuQJob<ScrapeJobSingleUrls>) {
 
     // The Exchange delivered this access but the scrape ultimately failed,
     // so the customer was never billed for it - void the access event so
-    // the Exchange ledger reconciles. Fire-and-forget.
+    // the Exchange ledger reconciles. Fire-and-forget. If billing did
+    // happen before a later step failed, its confirmation was awaited
+    // above and the service rejects confirmed->void, so a paid access can
+    // never be marked void.
     if (pipeline?.success && pipeline.exchange?.accessEventId !== undefined) {
       void reportExchangeBilling({
         accessEventId: pipeline.exchange.accessEventId,

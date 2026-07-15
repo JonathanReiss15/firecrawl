@@ -30,6 +30,7 @@ type RouteInput = {
   location?: unknown;
   proxy?: unknown;
   blockAds?: boolean;
+  profile?: unknown;
   zeroDataRetention?: boolean;
   lockdown?: boolean;
   flags?: {
@@ -405,6 +406,12 @@ function isExchangeEligibleRequest(input: RouteInput): boolean {
   }
 
   if (input.mobile || input.location || input.blockAds === false) {
+    return false;
+  }
+
+  // Profile-backed scrapes expect session-specific content, which the
+  // Exchange cannot serve.
+  if (input.profile !== undefined) {
     return false;
   }
 

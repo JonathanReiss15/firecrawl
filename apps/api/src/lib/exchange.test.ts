@@ -318,6 +318,16 @@ describe("Exchange routing", () => {
         flags: ENABLED_EXCHANGE_FLAGS,
       }),
     ).resolves.toBe(false);
+
+    // Profile-backed scrapes expect session-specific content.
+    await expect(
+      canUseExchangeForRequest({
+        url: "https://profiles.example/person/example-person",
+        formats: [{ type: "markdown" }],
+        profile: { id: "profile-1" },
+        flags: ENABLED_EXCHANGE_FLAGS,
+      }),
+    ).resolves.toBe(false);
   });
 
   it("requires the provider's terms before routing", async () => {

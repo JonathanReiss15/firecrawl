@@ -85,7 +85,8 @@ export async function scrapeURLWithExchange(
 
     setSpanAttributes(span, {
       "engine.type": "exchange",
-      "engine.url": url,
+      // Follow the same credential redaction as the log context.
+      "engine.url": requestLogContext?.url ?? "",
       "engine.team_id": meta.internalOptions.teamId,
     });
 

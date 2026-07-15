@@ -294,20 +294,28 @@ export function blocklistMiddleware(
     const zeroDataRetention =
       getScrapeZDR(req.acuc?.flags) === "forced" ||
       req.body?.zeroDataRetention === true;
+    // Crawl routes nest per-page options under scrapeOptions; scrape routes
+    // carry them at the top level. Eligibility must see the effective ones.
+    const scrapeOptions =
+      typeof req.body?.scrapeOptions === "object" &&
+      req.body.scrapeOptions !== null
+        ? req.body.scrapeOptions
+        : req.body;
     const exchangeAccess =
       typeof req.body.url === "string" &&
       (await getExchangeAccessForRequest({
         url: req.body.url,
-        formats: req.body.formats,
-        actions: req.body.actions,
-        headers: req.body.headers,
-        waitFor: req.body.waitFor,
-        mobile: req.body.mobile,
-        location: req.body.location,
-        proxy: req.body.proxy,
-        blockAds: req.body.blockAds,
+        formats: scrapeOptions.formats,
+        actions: scrapeOptions.actions,
+        headers: scrapeOptions.headers,
+        waitFor: scrapeOptions.waitFor,
+        mobile: scrapeOptions.mobile,
+        location: scrapeOptions.location,
+        proxy: scrapeOptions.proxy,
+        blockAds: scrapeOptions.blockAds,
+        profile: scrapeOptions.profile,
         zeroDataRetention,
-        lockdown: req.body.lockdown,
+        lockdown: scrapeOptions.lockdown ?? req.body.lockdown,
         flags: req.acuc?.flags ?? null,
       }));
     const canUseExchange =
