@@ -569,6 +569,20 @@ export async function reportExchangeBilling(input: {
   }
 }
 
+/**
+ * Warm the provider catalog at process startup so the first flagged-org
+ * request never waits on the fetch; after this, stale-while-revalidate
+ * keeps every lookup in-memory. No-op when the Exchange is not configured;
+ * never throws.
+ */
+export function warmExchangeCatalog(): void {
+  if (!config.FIRE_EXCHANGE_URL) {
+    return;
+  }
+
+  void getExchangeProviders();
+}
+
 export function setExchangeProvidersForTest(
   providers: {
     id: string;

@@ -101,6 +101,7 @@ import {
 } from "../monitoring/results";
 import {
   reportExchangeBilling,
+  warmExchangeCatalog,
   type ExchangeScrapeMetadata,
 } from "../../lib/exchange";
 
@@ -112,6 +113,7 @@ const jobLockExtensionTime = config.JOB_LOCK_EXTENSION_TIME;
 if (require.main === module) {
   cacheableLookup.install(http.globalAgent);
   cacheableLookup.install(https.globalAgent);
+  warmExchangeCatalog();
 }
 
 async function billScrapeJob(
