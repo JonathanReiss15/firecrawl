@@ -102,6 +102,25 @@ describe("Exchange routing", () => {
     ).resolves.toBe(true);
   });
 
+  it("serves the stale catalog while refreshing in the background", async () => {
+    setExchangeProvidersForTest(TEST_PROVIDERS, -1);
+    let resolveFetch: (value: unknown) => void = () => {};
+    vi.mocked(fetch).mockReturnValue(
+      new Promise(resolve => {
+        resolveFetch = resolve;
+      }) as ReturnType<typeof fetch>,
+    );
+
+    // The catalog is expired and the refresh never resolves during the
+    // request - the stale value must be served without waiting.
+    await expect(
+      resolveExchangeProvider("https://profiles.example/person/example"),
+    ).resolves.toMatchObject({ id: "acme" });
+    expect(fetch).toHaveBeenCalledTimes(1);
+
+    resolveFetch({ ok: false, status: 503 });
+  });
+
   it("caches failed provider catalog lookups briefly", async () => {
     clearExchangeProvidersForTest();
     vi.mocked(fetch).mockResolvedValue({

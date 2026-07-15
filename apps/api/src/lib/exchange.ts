@@ -186,22 +186,31 @@ async function getExchangeProviders(): Promise<ExchangeProvider[] | null> {
   }
 
   if (!providersRequest) {
-    providersRequest = fetchExchangeProviders().finally(() => {
-      providersRequest = undefined;
-    });
+    providersRequest = fetchExchangeProviders()
+      .then(providers => {
+        cachedProviders = {
+          value: providers,
+          expiresAt:
+            Date.now() +
+            (providers === null
+              ? EXCHANGE_PROVIDERS_FAILURE_TTL_MS
+              : EXCHANGE_PROVIDERS_TTL_MS),
+        };
+        return providers;
+      })
+      .finally(() => {
+        providersRequest = undefined;
+      });
   }
 
-  const providers = await providersRequest;
-  cachedProviders = {
-    value: providers,
-    expiresAt:
-      Date.now() +
-      (providers === null
-        ? EXCHANGE_PROVIDERS_FAILURE_TTL_MS
-        : EXCHANGE_PROVIDERS_TTL_MS),
-  };
+  // Serve the stale catalog while the refresh runs in the background so
+  // request latency never depends on the catalog endpoint; only the very
+  // first lookup after boot has nothing to serve and waits.
+  if (cachedProviders) {
+    return cachedProviders.value;
+  }
 
-  return providers;
+  return providersRequest;
 }
 
 function providerMatchesUrl(provider: ExchangeProvider, inputUrl: string): boolean {
@@ -531,6 +540,7 @@ export function setExchangeProvidersForTest(
     terms?: ExchangeTerms;
     routes: { domains: string[]; pathPrefixes?: string[] }[];
   }[],
+  ttlMs = 300_000,
 ) {
   cachedProviders = {
     value: providers.map(provider => ({
@@ -542,7 +552,7 @@ export function setExchangeProvidersForTest(
         pathPrefixes: (route.pathPrefixes ?? []).map(normalizePathPrefix),
       })),
     })),
-    expiresAt: Date.now() + 300_000,
+    expiresAt: Date.now() + ttlMs,
   };
 }
 
