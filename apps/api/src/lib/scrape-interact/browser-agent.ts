@@ -186,7 +186,7 @@ async function takeSnapshot(browserId: string): Promise<string> {
  * Keep a single foregrounded content tab, closing agent-browser's stray
  * about:blank tab (it safely falls back to the surviving tab).
  *
- * Uses the shared block-scoped script: the Node REPL keeps one global scope
+ * Uses the shared re-runnable IIFE script: the Node REPL keeps one global scope
  * per session, so a script with top-level `const` declarations can only ever
  * run once — every later invocation used to die with a redeclaration
  * SyntaxError that the catch below silently swallowed.
