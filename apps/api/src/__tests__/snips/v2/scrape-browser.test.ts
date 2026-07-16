@@ -2,6 +2,7 @@ import crypto from "crypto";
 import { config } from "../../../config";
 import {
   ALLOW_TEST_SUITE_WEBSITE,
+  HAS_AI,
   HAS_FIRE_ENGINE,
   TEST_PRODUCTION,
   TEST_SELF_HOST,
@@ -22,7 +23,8 @@ const sleep = (ms: number) => new Promise(resolve => setTimeout(resolve, ms));
 async function interactWithReplicaRetry(
   jobId: string,
   body: {
-    code: string;
+    code?: string;
+    prompt?: string;
     language?: "python" | "node" | "bash";
     timeout?: number;
   },
@@ -246,6 +248,74 @@ describe("Scrape browser interact replay", () => {
       }
     },
     scrapeTimeout,
+  );
+
+  // Prompt-only interact drives the browser agent, which needs AI.
+  itIf(canRunReplayHappyPath && (TEST_PRODUCTION || HAS_AI))(
+    "accepts a prompt-only interact request",
+    async () => {
+      const url = `${TEST_SUITE_WEBSITE}?testId=${crypto.randomUUID()}`;
+      let scrapeId: string | null = null;
+
+      try {
+        const scrapeResponse = await scrapeRaw(
+          {
+            url,
+            origin: "website-replay-test",
+          },
+          identity,
+        );
+
+        expect(scrapeResponse.statusCode).toBe(200);
+        expect(scrapeResponse.body.success).toBe(true);
+        expect(typeof scrapeResponse.body.scrape_id).toBe("string");
+        scrapeId = scrapeResponse.body.scrape_id as string;
+
+        const executeResponse = await interactWithReplicaRetry(
+          scrapeId,
+          {
+            prompt: "Report the current page URL.",
+            timeout: 120,
+          },
+          identity,
+        );
+
+        expect(executeResponse.statusCode).toBe(200);
+        expect(executeResponse.body.success).toBe(true);
+        expect(typeof executeResponse.body.sessionId).toBe("string");
+      } finally {
+        if (scrapeId) {
+          await scrapeStopInteractiveBrowserRaw(scrapeId, identity);
+        }
+      }
+    },
+    scrapeTimeout * 2,
+  );
+
+  itIf(!TEST_SELF_HOST)(
+    "returns 400 when both 'prompt' and 'code' are provided",
+    async () => {
+      const response = await scrapeInteractRaw(
+        crypto.randomUUID(),
+        {
+          code: "console.log('should not run')",
+          prompt: "Click the login button",
+          language: "node",
+        },
+        identity,
+      );
+
+      expect(response.statusCode).toBe(400);
+      expect(response.body.success).toBe(false);
+      expect(response.body.error).toBe(
+        "Provide exactly one of 'prompt' or 'code', not both.",
+      );
+      // Body validation rejects the request before any session is created,
+      // so neither the code path nor the agent path executes.
+      expect(response.body.sessionId).toBeUndefined();
+      expect(response.body.stdout).toBeUndefined();
+      expect(response.body.output).toBeUndefined();
+    },
   );
 
   itIf(!TEST_SELF_HOST)(

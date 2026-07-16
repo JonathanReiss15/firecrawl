@@ -53,6 +53,8 @@ async def interact(
     has_prompt = prompt and prompt.strip()
     if not has_code and not has_prompt:
         raise ValueError("Either 'code' or 'prompt' must be provided")
+    if has_code and has_prompt:
+        raise ValueError("Provide exactly one of 'prompt' or 'code', not both")
 
     payload: Dict[str, Any] = {
         "language": language,

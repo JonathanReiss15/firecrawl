@@ -93,6 +93,9 @@ const browserExecuteRequestSchema = z
   })
   .refine(data => data.code || data.prompt, {
     message: "Either 'code' or 'prompt' must be provided.",
+  })
+  .refine(data => !(data.code && data.prompt), {
+    message: "Provide exactly one of 'prompt' or 'code', not both.",
   });
 
 type BrowserExecuteRequest = z.infer<typeof browserExecuteRequestSchema>;
@@ -282,7 +285,7 @@ export async function scrapeInteractController(
 
   let execResult: BrowserServiceExecResponse | AgentResult;
 
-  if (prompt && !rawCode) {
+  if (prompt) {
     logger.info("Starting agent loop from prompt", { prompt, timeout });
 
     markBrowserSessionUsedPrompt(session.id).catch(() => {});
