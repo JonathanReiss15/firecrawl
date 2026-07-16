@@ -3,6 +3,8 @@ import { deleteKey, getValue, setValue } from "../services/redis";
 import { db } from "../db/connection";
 import * as schema from "../db/schema";
 import { logger as _logger } from "./logger";
+import { config } from "../config";
+import { redisEvictConnection } from "../services/redis";
 
 const logger = _logger.child({ module: "browser-sessions" });
 
@@ -31,6 +33,36 @@ interface BrowserSessionRow {
   updated_at: string; // ISO timestamp
 }
 
+const useLocalSessionStore = config.USE_DB_AUTHENTICATION !== true;
+const LOCAL_SESSION_RETENTION_SECONDS = 24 * 60 * 60;
+
+const localSessionKey = (id: string) => `browser_session:local:${id}`;
+const localBrowserIdKey = (id: string) => `browser_session:local_browser:${id}`;
+const localScrapeIdKey = (id: string) => `browser_session:local_scrape:${id}`;
+const localTeamKey = (id: string) => `browser_session:local_team:${id}`;
+
+function localSessionTtl(row: BrowserSessionRow): number {
+  return Math.max(LOCAL_SESSION_RETENTION_SECONDS, row.ttl_total + 3600);
+}
+
+async function saveLocalSession(row: BrowserSessionRow): Promise<void> {
+  const ttl = localSessionTtl(row);
+  const tx = redisEvictConnection
+    .multi()
+    .set(localSessionKey(row.id), JSON.stringify(row), "EX", ttl)
+    .set(localBrowserIdKey(row.browser_id), row.id, "EX", ttl)
+    .sadd(localTeamKey(row.team_id), row.id);
+  if (row.scrape_id) {
+    tx.set(localScrapeIdKey(row.scrape_id), row.id, "EX", ttl);
+  }
+  await tx.exec();
+}
+
+async function getLocalSession(id: string): Promise<BrowserSessionRow | null> {
+  const raw = await redisEvictConnection.get(localSessionKey(id));
+  return raw ? (JSON.parse(raw) as BrowserSessionRow) : null;
+}
+
 // ---------------------------------------------------------------------------
 // CRUD helpers
 // ---------------------------------------------------------------------------
@@ -44,6 +76,11 @@ export async function insertBrowserSession(
     created_at: now,
     updated_at: now,
   };
+
+  if (useLocalSessionStore) {
+    await saveLocalSession(full);
+    return full;
+  }
 
   const MAX_ATTEMPTS = 10;
   let lastError: any = null;
@@ -79,6 +116,8 @@ export async function insertBrowserSession(
 export async function getBrowserSession(
   id: string,
 ): Promise<BrowserSessionRow | null> {
+  if (useLocalSessionStore) return getLocalSession(id);
+
   try {
     const [data] = await db
       .select()
@@ -97,6 +136,11 @@ export async function getBrowserSession(
 export async function getBrowserSessionFromScrape(
   id: string,
 ): Promise<BrowserSessionRow | null> {
+  if (useLocalSessionStore) {
+    const sessionId = await redisEvictConnection.get(localScrapeIdKey(id));
+    return sessionId ? getLocalSession(sessionId) : null;
+  }
+
   try {
     const [data] = await db
       .select()
@@ -116,6 +160,19 @@ export async function listBrowserSessions(
   teamId: string,
   opts?: { status?: BrowserSessionStatus },
 ): Promise<BrowserSessionRow[]> {
+  if (useLocalSessionStore) {
+    const ids = await redisEvictConnection.smembers(localTeamKey(teamId));
+    const rows = await Promise.all(ids.map(getLocalSession));
+    const missing = ids.filter((_, index) => rows[index] === null);
+    if (missing.length > 0) {
+      await redisEvictConnection.srem(localTeamKey(teamId), ...missing);
+    }
+    return rows
+      .filter((row): row is BrowserSessionRow => row !== null)
+      .filter(row => !opts?.status || row.status === opts.status)
+      .sort((a, b) => b.created_at.localeCompare(a.created_at));
+  }
+
   const conditions = [eq(schema.browser_sessions.team_id, teamId)];
   if (opts?.status) {
     conditions.push(eq(schema.browser_sessions.status, opts.status));
@@ -137,6 +194,13 @@ export async function listBrowserSessions(
 }
 
 export async function updateBrowserSessionActivity(id: string): Promise<void> {
+  if (useLocalSessionStore) {
+    const row = await getLocalSession(id);
+    if (row)
+      await saveLocalSession({ ...row, updated_at: new Date().toISOString() });
+    return;
+  }
+
   try {
     await db
       .update(schema.browser_sessions)
@@ -150,6 +214,13 @@ export async function updateBrowserSessionActivity(id: string): Promise<void> {
 export async function getBrowserSessionByBrowserId(
   browserId: string,
 ): Promise<BrowserSessionRow | null> {
+  if (useLocalSessionStore) {
+    const sessionId = await redisEvictConnection.get(
+      localBrowserIdKey(browserId),
+    );
+    return sessionId ? getLocalSession(sessionId) : null;
+  }
+
   try {
     const [data] = await db
       .select()
@@ -172,6 +243,18 @@ export async function updateBrowserSessionStatus(
   id: string,
   status: BrowserSessionStatus,
 ): Promise<void> {
+  if (useLocalSessionStore) {
+    const row = await getLocalSession(id);
+    if (row) {
+      await saveLocalSession({
+        ...row,
+        status,
+        updated_at: new Date().toISOString(),
+      });
+    }
+    return;
+  }
+
   try {
     await db
       .update(schema.browser_sessions)
@@ -190,6 +273,13 @@ export async function claimBrowserSessionDestroyed(
   id: string,
 ): Promise<boolean> {
   const now = new Date().toISOString();
+  if (useLocalSessionStore) {
+    const row = await getLocalSession(id);
+    if (!row || row.status !== "active") return false;
+    await saveLocalSession({ ...row, status: "destroyed", updated_at: now });
+    return true;
+  }
+
   try {
     const data = await db
       .update(schema.browser_sessions)
@@ -216,6 +306,18 @@ export async function updateBrowserSessionScrapeId(
   id: string,
   scrapeId: string,
 ): Promise<void> {
+  if (useLocalSessionStore) {
+    const row = await getLocalSession(id);
+    if (row) {
+      await saveLocalSession({
+        ...row,
+        scrape_id: scrapeId,
+        updated_at: new Date().toISOString(),
+      });
+    }
+    return;
+  }
+
   try {
     await db
       .update(schema.browser_sessions)
@@ -234,6 +336,18 @@ export async function updateBrowserSessionCreditsUsed(
   id: string,
   creditsUsed: number,
 ): Promise<void> {
+  if (useLocalSessionStore) {
+    const row = await getLocalSession(id);
+    if (row) {
+      await saveLocalSession({
+        ...row,
+        credits_used: creditsUsed,
+        updated_at: new Date().toISOString(),
+      });
+    }
+    return;
+  }
+
   try {
     await db
       .update(schema.browser_sessions)
