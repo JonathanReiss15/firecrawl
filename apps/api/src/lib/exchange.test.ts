@@ -102,6 +102,29 @@ describe("Exchange routing", () => {
     ).resolves.toBe(true);
   });
 
+  it("respects path segment boundaries for prefixes without trailing slashes", async () => {
+    setExchangeProvidersForTest([
+      {
+        id: "acme",
+        creditsCost: 12,
+        routes: [{ domains: ["profiles.example"], pathPrefixes: ["/person"] }],
+      },
+    ]);
+
+    await expect(
+      resolveExchangeProvider("https://profiles.example/person"),
+    ).resolves.toMatchObject({ id: "acme" });
+    await expect(
+      resolveExchangeProvider("https://profiles.example/person/example"),
+    ).resolves.toMatchObject({ id: "acme" });
+    await expect(
+      resolveExchangeProvider("https://profiles.example/personality/details"),
+    ).resolves.toBeNull();
+    await expect(
+      resolveExchangeProvider("https://profiles.example/personnel"),
+    ).resolves.toBeNull();
+  });
+
   it("serves the stale catalog while refreshing in the background", async () => {
     setExchangeProvidersForTest(TEST_PROVIDERS, -1);
     let resolveFetch: (value: unknown) => void = () => {};
@@ -335,6 +358,34 @@ describe("Exchange routing", () => {
         url: "https://profiles.example/person/example-person",
         formats: [{ type: "markdown" }],
         atsv: true,
+        flags: ENABLED_EXCHANGE_FLAGS,
+      }),
+    ).resolves.toBe(false);
+
+    // minAge asks for Firecrawl-cached data, which the Exchange never has.
+    await expect(
+      canUseExchangeForRequest({
+        url: "https://profiles.example/person/example-person",
+        formats: [{ type: "markdown" }],
+        minAge: 3_600_000,
+        flags: ENABLED_EXCHANGE_FLAGS,
+      }),
+    ).resolves.toBe(false);
+
+    // Selector-based filtering does not apply to provider records.
+    await expect(
+      canUseExchangeForRequest({
+        url: "https://profiles.example/person/example-person",
+        formats: [{ type: "markdown" }],
+        includeTags: ["article"],
+        flags: ENABLED_EXCHANGE_FLAGS,
+      }),
+    ).resolves.toBe(false);
+    await expect(
+      canUseExchangeForRequest({
+        url: "https://profiles.example/person/example-person",
+        formats: [{ type: "markdown" }],
+        excludeTags: ["nav"],
         flags: ENABLED_EXCHANGE_FLAGS,
       }),
     ).resolves.toBe(false);

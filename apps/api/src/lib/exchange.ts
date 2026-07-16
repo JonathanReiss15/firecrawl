@@ -32,6 +32,9 @@ type RouteInput = {
   blockAds?: boolean;
   profile?: unknown;
   atsv?: boolean;
+  minAge?: number;
+  includeTags?: unknown[];
+  excludeTags?: unknown[];
   zeroDataRetention?: boolean;
   lockdown?: boolean;
   flags?: {
@@ -244,7 +247,13 @@ function providerMatchesUrl(provider: ExchangeProvider, inputUrl: string): boole
       return true;
     }
 
-    return route.pathPrefixes.some(prefix => pathname.startsWith(prefix));
+    // Prefix matches respect path segment boundaries: "/person" matches
+    // "/person" and "/person/x" but never "/personality".
+    return route.pathPrefixes.some(prefix =>
+      prefix.endsWith("/")
+        ? pathname.startsWith(prefix)
+        : pathname === prefix || pathname.startsWith(`${prefix}/`),
+    );
   });
 }
 
@@ -419,6 +428,21 @@ function isExchangeEligibleRequest(input: RouteInput): boolean {
   // atsv is only supported by browser engines; requests that set it keep an
   // engine that can honor it instead of routing to the Exchange.
   if (input.atsv === true) {
+    return false;
+  }
+
+  // minAge requests ask for Firecrawl-cached data; the Exchange serves
+  // provider data and Firecrawl never caches it, so the semantics cannot
+  // be honored here.
+  if (input.minAge !== undefined) {
+    return false;
+  }
+
+  // Selector-based content filtering does not apply to provider records.
+  if (
+    (Array.isArray(input.includeTags) && input.includeTags.length > 0) ||
+    (Array.isArray(input.excludeTags) && input.excludeTags.length > 0)
+  ) {
     return false;
   }
 
