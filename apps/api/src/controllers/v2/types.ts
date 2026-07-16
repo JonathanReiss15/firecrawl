@@ -1960,9 +1960,9 @@ export const searchRequestSchema = z
     ignoreInvalidURLs: z.boolean().optional().prefault(false),
     asyncScraping: z.boolean().optional().prefault(false),
     // Replace each result's snippet with query-relevant highlights pulled from
-    // our index. Falls back to the provider snippet when a result cannot be
-    // highlighted.
-    highlights: z.boolean().optional().prefault(true),
+    // our index. When omitted, the caller integration and rollout cohort decide
+    // whether generated highlights are returned or only run in shadow mode.
+    highlights: z.boolean().optional(),
     __searchPreviewToken: z.string().optional(),
     threatProtection: threatProtectionOverrideSchema.optional(),
     scrapeOptions: baseScrapeOptions
