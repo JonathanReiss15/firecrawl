@@ -497,7 +497,7 @@ export async function browserExecuteController(
   const hasError = execResult.exitCode !== 0 || execResult.killed;
 
   return res.status(200).json({
-    success: true,
+    success: !hasError,
     stdout: execResult.stdout,
     result: execResult.result,
     stderr: execResult.stderr,
