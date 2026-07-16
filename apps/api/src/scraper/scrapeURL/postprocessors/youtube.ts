@@ -29,6 +29,11 @@ type YouTubeMetadataRequest = {
   url: string;
   transcript_language: string;
   cookies?: BrowserCookie[];
+  /**
+   * Cache freshness we'll accept from avgrab's metadata cache, in ms.
+   * 0 forces a live extraction; omitted means avgrab's server default TTL.
+   */
+  max_age_ms?: number;
 };
 
 function getTranscriptLanguage(meta: Meta): string {
@@ -105,6 +110,9 @@ async function getYouTubeMetadata(
     url: engineResult.url,
     transcript_language: getTranscriptLanguage(meta),
     ...(cookies && cookies.length > 0 ? { cookies } : {}),
+    ...(meta.options.maxAge !== undefined
+      ? { max_age_ms: meta.options.maxAge }
+      : {}),
   };
 
   const response = await fetch(`${config.AVGRAB_SERVICE_URL}/metadata`, {
