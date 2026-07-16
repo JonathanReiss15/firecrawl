@@ -41,6 +41,120 @@ async function interactWithReplicaRetry(
   return lastResponse!;
 }
 
+type InteractRuntime = "python" | "node" | "bash";
+
+/**
+ * Shared scrape → interact lifecycle:
+ * scrape (planting a replay marker) → N interact calls in one runtime →
+ * DELETE /v2/scrape/:jobId/interact.
+ *
+ * The stop always runs in a `finally` so sessions never leak, even when an
+ * interact call fails; its response is returned so callers can assert the
+ * DELETE succeeded without masking an earlier failure.
+ */
+async function runScrapeInteractLifecycle(opts: {
+  identity: Identity;
+  language: InteractRuntime;
+  codes: string[];
+  replayMarker: string;
+}) {
+  const url = `${TEST_SUITE_WEBSITE}?testId=${crypto.randomUUID()}`;
+
+  const scrapeResponse = await scrapeRaw(
+    {
+      url,
+      origin: "website-replay-test",
+      waitFor: 500,
+      actions: [
+        {
+          type: "executeJavascript",
+          script: `window.__fcMatrixReplayMarker = "${opts.replayMarker}";`,
+        },
+      ],
+    },
+    opts.identity,
+  );
+
+  expect(scrapeResponse.statusCode).toBe(200);
+  expect(scrapeResponse.body.success).toBe(true);
+  expect(typeof scrapeResponse.body.scrape_id).toBe("string");
+  const scrapeId = scrapeResponse.body.scrape_id as string;
+
+  const responses: Awaited<ReturnType<typeof scrapeInteractRaw>>[] = [];
+  let stopResponse: Awaited<
+    ReturnType<typeof scrapeStopInteractiveBrowserRaw>
+  > | null = null;
+
+  try {
+    for (const code of opts.codes) {
+      responses.push(
+        await interactWithReplicaRetry(
+          scrapeId,
+          { language: opts.language, timeout: 60, code },
+          opts.identity,
+        ),
+      );
+    }
+  } finally {
+    stopResponse = await scrapeStopInteractiveBrowserRaw(
+      scrapeId,
+      opts.identity,
+    );
+  }
+
+  return { url, responses, stopResponse };
+}
+
+function lastStdoutLine(response: { body: { stdout?: string } }): string {
+  return response.body.stdout?.trim().split("\n").filter(Boolean).pop() ?? "";
+}
+
+/**
+ * Parse the JSON payload an interact call produced. The node REPL reports a
+ * final expression through `result` while python/bash report through stdout,
+ * so accept whichever channel carries a JSON object.
+ */
+function jsonPayload(response: {
+  body: { stdout?: string; result?: string };
+}): Record<string, unknown> {
+  const candidates = [
+    response.body.result?.trim() ?? "",
+    lastStdoutLine(response),
+  ];
+  for (const candidate of candidates) {
+    if (!candidate.startsWith("{")) continue;
+    try {
+      return JSON.parse(candidate);
+    } catch {
+      continue;
+    }
+  }
+  throw new Error(
+    `No JSON payload found in interact response (result: ${JSON.stringify(
+      response.body.result,
+    )}, stdout: ${JSON.stringify(response.body.stdout)})`,
+  );
+}
+
+function expectExecSuccess(
+  response: Awaited<ReturnType<typeof scrapeInteractRaw>>,
+) {
+  expect(response.statusCode).toBe(200);
+  expect(response.body.success).toBe(true);
+  expect(response.body.exitCode).toBe(0);
+  expect(response.body.killed).toBe(false);
+}
+
+function expectStopSuccess(
+  stopResponse: Awaited<
+    ReturnType<typeof scrapeStopInteractiveBrowserRaw>
+  > | null,
+) {
+  expect(stopResponse).not.toBeNull();
+  expect(stopResponse!.statusCode).toBe(200);
+  expect(stopResponse!.body.success).toBe(true);
+}
+
 describe("Scrape browser interact replay", () => {
   let identity: Identity;
   let otherIdentity: Identity;
@@ -356,4 +470,211 @@ describe("Scrape browser interact replay", () => {
     },
     scrapeTimeout,
   );
+});
+
+// ---------------------------------------------------------------------------
+// Cross-runtime state-attachment matrix
+//
+// Every runtime (node / python / bash) must attach to the same live page of a
+// scrape-bound session, keep that attachment across consecutive interact
+// calls, report failures with consistent fields, and allow the session to be
+// stopped cleanly — including after a failed execution.
+//
+// Regression coverage for firecrawl/firecrawl#3498: the Python runtime binds
+// its `page` variable when its REPL starts (before the scrape replay runs),
+// and used to keep pointing at a tab that session-creation tab consolidation
+// had closed, so every Python exec on the session failed with
+// `TargetClosedError` while node and bash worked.
+// ---------------------------------------------------------------------------
+
+describe("Scrape browser cross-runtime interact matrix", () => {
+  let identity: Identity;
+
+  beforeAll(async () => {
+    identity = await idmux({
+      name: "scrape-browser-matrix",
+      concurrency: 20,
+      credits: 1_000_000,
+    });
+  }, 10000 + scrapeTimeout);
+
+  const canRunMatrix =
+    ALLOW_TEST_SUITE_WEBSITE &&
+    !!config.BROWSER_SERVICE_URL &&
+    (TEST_PRODUCTION || HAS_FIRE_ENGINE);
+
+  itIf(canRunMatrix)(
+    "node: attaches to the replayed page and keeps state across calls",
+    async () => {
+      const replayMarker = crypto.randomUUID();
+      const runtimeMarker = crypto.randomUUID();
+
+      const { url, responses, stopResponse } = await runScrapeInteractLifecycle(
+        {
+          identity,
+          language: "node",
+          replayMarker,
+          codes: [
+            // The REPL reports the final expression through `result`
+            // (console.log output does not reliably reach stdout).
+            [
+              `const matrixNodeFirst = {`,
+              `  url: page.url(),`,
+              `  title: await page.title(),`,
+              `  replayMarker: await page.evaluate(() => window.__fcMatrixReplayMarker ?? null),`,
+              `};`,
+              `await page.evaluate(value => { window.__fcMatrixRuntimeMarker = value; }, ${JSON.stringify(runtimeMarker)});`,
+              `JSON.stringify(matrixNodeFirst)`,
+            ].join("\n"),
+            [
+              `const matrixNodeSecond = await page.evaluate(() => ({`,
+              `  replayMarker: window.__fcMatrixReplayMarker ?? null,`,
+              `  runtimeMarker: window.__fcMatrixRuntimeMarker ?? null,`,
+              `}));`,
+              `JSON.stringify(matrixNodeSecond)`,
+            ].join("\n"),
+          ],
+        },
+      );
+
+      expectStopSuccess(stopResponse);
+
+      expectExecSuccess(responses[0]);
+      const first = jsonPayload(responses[0]);
+      expect(first.url).toContain(TEST_SUITE_WEBSITE);
+      expect(url).toContain(TEST_SUITE_WEBSITE);
+      expect(first.replayMarker).toBe(replayMarker);
+
+      expectExecSuccess(responses[1]);
+      const second = jsonPayload(responses[1]);
+      expect(second.replayMarker).toBe(replayMarker);
+      expect(second.runtimeMarker).toBe(runtimeMarker);
+    },
+    scrapeTimeout * 2,
+  );
+
+  itIf(canRunMatrix)(
+    "python: attaches to the replayed page and keeps state across calls",
+    async () => {
+      const replayMarker = crypto.randomUUID();
+      const runtimeMarker = crypto.randomUUID();
+
+      const { responses, stopResponse } = await runScrapeInteractLifecycle({
+        identity,
+        language: "python",
+        replayMarker,
+        codes: [
+          // The python REPL processes Playwright protocol events only while
+          // an exec runs, so page.url can lag; read location.href through a
+          // real protocol round-trip instead. A stale/closed attachment
+          // (issue #3498) fails here with TargetClosedError.
+          [
+            `import json`,
+            `matrix_href = await page.evaluate("() => location.href")`,
+            `matrix_title = await page.title()`,
+            `matrix_replay_marker = await page.evaluate("() => window.__fcMatrixReplayMarker || null")`,
+            `await page.evaluate("value => { window.__fcMatrixRuntimeMarker = value; }", ${JSON.stringify(runtimeMarker)})`,
+            `print(json.dumps({"href": matrix_href, "title": matrix_title, "replayMarker": matrix_replay_marker, "closed": page.is_closed()}))`,
+          ].join("\n"),
+          [
+            `import json`,
+            `matrix_state = await page.evaluate("() => ({ replayMarker: window.__fcMatrixReplayMarker || null, runtimeMarker: window.__fcMatrixRuntimeMarker || null })")`,
+            `print(json.dumps(matrix_state))`,
+          ].join("\n"),
+        ],
+      });
+
+      expectStopSuccess(stopResponse);
+
+      expectExecSuccess(responses[0]);
+      const first = jsonPayload(responses[0]);
+      expect(first.closed).toBe(false);
+      expect(first.href).toContain(TEST_SUITE_WEBSITE);
+      expect(first.replayMarker).toBe(replayMarker);
+
+      expectExecSuccess(responses[1]);
+      const second = jsonPayload(responses[1]);
+      expect(second.replayMarker).toBe(replayMarker);
+      expect(second.runtimeMarker).toBe(runtimeMarker);
+    },
+    scrapeTimeout * 2,
+  );
+
+  itIf(canRunMatrix)(
+    "bash: agent-browser stays attached across consecutive calls",
+    async () => {
+      const replayMarker = crypto.randomUUID();
+
+      const { responses, stopResponse } = await runScrapeInteractLifecycle({
+        identity,
+        language: "bash",
+        replayMarker,
+        codes: [
+          `agent-browser get url && agent-browser get title`,
+          `agent-browser get url`,
+        ],
+      });
+
+      expectStopSuccess(stopResponse);
+
+      expectExecSuccess(responses[0]);
+      expect(responses[0].body.stdout).toContain(TEST_SUITE_WEBSITE);
+
+      expectExecSuccess(responses[1]);
+      expect(responses[1].body.stdout).toContain(TEST_SUITE_WEBSITE);
+    },
+    scrapeTimeout * 2,
+  );
+
+  const failureCases: {
+    language: InteractRuntime;
+    code: string;
+    stderrNeedle: string;
+  }[] = [
+    {
+      language: "node",
+      code: `throw new Error("firecrawl-matrix-node-failure");`,
+      stderrNeedle: "firecrawl-matrix-node-failure",
+    },
+    {
+      language: "python",
+      code: `raise RuntimeError("firecrawl-matrix-python-failure")`,
+      stderrNeedle: "firecrawl-matrix-python-failure",
+    },
+    {
+      // Fail inside a subshell: a bare top-level `exit` would terminate the
+      // session's persistent shell instead of reporting an exit code.
+      language: "bash",
+      code: `(echo "firecrawl-matrix-bash-failure" >&2; exit 3)`,
+      stderrNeedle: "firecrawl-matrix-bash-failure",
+    },
+  ];
+
+  for (const failureCase of failureCases) {
+    itIf(canRunMatrix)(
+      `${failureCase.language}: failing code reports consistent failure fields and still stops cleanly`,
+      async () => {
+        const { responses, stopResponse } = await runScrapeInteractLifecycle({
+          identity,
+          language: failureCase.language,
+          replayMarker: crypto.randomUUID(),
+          codes: [failureCase.code],
+        });
+
+        // The DELETE must succeed even though execution failed.
+        expectStopSuccess(stopResponse);
+
+        const response = responses[0];
+        expect(response.statusCode).toBe(200);
+        expect(response.body.success).toBe(false);
+        expect(typeof response.body.exitCode).toBe("number");
+        expect(response.body.exitCode).not.toBe(0);
+        expect(response.body.killed).toBe(false);
+        expect(response.body.stderr).toContain(failureCase.stderrNeedle);
+        expect(typeof response.body.error).toBe("string");
+        expect(response.body.error.length).toBeGreaterThan(0);
+      },
+      scrapeTimeout * 2,
+    );
+  }
 });

@@ -8,6 +8,7 @@ import {
   browserServiceRequest,
   BrowserServiceExecResponse,
 } from "./browser-service-client";
+import { NODE_TAB_SYNC_SCRIPT } from "./runtime-page-sync";
 import { config } from "../../config";
 import {
   generateText,
@@ -184,20 +185,16 @@ async function takeSnapshot(browserId: string): Promise<string> {
 /**
  * Keep a single foregrounded content tab, closing agent-browser's stray
  * about:blank tab (it safely falls back to the surviving tab).
+ *
+ * Uses the shared block-scoped script: the Node REPL keeps one global scope
+ * per session, so a script with top-level `const` declarations can only ever
+ * run once — every later invocation used to die with a redeclaration
+ * SyntaxError that the catch below silently swallowed.
  */
 async function syncTabs(browserId: string): Promise<void> {
   try {
     await browserServiceRequest("POST", `/browsers/${browserId}/exec`, {
-      code: [
-        `const ctx = page.context();`,
-        `const pages = ctx.pages();`,
-        `if (pages.length > 1) {`,
-        `  const target = pages.find(p => { const u = p.url(); return u && u !== 'about:blank'; }) || pages[pages.length - 1];`,
-        `  for (const p of pages) { if (p !== target) await p.close().catch(() => {}); }`,
-        `  page = target;`,
-        `}`,
-        `await page.bringToFront();`,
-      ].join("\n"),
+      code: NODE_TAB_SYNC_SCRIPT,
       language: "node",
       timeout: 5,
       origin: "tab_sync",

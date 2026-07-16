@@ -41,6 +41,10 @@ import {
   executeCodeViaBrowserSession,
   AgentResult,
 } from "../../lib/scrape-interact/browser-agent";
+import {
+  NODE_TAB_SYNC_SCRIPT,
+  PYTHON_PAGE_SYNC_SCRIPT,
+} from "../../lib/scrape-interact/runtime-page-sync";
 import { sanitizeUrlForTrace } from "../../lib/scrape-interact/langsmith";
 import { getScrapeZDR } from "../../lib/zdr-helpers";
 import { RequestWithAuth, ScrapeOptions } from "./types";
@@ -718,21 +722,35 @@ async function createSessionForScrape(
       "POST",
       `/browsers/${svcResponse.sessionId}/exec`,
       {
-        code: [
-          `const ctx = page.context();`,
-          `const pages = ctx.pages();`,
-          `if (pages.length > 1) {`,
-          `  const target = pages.find(p => { const u = p.url(); return u && u !== 'about:blank'; }) || pages[pages.length - 1];`,
-          `  for (const p of pages) { if (p !== target) await p.close().catch(() => {}); }`,
-          `  page = target;`,
-          `}`,
-          `await page.bringToFront();`,
-        ].join("\n"),
+        code: NODE_TAB_SYNC_SCRIPT,
         language: "node",
         timeout: 10,
         origin: "tab_sync",
       },
     ).catch(() => {});
+
+    // The Python REPL binds its `page` variable when it starts — before the
+    // replay navigated anything — and unlike the Node REPL it is never
+    // repointed by the tab sync above. If it happened to bind a tab the sync
+    // just closed, every Python exec on this session would fail with
+    // TargetClosedError (#3498). Re-attach it to the surviving content page.
+    // Non-fatal: Node/bash execs work regardless, so a failure here must not
+    // tear down the session.
+    await browserServiceRequest<BrowserServiceExecResponse>(
+      "POST",
+      `/browsers/${svcResponse.sessionId}/exec`,
+      {
+        code: PYTHON_PAGE_SYNC_SCRIPT,
+        language: "python",
+        timeout: 15,
+        origin: "python_page_sync",
+      },
+    ).catch(err => {
+      logger.warn("Failed to sync Python runtime page binding", {
+        error: err,
+      });
+      return null;
+    });
 
     // Verify agent-browser is on the content page after cleanup.
     let agentUrl = (primeResult?.stdout || "").trim();
