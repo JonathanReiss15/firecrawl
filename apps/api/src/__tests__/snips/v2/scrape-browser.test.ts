@@ -292,31 +292,30 @@ describe("Scrape browser interact replay", () => {
     scrapeTimeout * 2,
   );
 
-  itIf(!TEST_SELF_HOST)(
-    "returns 400 when both 'prompt' and 'code' are provided",
-    async () => {
-      const response = await scrapeInteractRaw(
-        crypto.randomUUID(),
-        {
-          code: "console.log('should not run')",
-          prompt: "Click the login button",
-          language: "node",
-        },
-        identity,
-      );
+  // Body validation runs before auth-mode/database checks, so this holds in
+  // both production and self-hosted configurations.
+  it("returns 400 when both 'prompt' and 'code' are provided", async () => {
+    const response = await scrapeInteractRaw(
+      crypto.randomUUID(),
+      {
+        code: "console.log('should not run')",
+        prompt: "Click the login button",
+        language: "node",
+      },
+      identity,
+    );
 
-      expect(response.statusCode).toBe(400);
-      expect(response.body.success).toBe(false);
-      expect(response.body.error).toBe(
-        "Provide exactly one of 'prompt' or 'code', not both.",
-      );
-      // Body validation rejects the request before any session is created,
-      // so neither the code path nor the agent path executes.
-      expect(response.body.sessionId).toBeUndefined();
-      expect(response.body.stdout).toBeUndefined();
-      expect(response.body.output).toBeUndefined();
-    },
-  );
+    expect(response.statusCode).toBe(400);
+    expect(response.body.success).toBe(false);
+    expect(response.body.error).toBe(
+      "Provide exactly one of 'prompt' or 'code', not both.",
+    );
+    // Body validation rejects the request before any session is created,
+    // so neither the code path nor the agent path executes.
+    expect(response.body.sessionId).toBeUndefined();
+    expect(response.body.stdout).toBeUndefined();
+    expect(response.body.output).toBeUndefined();
+  });
 
   itIf(!TEST_SELF_HOST)(
     "returns 400 for invalid scrape job id format",
