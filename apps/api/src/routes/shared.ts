@@ -290,6 +290,29 @@ export function blocklistMiddleware(
   res: Response,
   next: NextFunction,
 ) {
+  return blocklistGate(req, res, next, { exchange: false });
+}
+
+/**
+ * Blocklist gate for scrape-shaped routes (scrape, crawl, batch scrape),
+ * where an Exchange-eligible URL may bypass the blocklist because the
+ * exchange engine can serve it. Non-scrape flows (map, search, monitors)
+ * never route through the Exchange and must keep plain blocklist behavior.
+ */
+export function scrapeBlocklistMiddleware(
+  req: RequestWithMaybeACUC<any, any, any>,
+  res: Response,
+  next: NextFunction,
+) {
+  return blocklistGate(req, res, next, { exchange: true });
+}
+
+function blocklistGate(
+  req: RequestWithMaybeACUC<any, any, any>,
+  res: Response,
+  next: NextFunction,
+  options: { exchange: boolean },
+) {
   (async () => {
     const zeroDataRetention =
       getScrapeZDR(req.acuc?.flags) === "forced" ||
@@ -302,6 +325,7 @@ export function blocklistMiddleware(
         ? req.body.scrapeOptions
         : req.body;
     const exchangeAccess =
+      options.exchange &&
       typeof req.body.url === "string" &&
       (await getExchangeAccessForRequest({
         url: req.body.url,

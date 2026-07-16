@@ -268,10 +268,6 @@ export async function resolveExchangeProvider(
   return providers.find(provider => providerMatchesUrl(provider, inputUrl)) ?? null;
 }
 
-export async function isExchangeSupportedUrl(inputUrl: string): Promise<boolean> {
-  return (await resolveExchangeProvider(inputUrl)) !== null;
-}
-
 export function getExchangeRequestLogContext(inputUrl: string):
   | {
       url: string;

@@ -11,7 +11,6 @@ import {
   getExchangeResponseLogContext,
   getExchangeSuccessCredits,
   getThirdPartyDataTermsRequiredResponse,
-  isExchangeSupportedUrl,
   isSuccessfulExchangeStatusCode,
   isSupportedExchangeFormatRequest,
   resolveExchangeProvider,
@@ -98,8 +97,8 @@ describe("Exchange routing", () => {
     await expect(resolveExchangeProvider("not a url")).resolves.toBeNull();
 
     await expect(
-      isExchangeSupportedUrl("https://profiles.example/person/example-person"),
-    ).resolves.toBe(true);
+      resolveExchangeProvider("https://profiles.example/person/example-person"),
+    ).resolves.not.toBeNull();
   });
 
   it("respects path segment boundaries for prefixes without trailing slashes", async () => {
@@ -191,11 +190,11 @@ describe("Exchange routing", () => {
     } as Awaited<ReturnType<typeof fetch>>);
 
     await expect(
-      isExchangeSupportedUrl("https://profiles.example/person/example-person"),
-    ).resolves.toBe(false);
+      resolveExchangeProvider("https://profiles.example/person/example-person"),
+    ).resolves.toBeNull();
     await expect(
-      isExchangeSupportedUrl("https://profiles.example/person/example-person"),
-    ).resolves.toBe(false);
+      resolveExchangeProvider("https://profiles.example/person/example-person"),
+    ).resolves.toBeNull();
 
     expect(fetch).toHaveBeenCalledTimes(1);
   });
