@@ -166,6 +166,17 @@ const mapResult = await app.map('https://example.com');
 console.log(mapResult);
 ```
 
+### Browser sessions (v2)
+
+Create a hosted browser session directly, without a preliminary scrape. Pass an optional `url` to have the session navigate there before it's returned, so it's ready to interact with straight away:
+
+```js
+const session = await app.browser({ url: 'https://example.com' });
+console.log(session.id, session.cdpUrl);
+```
+
+The URL is validated the same way scrape targets are — malformed URLs and private/internal-network addresses are rejected before any session is created. Omit `url` to get an empty session and navigate it yourself later.
+
 ### Scrape-bound interactive browsing (v2)
 
 Use a scrape job ID to keep interacting with the replayed browser context:
