@@ -43,7 +43,7 @@ import {
 } from "../../lib/scrape-interact/browser-agent";
 import {
   NODE_TAB_SYNC_SCRIPT,
-  PYTHON_PAGE_SYNC_SCRIPT,
+  syncPythonRuntimePage,
 } from "../../lib/scrape-interact/runtime-page-sync";
 import { sanitizeUrlForTrace } from "../../lib/scrape-interact/langsmith";
 import { getScrapeZDR } from "../../lib/zdr-helpers";
@@ -734,23 +734,7 @@ async function createSessionForScrape(
     // repointed by the tab sync above. If it happened to bind a tab the sync
     // just closed, every Python exec on this session would fail with
     // TargetClosedError (#3498). Re-attach it to the surviving content page.
-    // Non-fatal: Node/bash execs work regardless, so a failure here must not
-    // tear down the session.
-    await browserServiceRequest<BrowserServiceExecResponse>(
-      "POST",
-      `/browsers/${svcResponse.sessionId}/exec`,
-      {
-        code: PYTHON_PAGE_SYNC_SCRIPT,
-        language: "python",
-        timeout: 15,
-        origin: "python_page_sync",
-      },
-    ).catch(err => {
-      logger.warn("Failed to sync Python runtime page binding", {
-        error: err,
-      });
-      return null;
-    });
+    await syncPythonRuntimePage(svcResponse.sessionId, logger);
 
     // Verify agent-browser is on the content page after cleanup.
     let agentUrl = (primeResult?.stdout || "").trim();

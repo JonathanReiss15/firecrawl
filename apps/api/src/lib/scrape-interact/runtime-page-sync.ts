@@ -1,3 +1,11 @@
+import { logger as _logger } from "../logger";
+import {
+  browserServiceRequest,
+  BrowserServiceExecResponse,
+} from "./browser-service-client";
+
+const PYTHON_PAGE_SYNC_TIMEOUT = 15;
+
 // ---------------------------------------------------------------------------
 // Runtime page-sync scripts for scrape-bound Interact sessions.
 //
@@ -79,3 +87,34 @@ export const PYTHON_PAGE_SYNC_SCRIPT = [
   `if _fc_sync_target is not None:`,
   `    page = _fc_sync_target`,
 ].join("\n");
+
+/**
+ * Re-attach the Python REPL's `page` binding to the live content page on the
+ * given browser session, running `PYTHON_PAGE_SYNC_SCRIPT`.
+ *
+ * Best-effort by design: the Node and bash runtimes work regardless of the
+ * Python binding, so a failure here must never tear down the session — it is
+ * logged and swallowed. Shared by the two moments that can strand the Python
+ * binding: session creation (after tab consolidation, before the caller's
+ * first exec) and the end of a prompt-driven agent run (whose actions may have
+ * opened or closed tabs since the last Python exec). See firecrawl/firecrawl#3498.
+ */
+export async function syncPythonRuntimePage(
+  browserId: string,
+  logger: typeof _logger,
+): Promise<void> {
+  try {
+    await browserServiceRequest<BrowserServiceExecResponse>(
+      "POST",
+      `/browsers/${browserId}/exec`,
+      {
+        code: PYTHON_PAGE_SYNC_SCRIPT,
+        language: "python",
+        timeout: PYTHON_PAGE_SYNC_TIMEOUT,
+        origin: "python_page_sync",
+      },
+    );
+  } catch (error) {
+    logger.warn("Failed to sync Python runtime page binding", { error });
+  }
+}

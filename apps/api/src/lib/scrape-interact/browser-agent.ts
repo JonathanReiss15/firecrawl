@@ -8,7 +8,10 @@ import {
   browserServiceRequest,
   BrowserServiceExecResponse,
 } from "./browser-service-client";
-import { NODE_TAB_SYNC_SCRIPT } from "./runtime-page-sync";
+import {
+  NODE_TAB_SYNC_SCRIPT,
+  syncPythonRuntimePage,
+} from "./runtime-page-sync";
 import { config } from "../../config";
 import {
   generateText,
@@ -421,6 +424,16 @@ export async function executePromptViaBrowserAgent(
       exitCode: 1,
       killed: false,
     };
+  } finally {
+    // The agent's actions (clicks, navigations, agent-browser commands) can
+    // open or close tabs, and each per-action syncTabs above only repoints the
+    // Node REPL's `page`. If the caller follows this prompt run with a Python
+    // exec — a supported mix on one retained session — the Python REPL may
+    // still be bound to a tab that has since been closed, reproducing #3498
+    // mid-session. Re-attach it once here, after the run's final syncTabs, so
+    // a subsequent Python exec starts from the live content page. Runs once
+    // per prompt call (not per action) to bound added latency; best-effort.
+    await syncPythonRuntimePage(browserId, logger);
   }
 }
 

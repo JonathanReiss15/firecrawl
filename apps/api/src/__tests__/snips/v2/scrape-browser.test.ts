@@ -3,6 +3,7 @@ import { config } from "../../../config";
 import { PYTHON_PAGE_SYNC_SCRIPT } from "../../../lib/scrape-interact/runtime-page-sync";
 import {
   ALLOW_TEST_SUITE_WEBSITE,
+  HAS_AI,
   HAS_FIRE_ENGINE,
   TEST_PRODUCTION,
   TEST_SELF_HOST,
@@ -23,7 +24,8 @@ const sleep = (ms: number) => new Promise(resolve => setTimeout(resolve, ms));
 async function interactWithReplicaRetry(
   jobId: string,
   body: {
-    code: string;
+    code?: string;
+    prompt?: string;
     language?: "python" | "node" | "bash";
     timeout?: number;
   },
@@ -767,6 +769,72 @@ describe("Scrape browser cross-runtime interact matrix", () => {
       stderrNeedle: "firecrawl-matrix-bash-failure",
     },
   ];
+
+  // A prompt run and a python code exec are a supported mix on one retained
+  // session. The agent's actions churn tabs, and per-action tab sync only
+  // repoints the Node REPL's `page` — so without the post-run Python page sync
+  // the following python exec can hit a stale/closed binding (#3498) mid-run.
+  // Gated on AI: the prompt path needs a model. TEST_PRODUCTION cloud has one;
+  // otherwise require a configured local model (HAS_AI).
+  itIf(canRunMatrix && (TEST_PRODUCTION || HAS_AI))(
+    "prompt then python: agent run leaves the python binding on the live page",
+    async () => {
+      const url = `${TEST_SUITE_WEBSITE}?testId=${crypto.randomUUID()}`;
+
+      const scrapeResponse = await scrapeRaw(
+        { url, origin: "website-replay-test", waitFor: 500 },
+        identity,
+      );
+      expect(scrapeResponse.statusCode).toBe(200);
+      expect(scrapeResponse.body.success).toBe(true);
+      const scrapeId = scrapeResponse.body.scrape_id as string;
+
+      try {
+        // A minimal, deterministic-outcome prompt: just read the page. Its
+        // point is to run the agent loop (which primes agent-browser, opens
+        // and consolidates tabs, and finishes with the post-run python sync),
+        // not to exercise complex automation.
+        const promptResponse = await interactWithReplicaRetry(
+          scrapeId,
+          {
+            prompt: "Report the exact title of the current page.",
+            timeout: 60,
+          },
+          identity,
+        );
+        expect(promptResponse.statusCode).toBe(200);
+        expect(promptResponse.body.success).toBe(true);
+
+        // The invariant the post-run sync guarantees: the FIRST python exec
+        // after the prompt run does a real protocol round-trip on the live
+        // content page — same URL, not closed. Pre-fix this failed with
+        // TargetClosedError whenever the agent's tab churn stranded the
+        // python binding.
+        const pythonResponse = await interactWithReplicaRetry(
+          scrapeId,
+          {
+            language: "python",
+            timeout: 60,
+            code: [
+              `import json`,
+              `matrix_href = await page.evaluate("() => location.href")`,
+              `print(json.dumps({"href": matrix_href, "closed": page.is_closed()}))`,
+            ].join("\n"),
+          },
+          identity,
+        );
+
+        expectExecSuccess(pythonResponse);
+        const payload = jsonPayload(pythonResponse);
+        expect(payload.closed).toBe(false);
+        expect(payload.href).toContain(TEST_SUITE_WEBSITE);
+        expect(payload.href).toContain(url.split("?")[1]);
+      } finally {
+        await scrapeStopInteractiveBrowserRaw(scrapeId, identity);
+      }
+    },
+    scrapeTimeout * 2,
+  );
 
   for (const failureCase of failureCases) {
     itIf(canRunMatrix)(
