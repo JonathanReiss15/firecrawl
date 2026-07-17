@@ -321,6 +321,7 @@ export async function scrapeInteractRaw(
     language?: "python" | "node" | "bash";
     timeout?: number;
     origin?: string;
+    existingSessionId?: string;
   },
   identity: Identity,
 ) {

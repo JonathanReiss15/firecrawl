@@ -188,6 +188,22 @@ console.log(run.stdout);
 await app.stopInteraction(scrapeJobId);
 ```
 
+You can also attach a scrape to a browser session you already created, instead of letting the first `interact` call spin one up. Pass its id as `existingSessionId`:
+
+```js
+const session = await app.browser();
+
+const run = await app.interact(scrapeJobId, {
+  existingSessionId: session.id,
+  code: 'console.log(await page.title())',
+  language: 'node',
+  timeout: 60,
+});
+console.log(run.stdout);
+```
+
+If the session doesn't exist, has already been destroyed, or belongs to another team, the call returns an error rather than silently creating a new session.
+
 ### Crawl a website with real‑time updates
 
 To receive real‑time updates, start a crawl and attach a watcher.

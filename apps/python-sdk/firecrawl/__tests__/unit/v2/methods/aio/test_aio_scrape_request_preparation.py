@@ -154,6 +154,37 @@ class TestAsyncScrapeRequestPreparation:
         assert response.interactive_live_view_url == "https://live.example.com/interactive"
 
     @pytest.mark.asyncio
+    async def test_interact_serializes_existing_session_id(self):
+        client = _FakeAsyncClient(
+            post_response=_FakeAsyncResponse(
+                200,
+                {"success": True, "stdout": "ok", "exitCode": 0},
+            ),
+            delete_response=_FakeAsyncResponse(200, {"success": True}),
+        )
+        await interact(
+            client,
+            "job-123",
+            "console.log('ok')",
+            existing_session_id="session-abc",
+        )
+
+        assert client.last_post[1]["existingSessionId"] == "session-abc"
+
+    @pytest.mark.asyncio
+    async def test_interact_omits_existing_session_id_when_absent(self):
+        client = _FakeAsyncClient(
+            post_response=_FakeAsyncResponse(
+                200,
+                {"success": True, "stdout": "ok", "exitCode": 0},
+            ),
+            delete_response=_FakeAsyncResponse(200, {"success": True}),
+        )
+        await interact(client, "job-123", "console.log('ok')")
+
+        assert "existingSessionId" not in client.last_post[1]
+
+    @pytest.mark.asyncio
     async def test_interact_validates_required_inputs(self):
         client = _FakeAsyncClient(
             post_response=_FakeAsyncResponse(200, {"success": True}),

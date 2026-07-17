@@ -124,6 +124,44 @@ describe("JS SDK v2 scrape-browser methods", () => {
     );
   });
 
+  test("interact includes existingSessionId when set", async () => {
+    const post = jest.fn(async () => ({
+      status: 200,
+      data: { success: true, stdout: "ok", exitCode: 0 },
+    }));
+
+    const http = { post } as any;
+    await interact(http, "job-123", {
+      code: "console.log('ok')",
+      existingSessionId: "session-abc",
+    });
+
+    expect(post).toHaveBeenCalledWith(
+      "/v2/scrape/job-123/interact",
+      {
+        code: "console.log('ok')",
+        language: "node",
+        existingSessionId: "session-abc",
+      },
+      {},
+    );
+  });
+
+  test("interact omits existingSessionId when not set", async () => {
+    const post = jest.fn(async () => ({
+      status: 200,
+      data: { success: true, stdout: "ok", exitCode: 0 },
+    }));
+
+    const http = { post } as any;
+    await interact(http, "job-123", {
+      code: "console.log('ok')",
+    });
+
+    const sentBody = post.mock.calls[0][1] as Record<string, unknown>;
+    expect(sentBody).not.toHaveProperty("existingSessionId");
+  });
+
   test("interact converts seconds-based body timeout to ms axios timeout", async () => {
     const post = jest.fn(async () => ({
       status: 200,
