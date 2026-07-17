@@ -55,6 +55,7 @@ def _normalize_browser_list_response(payload: Dict[str, Any]) -> Dict[str, Any]:
 def browser(
     client: HttpClient,
     *,
+    url: Optional[str] = None,
     ttl: Optional[int] = None,
     activity_ttl: Optional[int] = None,
     stream_web_view: Optional[bool] = None,
@@ -64,6 +65,9 @@ def browser(
 
     Args:
         client: HTTP client instance
+        url: Optional starting URL. When provided, the session is navigated
+            there before it is returned. Malformed or private/internal-network
+            URLs are rejected server-side before the session is created.
         ttl: Total time-to-live in seconds (30-3600, default 300)
         activity_ttl: Inactivity TTL in seconds (10-3600)
         stream_web_view: Whether to enable webview streaming
@@ -74,6 +78,8 @@ def browser(
         BrowserCreateResponse with session id and CDP URL
     """
     body: Dict[str, Any] = {}
+    if url is not None:
+        body["url"] = url
     if ttl is not None:
         body["ttl"] = ttl
     if activity_ttl is not None:

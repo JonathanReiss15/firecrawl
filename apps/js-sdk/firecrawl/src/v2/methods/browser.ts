@@ -13,6 +13,7 @@ import {
 export async function browser(
   http: HttpClient,
   args: {
+    url?: string;
     ttl?: number;
     activityTtl?: number;
     streamWebView?: boolean;
@@ -25,6 +26,7 @@ export async function browser(
   } = {},
 ): Promise<BrowserCreateResponse> {
   const body: Record<string, unknown> = {};
+  if (args.url != null) body.url = args.url;
   if (args.ttl != null) body.ttl = args.ttl;
   if (args.activityTtl != null) body.activityTtl = args.activityTtl;
   if (args.streamWebView != null) body.streamWebView = args.streamWebView;

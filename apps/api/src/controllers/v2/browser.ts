@@ -22,7 +22,8 @@ import {
   mirrorExternalSlotAcquire,
   mirrorExternalSlotRelease,
 } from "../../services/worker/nuq-router";
-import { RequestWithAuth } from "./types";
+import { RequestWithAuth, URL as URLSchema } from "./types";
+import { isIPPrivate } from "../../scraper/scrapeURL/engines/utils/safeFetch";
 import { billTeam } from "../../services/billing/credit_billing";
 import { enqueueBrowserSessionActivity } from "../../lib/browser-session-activity";
 import { logRequest } from "../../services/logging/log_job";
@@ -39,6 +40,12 @@ import { autumnService } from "../../services/autumn/autumn.service";
 // ---------------------------------------------------------------------------
 
 const browserCreateRequestSchema = z.object({
+  // Optional starting URL. When provided, the freshly created session is
+  // navigated here before we return it, so callers can begin interacting
+  // without a preliminary /v2/scrape. Uses the same URL schema as /v2/scrape
+  // (protocol + format + checkUrl); private/internal targets are additionally
+  // rejected below via isIPPrivate before any session is created.
+  url: URLSchema.optional(),
   ttl: z.number().min(30).max(3600).default(600),
   activityTtl: z.number().min(10).max(3600).default(300),
   streamWebView: z.boolean().default(true),
@@ -214,6 +221,7 @@ export async function browserCreateController(
   req.body = browserCreateRequestSchema.parse(req.body);
 
   const {
+    url,
     ttl,
     activityTtl,
     streamWebView,
@@ -228,6 +236,36 @@ export async function browserCreateController(
       error:
         "Browser feature is not configured (BROWSER_SERVICE_URL is missing).",
     });
+  }
+
+  // Reject private/internal-network URLs (SSRF) BEFORE any browser session is
+  // created, so a blocked target never leaves a dangling session behind. The
+  // URL schema above already rejected malformed URLs and unsupported protocols;
+  // here we additionally block literal private IPs using the same isIPPrivate
+  // helper the scrape fetch dispatcher uses at connect time. (Hostnames that
+  // resolve to private IPs are still caught by that dispatcher during
+  // navigation, which tears the session down on failure — see below.)
+  if (url && config.ALLOW_LOCAL_WEBHOOKS !== true) {
+    let hostname: string;
+    try {
+      // Strip IPv6 brackets (new URL keeps them, e.g. "[::1]") so the literal
+      // address is what isIPPrivate/ipaddr.js sees.
+      hostname = new URL(url).hostname.replace(/^\[|\]$/g, "");
+    } catch {
+      return res.status(400).json({
+        success: false,
+        error: "Invalid URL.",
+      });
+    }
+    if (isIPPrivate(hostname)) {
+      logger.warn("Rejected browser session with private-network URL", {
+        hostname,
+      });
+      return res.status(400).json({
+        success: false,
+        error: "URL resolves to a private or internal network address.",
+      });
+    }
   }
 
   logger.info("Creating browser session", { ttl, activityTtl });
@@ -394,6 +432,48 @@ export async function browserCreateController(
     browserId: svcResponse.sessionId,
   });
 
+  // If a starting URL was provided, navigate the fresh session to it before
+  // returning. This mirrors how createSessionForScrape primes a session with
+  // page.goto(). If navigation fails (including SSRF blocks surfaced by the
+  // scrape fetch dispatcher when a hostname resolves to a private IP), tear the
+  // session fully down so no half-initialized session is left dangling.
+  if (url) {
+    try {
+      const navResult = await browserServiceRequest<BrowserServiceExecResponse>(
+        "POST",
+        `/browsers/${svcResponse.sessionId}/exec`,
+        {
+          code: `await page.goto(${JSON.stringify(url)}, { waitUntil: "domcontentloaded" });`,
+          language: "node",
+          timeout: 30,
+          origin: "browser_create_navigate",
+        },
+      );
+
+      if (navResult.exitCode !== 0 || navResult.killed) {
+        throw new Error(
+          navResult.stderr?.trim() ||
+            navResult.stdout?.trim() ||
+            "Navigation exited with an error.",
+        );
+      }
+    } catch (err) {
+      logger.error("Failed to navigate browser session to starting URL", {
+        error: err,
+      });
+      await teardownBrowserSession(
+        sessionId,
+        svcResponse.sessionId,
+        req.auth.team_id,
+        logger,
+      );
+      return res.status(502).json({
+        success: false,
+        error: "Failed to navigate the browser session to the provided URL.",
+      });
+    }
+  }
+
   return res.status(200).json({
     success: true,
     id: sessionId,
@@ -401,6 +481,31 @@ export async function browserCreateController(
     liveViewUrl: svcResponse.iframeUrl,
     interactiveLiveViewUrl: svcResponse.interactiveIframeUrl,
     expiresAt: svcResponse.expiresAt,
+  });
+}
+
+/**
+ * Fully tear down a persisted browser session that failed to initialize:
+ * release it in the browser service, mark it destroyed in Supabase, and drop
+ * its concurrency-limiter slot / cached count. Best-effort — every step
+ * swallows its own error so teardown never masks the original failure.
+ */
+async function teardownBrowserSession(
+  sessionId: string,
+  browserId: string,
+  teamId: string,
+  logger: typeof _logger,
+): Promise<void> {
+  await browserServiceRequest("DELETE", `/browsers/${browserId}`).catch(
+    () => {},
+  );
+  await claimBrowserSessionDestroyed(sessionId).catch(() => {});
+  invalidateActiveBrowserSessionCount(teamId).catch(() => {});
+  mirrorExternalSlotRelease(teamId, sessionId).catch(error => {
+    logger.error(
+      "Failed to remove concurrency limiter entry during session teardown",
+      { error, sessionId, teamId },
+    );
   });
 }
 

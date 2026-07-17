@@ -740,6 +740,7 @@ class AsyncFirecrawlClient:
     async def browser(
         self,
         *,
+        url: Optional[str] = None,
         ttl: Optional[int] = None,
         activity_ttl: Optional[int] = None,
         stream_web_view: Optional[bool] = None,
@@ -748,6 +749,9 @@ class AsyncFirecrawlClient:
         """Create a new browser session.
 
         Args:
+            url: Optional starting URL. When provided, the session is navigated
+                there before it is returned. Malformed or private/internal-network
+                URLs are rejected server-side before the session is created.
             ttl: Total time-to-live in seconds (30-3600, default 300)
             activity_ttl: Inactivity TTL in seconds (10-3600)
             stream_web_view: Whether to enable webview streaming
@@ -759,6 +763,7 @@ class AsyncFirecrawlClient:
         """
         return await async_browser.browser(
             self.async_http_client,
+            url=url,
             ttl=ttl,
             activity_ttl=activity_ttl,
             stream_web_view=stream_web_view,
