@@ -362,6 +362,11 @@ const configSchema = z.object({
   BROWSER_SERVICE_URL: z.string().optional(),
   BROWSER_SERVICE_API_KEY: z.string().optional(),
   BROWSER_SERVICE_WEBHOOK_SECRET: z.string().optional(),
+  // Model used for Interact prompt-agent runs and recipe learn/repair.
+  // Defaults to the hosted Gemini configuration; self-hosters without a
+  // Google key can point these at openai/anthropic/ollama instead.
+  INTERACT_MODEL_NAME: z.string().optional(),
+  INTERACT_MODEL_PROVIDER: z.string().optional(),
 
   // Audio (avgrab)
   AVGRAB_SERVICE_URL: z.string().optional(),

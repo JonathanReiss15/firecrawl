@@ -352,7 +352,14 @@ export async function executePromptViaBrowserAgent(
 
   try {
     const result = await generateText({
-      model: getModel("gemini-3.5-flash", "google"),
+      // Defaults to the hosted Gemini configuration; self-hosters can override
+      // via INTERACT_MODEL_NAME / INTERACT_MODEL_PROVIDER (see config.ts).
+      model: getModel(
+        config.INTERACT_MODEL_NAME ?? "gemini-3.5-flash",
+        (config.INTERACT_MODEL_PROVIDER ?? "google") as Parameters<
+          typeof getModel
+        >[1],
+      ),
       system: SYSTEM_PROMPT,
       messages: [
         {

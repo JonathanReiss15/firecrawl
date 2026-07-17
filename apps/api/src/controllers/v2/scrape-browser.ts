@@ -67,6 +67,12 @@ import {
 } from "../../lib/browser-billing";
 import { autumnService } from "../../services/autumn/autumn.service";
 import { applyAgentAuthDiscoveryHeader } from "../../lib/agent-auth-discovery";
+import {
+  recipeRequestSchema,
+  runRecipeRequest,
+  isLearnRequest,
+  RecipeResponseMetadata,
+} from "../../lib/scrape-interact/recipe-controller";
 
 // ---------------------------------------------------------------------------
 // Schemas
@@ -94,13 +100,28 @@ const browserExecuteRequestSchema = z
     origin: z.string().optional(),
     integration: integrationSchema.optional().transform(val => val || null),
     existingSessionId: z.string().optional(),
+    // Learn a reusable recipe from `prompt`, or execute a pinned recipe. A
+    // pinned execution needs neither prompt nor code (an accompanying prompt
+    // is used only as repair context).
+    recipe: recipeRequestSchema.optional(),
   })
-  .refine(data => data.code || data.prompt, {
-    message: "Either 'code' or 'prompt' must be provided.",
-  })
+  .refine(
+    data =>
+      data.code || data.prompt || (data.recipe && !isLearnRequest(data.recipe)),
+    {
+      message: "Either 'code' or 'prompt' must be provided.",
+    },
+  )
   .refine(data => !(data.code && data.prompt), {
     message: "Provide exactly one of 'prompt' or 'code', not both.",
-  });
+  })
+  .refine(data => !(data.recipe && data.code), {
+    message: "'recipe' cannot be combined with 'code'.",
+  })
+  .refine(
+    data => !(data.recipe && isLearnRequest(data.recipe) && !data.prompt),
+    { message: "recipe mode 'learn' requires a 'prompt'." },
+  );
 
 type BrowserExecuteRequest = z.infer<typeof browserExecuteRequestSchema>;
 
@@ -117,6 +138,7 @@ interface BrowserExecuteResponse {
   exitCode?: number;
   killed?: boolean;
   error?: string;
+  recipe?: RecipeResponseMetadata;
 }
 
 interface BrowserDeleteResponse {
@@ -141,7 +163,7 @@ export async function scrapeInteractController(
   req.body = browserExecuteRequestSchema.parse(req.body);
 
   const scrapeId = req.params.jobId;
-  const { code: rawCode, prompt, language, timeout, origin } = req.body;
+  const { code: rawCode, prompt, language, timeout, origin, recipe } = req.body;
 
   let logger = _logger.child({
     scrapeId,
@@ -303,6 +325,65 @@ export async function scrapeInteractController(
   const traceIdentity = {
     orgId: req.auth.org_id ?? undefined,
   };
+
+  // Recipe path: learn a reusable recipe from the prompt, or run a pinned
+  // recipe deterministically against the replayed session (optionally
+  // repairing provably-safe drift). Shared with the standalone interact path.
+  if (recipe) {
+    const mode = isLearnRequest(recipe) ? "learn" : "execute";
+    logger.info("Running recipe request", { mode, timeout });
+
+    const outcome = await runRecipeRequest({
+      recipe,
+      prompt,
+      browserId: session.browser_id,
+      teamId: req.auth.team_id,
+      stepTimeout: timeout,
+      logger,
+    });
+
+    // Bill at the interact (prompt) rate only when a model actually ran —
+    // learn always does; pinned execution only when a repair was attempted.
+    if (outcome.usedModel) {
+      markBrowserSessionUsedPrompt(session.id).catch(() => {});
+    }
+    enqueueBrowserSessionActivity({
+      team_id: req.auth.team_id,
+      session_id: session.id,
+      source: "interact",
+      language: "bash",
+      timeout,
+      exit_code: outcome.ok ? 0 : 1,
+      killed: false,
+    });
+
+    if (!outcome.ok) {
+      return res.status(outcome.status).json({
+        success: false,
+        sessionId: session.id,
+        cdpUrl: session.cdp_url,
+        liveViewUrl: session.cdp_path,
+        interactiveLiveViewUrl: session.cdp_interactive_path,
+        error: outcome.error,
+        exitCode: 1,
+        killed: false,
+      });
+    }
+    return res.status(200).json({
+      success: true,
+      sessionId: session.id,
+      cdpUrl: session.cdp_url,
+      liveViewUrl: session.cdp_path,
+      interactiveLiveViewUrl: session.cdp_interactive_path,
+      output: outcome.output,
+      stdout: outcome.stdout,
+      result: outcome.result,
+      stderr: "",
+      exitCode: 0,
+      killed: false,
+      recipe: outcome.recipe,
+    });
+  }
 
   let execResult: BrowserServiceExecResponse | AgentResult;
 

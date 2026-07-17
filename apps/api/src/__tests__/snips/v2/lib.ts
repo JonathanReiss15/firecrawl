@@ -356,6 +356,7 @@ export async function browserCreateRaw(
     ttl?: number;
     activityTtl?: number;
     recordSession?: boolean;
+    recipe?: Record<string, unknown>;
   },
   identity: Identity,
 ) {
@@ -373,6 +374,7 @@ export async function browserExecuteRaw(
     prompt?: string;
     language?: "python" | "node" | "bash";
     timeout?: number;
+    recipe?: Record<string, unknown>;
   },
   identity: Identity,
 ) {

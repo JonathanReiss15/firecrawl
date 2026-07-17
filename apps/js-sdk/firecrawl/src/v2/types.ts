@@ -1291,6 +1291,15 @@ export interface BrowserCreateResponse {
   interactiveLiveViewUrl?: string;
   expiresAt?: string;
   error?: string;
+  // Present only when an initial execution (url + prompt/code/recipe) ran
+  // during create — mirrors the execute response shape.
+  output?: string;
+  stdout?: string;
+  result?: string;
+  stderr?: string;
+  exitCode?: number;
+  killed?: boolean;
+  recipe?: InteractRecipeResult;
 }
 
 export interface BrowserExecuteResponse {
@@ -1305,6 +1314,7 @@ export interface BrowserExecuteResponse {
   exitCode?: number;
   killed?: boolean;
   error?: string;
+  recipe?: InteractRecipeResult;
 }
 
 export interface BrowserDeleteResponse {
@@ -1312,6 +1322,48 @@ export interface BrowserDeleteResponse {
   sessionDurationMs?: number;
   creditsBilled?: number;
   error?: string;
+}
+
+/**
+ * Recipe behavior for an interact execution.
+ *
+ * `{ mode: "learn" }` runs the `prompt` through the interact agent and, on
+ * success, retains the minimal validated command stream as a versioned recipe.
+ * `{ recipeId, version }` executes a previously learned recipe
+ * deterministically — no model in the loop. With `onDrift: "repair-safe"`,
+ * a step failure that provably had no side effect may be repaired by a model;
+ * a verified repair is stored as a candidate version and the pinned version
+ * is never modified in place.
+ */
+export type InteractRecipeOption =
+  | { mode: "learn"; includeSteps?: boolean }
+  | {
+      recipeId: string;
+      version: number;
+      onDrift?: "fail" | "repair-safe";
+      includeSteps?: boolean;
+    };
+
+export interface InteractRecipeStep {
+  id: number;
+  /** agent-browser argv tokens, e.g. ["fill", "#q", "value"]. */
+  args: string[];
+}
+
+/** Recipe metadata returned when an execution ran with a `recipe` option. */
+export interface InteractRecipeResult {
+  recipeId: string;
+  version: number;
+  route: "learned" | "executed" | "repaired";
+  /** Version the verified repair was stored under (route "repaired"). */
+  candidateVersion?: number;
+  /** Present when `includeSteps: true` was requested. */
+  steps?: InteractRecipeStep[];
+  repair?: {
+    step: number;
+    from: string[];
+    to: string[];
+  };
 }
 
 export interface ScrapeExecuteRequest {
@@ -1325,6 +1377,12 @@ export interface ScrapeExecuteRequest {
    * for this scrape. The session must be active and owned by the same team.
    */
   existingSessionId?: string;
+  /**
+   * Learn a reusable recipe from `prompt`, or execute a pinned recipe. A
+   * pinned execution needs neither `prompt` nor `code` (an accompanying
+   * `prompt` is used only as repair context).
+   */
+  recipe?: InteractRecipeOption;
 }
 
 export type ScrapeExecuteResponse = BrowserExecuteResponse;
