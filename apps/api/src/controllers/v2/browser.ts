@@ -40,6 +40,12 @@ import {
   calculateBrowserSessionCredits,
 } from "../../lib/browser-billing";
 import { autumnService } from "../../services/autumn/autumn.service";
+import {
+  recipeRequestSchema,
+  runRecipeRequest,
+  isLearnRequest,
+  RecipeResponseMetadata,
+} from "../../lib/scrape-interact/recipe-controller";
 
 // ---------------------------------------------------------------------------
 // Zod schemas
@@ -74,12 +80,22 @@ const browserCreateRequestSchema = z
         saveChanges: z.boolean().default(true),
       })
       .optional(),
+    // Optional recipe behavior for the initial execution: learn a reusable
+    // recipe from `prompt`, or execute a previously learned, pinned recipe.
+    recipe: recipeRequestSchema.optional(),
   })
   // At most one of prompt/code. Neither is valid (create-only / create+url);
   // both is not — reuse the execute endpoint's message for parity.
   .refine(data => !(data.code && data.prompt), {
     message: "Provide exactly one of 'prompt' or 'code', not both.",
-  });
+  })
+  .refine(data => !(data.recipe && data.code), {
+    message: "'recipe' cannot be combined with 'code'.",
+  })
+  .refine(
+    data => !(data.recipe && isLearnRequest(data.recipe) && !data.prompt),
+    { message: "recipe mode 'learn' requires a 'prompt'." },
+  );
 
 type BrowserCreateRequest = z.infer<typeof browserCreateRequestSchema>;
 
@@ -102,6 +118,8 @@ interface BrowserCreateResponse {
   exitCode?: number;
   killed?: boolean;
   error?: string;
+  // Present when the initial execution ran with a `recipe` option.
+  recipe?: RecipeResponseMetadata;
 }
 
 const browserExecuteRequestSchema = z
@@ -111,13 +129,28 @@ const browserExecuteRequestSchema = z
     language: z.enum(["python", "node", "bash"]).default("node"),
     timeout: z.number().min(1).max(300).default(30),
     origin: z.string().optional(),
+    // Learn a reusable recipe from `prompt`, or execute a pinned recipe. A
+    // pinned execution needs neither prompt nor code (an accompanying prompt
+    // is used only as repair context).
+    recipe: recipeRequestSchema.optional(),
   })
-  .refine(data => data.code || data.prompt, {
-    message: "Either 'code' or 'prompt' must be provided.",
-  })
+  .refine(
+    data =>
+      data.code || data.prompt || (data.recipe && !isLearnRequest(data.recipe)),
+    {
+      message: "Either 'code' or 'prompt' must be provided.",
+    },
+  )
   .refine(data => !(data.code && data.prompt), {
     message: "Provide exactly one of 'prompt' or 'code', not both.",
-  });
+  })
+  .refine(data => !(data.recipe && data.code), {
+    message: "'recipe' cannot be combined with 'code'.",
+  })
+  .refine(
+    data => !(data.recipe && isLearnRequest(data.recipe) && !data.prompt),
+    { message: "recipe mode 'learn' requires a 'prompt'." },
+  );
 
 type BrowserExecuteRequest = z.infer<typeof browserExecuteRequestSchema>;
 
@@ -130,6 +163,7 @@ interface BrowserExecuteResponse {
   exitCode?: number;
   killed?: boolean;
   error?: string;
+  recipe?: RecipeResponseMetadata;
 }
 
 interface BrowserDeleteResponse {
@@ -274,6 +308,7 @@ export async function browserCreateController(
     recordSession,
     profile,
     integration,
+    recipe,
   } = req.body;
 
   if (!config.BROWSER_SERVICE_URL) {
@@ -549,10 +584,61 @@ export async function browserCreateController(
 
   // No initial execution requested: return the plain create response (plus the
   // navigation side effect, if any). Backward compatible.
-  if (!prompt && !code) {
+  if (!prompt && !code && !recipe) {
     return res.status(200).json({
       success: true,
       ...sessionFields,
+    });
+  }
+
+  // Recipe path: learn from the prompt or execute a pinned recipe against the
+  // freshly created (and navigated) session; the session stays alive either
+  // way, mirroring the prompt/code one-call behavior below.
+  if (recipe) {
+    const mode = isLearnRequest(recipe) ? "learn" : "execute";
+    logger.info("Running initial recipe request", { mode, timeout });
+
+    const outcome = await runRecipeRequest({
+      recipe,
+      prompt,
+      browserId: svcResponse.sessionId,
+      teamId: req.auth.team_id,
+      stepTimeout: timeout,
+      logger,
+    });
+
+    if (outcome.usedModel) {
+      markBrowserSessionUsedPrompt(sessionId).catch(() => {});
+    }
+    enqueueBrowserSessionActivity({
+      team_id: req.auth.team_id,
+      session_id: sessionId,
+      source: "interact",
+      language: "bash",
+      timeout,
+      exit_code: outcome.ok ? 0 : 1,
+      killed: false,
+    });
+
+    if (!outcome.ok) {
+      return res.status(outcome.status === 404 ? 404 : 200).json({
+        success: false,
+        ...sessionFields,
+        error: outcome.error,
+        exitCode: 1,
+        killed: false,
+      });
+    }
+    return res.status(200).json({
+      success: true,
+      ...sessionFields,
+      output: outcome.output,
+      stdout: outcome.stdout,
+      result: outcome.result,
+      stderr: "",
+      exitCode: 0,
+      killed: false,
+      recipe: outcome.recipe,
     });
   }
 
@@ -717,7 +803,7 @@ export async function browserExecuteController(
   req.body = browserExecuteRequestSchema.parse(req.body);
 
   const id = req.params.sessionId;
-  const { code, prompt, language, timeout, origin } = req.body;
+  const { code, prompt, language, timeout, origin, recipe } = req.body;
 
   const logger = _logger.child({
     sessionId: id,
@@ -764,6 +850,56 @@ export async function browserExecuteController(
   const traceIdentity = {
     orgId: req.auth.org_id ?? undefined,
   };
+
+  // Recipe path: learn a reusable recipe from the prompt, or run a pinned
+  // recipe deterministically (optionally repairing provably-safe drift).
+  if (recipe) {
+    const mode = isLearnRequest(recipe) ? "learn" : "execute";
+    logger.info("Running recipe request", { mode, timeout });
+
+    const outcome = await runRecipeRequest({
+      recipe,
+      prompt,
+      browserId: session.browser_id,
+      teamId: req.auth.team_id,
+      stepTimeout: timeout,
+      logger,
+    });
+
+    // Bill at the interact (prompt) rate only when a model actually ran —
+    // learn always does; pinned execution only when a repair was attempted.
+    if (outcome.usedModel) {
+      markBrowserSessionUsedPrompt(session.id).catch(() => {});
+    }
+    enqueueBrowserSessionActivity({
+      team_id: req.auth.team_id,
+      session_id: id,
+      source: "interact",
+      language: "bash",
+      timeout,
+      exit_code: outcome.ok ? 0 : 1,
+      killed: false,
+    });
+
+    if (!outcome.ok) {
+      return res.status(outcome.status).json({
+        success: false,
+        error: outcome.error,
+        exitCode: 1,
+        killed: false,
+      });
+    }
+    return res.status(200).json({
+      success: true,
+      output: outcome.output,
+      stdout: outcome.stdout,
+      result: outcome.result,
+      stderr: "",
+      exitCode: 0,
+      killed: false,
+      recipe: outcome.recipe,
+    });
+  }
 
   let execResult: BrowserServiceExecResponse | AgentResult;
 
