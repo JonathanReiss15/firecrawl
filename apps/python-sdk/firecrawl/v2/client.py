@@ -245,6 +245,7 @@ class FirecrawlClient:
         language: Literal["python", "node", "bash"] = "node",
         timeout: Optional[int] = None,
         origin: Optional[str] = None,
+        existing_session_id: Optional[str] = None,
     ):
         """
         Interact with the browser session associated with a scrape job.
@@ -258,6 +259,9 @@ class FirecrawlClient:
             language: Programming language ("python", "node", or "bash")
             timeout: Execution timeout in seconds (1-300)
             origin: Optional request origin tag
+            existing_session_id: Adopt a specific pre-created browser session
+                instead of creating a new one. The session must be active and
+                owned by the same team.
 
         Returns:
             BrowserExecuteResponse with execution result
@@ -270,6 +274,7 @@ class FirecrawlClient:
             language=language,
             timeout=timeout,
             origin=origin,
+            existing_session_id=existing_session_id,
         )
 
     def stop_interaction(self, job_id: str):
@@ -297,6 +302,7 @@ class FirecrawlClient:
         language: Literal["python", "node", "bash"] = "node",
         timeout: Optional[int] = None,
         origin: Optional[str] = None,
+        existing_session_id: Optional[str] = None,
     ):
         """Deprecated alias for interact()."""
         return self.interact(
@@ -306,6 +312,7 @@ class FirecrawlClient:
             language=language,
             timeout=timeout,
             origin=origin,
+            existing_session_id=existing_session_id,
         )
 
     def delete_scrape_browser(self, job_id: str):

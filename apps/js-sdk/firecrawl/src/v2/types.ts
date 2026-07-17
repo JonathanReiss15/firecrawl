@@ -1320,6 +1320,11 @@ export interface ScrapeExecuteRequest {
   language?: "python" | "node" | "bash";
   timeout?: number;
   origin?: string;
+  /**
+   * Adopt a specific pre-created browser session instead of creating a new one
+   * for this scrape. The session must be active and owned by the same team.
+   */
+  existingSessionId?: string;
 }
 
 export type ScrapeExecuteResponse = BrowserExecuteResponse;

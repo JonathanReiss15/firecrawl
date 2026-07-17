@@ -205,6 +205,35 @@ class TestScrapeRequestPreparation:
         assert response.live_view_url == "https://live.example.com/view"
         assert response.interactive_live_view_url == "https://live.example.com/interactive"
 
+    def test_interact_serializes_existing_session_id(self):
+        client = _FakeClient(
+            post_response=_FakeResponse(
+                200,
+                {"success": True, "stdout": "ok", "exitCode": 0},
+            ),
+            delete_response=_FakeResponse(200, {"success": True}),
+        )
+        interact(
+            client,
+            "job-123",
+            "console.log('ok')",
+            existing_session_id="session-abc",
+        )
+
+        assert client.last_post[1]["existingSessionId"] == "session-abc"
+
+    def test_interact_omits_existing_session_id_when_absent(self):
+        client = _FakeClient(
+            post_response=_FakeResponse(
+                200,
+                {"success": True, "stdout": "ok", "exitCode": 0},
+            ),
+            delete_response=_FakeResponse(200, {"success": True}),
+        )
+        interact(client, "job-123", "console.log('ok')")
+
+        assert "existingSessionId" not in client.last_post[1]
+
     def test_interact_validates_required_inputs(self):
         client = _FakeClient(
             post_response=_FakeResponse(200, {"success": True}),

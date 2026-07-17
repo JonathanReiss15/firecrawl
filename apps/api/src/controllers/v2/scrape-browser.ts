@@ -198,21 +198,38 @@ export async function scrapeInteractController(
 
   let session = await getBrowserSessionFromScrape(scrapeId);
 
+  // When the caller supplies an `existingSessionId`, they are explicitly asking
+  // to reuse a specific pre-created browser session. If that session can't be
+  // adopted, we must NOT silently fall through and create a brand-new session
+  // (that would strand the caller's real session and hand back a different one);
+  // instead return an explicit error mirroring the ownership/state conventions
+  // used elsewhere in this controller: 404 missing, 403 cross-team, 410 not
+  // active (destroyed/error).
   if (!session && req.body.existingSessionId) {
     const existing = await getBrowserSession(req.body.existingSessionId);
-    if (
-      existing &&
-      existing.team_id === req.auth.team_id &&
-      existing.status === "active"
-    ) {
-      await updateBrowserSessionScrapeId(existing.id, scrapeId);
-      session = { ...existing, scrape_id: scrapeId };
-      logger.info("Adopted pre-created browser session for scrape", {
-        scrapeId,
-        sessionId: session.id,
-        browserId: session.browser_id,
+    if (!existing) {
+      return res.status(404).json({
+        success: false,
+        error: "Browser session not found.",
       });
     }
+    if (existing.team_id !== req.auth.team_id) {
+      return res.status(403).json({ success: false, error: "Forbidden." });
+    }
+    if (existing.status !== "active") {
+      return res.status(410).json({
+        success: false,
+        error: "Browser session is no longer active.",
+      });
+    }
+
+    await updateBrowserSessionScrapeId(existing.id, scrapeId);
+    session = { ...existing, scrape_id: scrapeId };
+    logger.info("Adopted pre-created browser session for scrape", {
+      scrapeId,
+      sessionId: session.id,
+      browserId: session.browser_id,
+    });
   }
 
   if (!session) {

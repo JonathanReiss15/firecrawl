@@ -78,6 +78,7 @@ def interact(
     language: Literal["python", "node", "bash"] = "node",
     timeout: Optional[int] = None,
     origin: Optional[str] = None,
+    existing_session_id: Optional[str] = None,
 ) -> BrowserExecuteResponse:
     """
     Interact with the scrape-bound browser session for a scrape job.
@@ -94,6 +95,9 @@ def interact(
         language: Programming language ("python", "node", or "bash")
         timeout: Execution timeout in seconds (1-300)
         origin: Optional request origin tag
+        existing_session_id: Adopt a specific pre-created browser session instead
+            of creating a new one. The session must be active and owned by the
+            same team.
 
     Returns:
         BrowserExecuteResponse with execution output
@@ -118,6 +122,8 @@ def interact(
         body["timeout"] = timeout
     if origin is not None:
         body["origin"] = origin
+    if existing_session_id is not None:
+        body["existingSessionId"] = existing_session_id
 
     response = client.post(f"/v2/scrape/{job_id}/interact", body)
     if not response.ok:
@@ -187,6 +193,7 @@ def scrape_execute(
     language: Literal["python", "node", "bash"] = "node",
     timeout: Optional[int] = None,
     origin: Optional[str] = None,
+    existing_session_id: Optional[str] = None,
 ) -> BrowserExecuteResponse:
     """Deprecated alias for interact()."""
     return interact(
@@ -197,6 +204,7 @@ def scrape_execute(
         language=language,
         timeout=timeout,
         origin=origin,
+        existing_session_id=existing_session_id,
     )
 
 

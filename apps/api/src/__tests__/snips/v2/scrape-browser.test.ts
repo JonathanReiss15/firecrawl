@@ -13,6 +13,9 @@ import {
 import {
   Identity,
   idmux,
+  browserCreateRaw,
+  browserDeleteRaw,
+  browserExecuteRaw,
   scrapeStopInteractiveBrowserRaw,
   scrapeInteractRaw,
   scrapeRaw,
@@ -537,6 +540,248 @@ describe("Scrape browser interact replay", () => {
       expect(executeResponse.body.error).toContain(
         "Replay context is unavailable",
       );
+    },
+    scrapeTimeout,
+  );
+});
+
+// ---------------------------------------------------------------------------
+// existingSessionId: adopting a pre-created browser session
+//
+// A caller can pre-create a browser session (POST /v2/interact) and then hand
+// its id to scrape-interact via `existingSessionId` so the interact runs on
+// THAT session (preserving whatever state it already holds) instead of a
+// freshly-created one. When the supplied id can't be adopted the controller
+// must return an explicit error rather than silently minting a replacement
+// session — so we also assert no session gets bound to the scrape on failure.
+// ---------------------------------------------------------------------------
+
+describe("Scrape browser interact existingSessionId", () => {
+  let identity: Identity;
+  let otherIdentity: Identity;
+
+  beforeAll(async () => {
+    identity = await idmux({
+      name: "scrape-browser-existing-session",
+      concurrency: 20,
+      credits: 1_000_000,
+    });
+    otherIdentity = await idmux({
+      name: "scrape-browser-existing-session-other",
+      concurrency: 10,
+      credits: 1_000_000,
+    });
+  }, 10000 + scrapeTimeout);
+
+  const canRunAdopt =
+    ALLOW_TEST_SUITE_WEBSITE &&
+    !!config.BROWSER_SERVICE_URL &&
+    (TEST_PRODUCTION || HAS_FIRE_ENGINE);
+
+  async function startScrape(id: Identity): Promise<string> {
+    const scrapeResponse = await scrapeRaw(
+      {
+        url: `${TEST_SUITE_WEBSITE}?testId=${crypto.randomUUID()}`,
+        origin: "website-replay-test",
+      },
+      id,
+    );
+    expect(scrapeResponse.statusCode).toBe(200);
+    expect(scrapeResponse.body.success).toBe(true);
+    expect(typeof scrapeResponse.body.scrape_id).toBe("string");
+    return scrapeResponse.body.scrape_id as string;
+  }
+
+  itIf(canRunAdopt)(
+    "adopts a supplied session and preserves its existing state",
+    async () => {
+      const marker = crypto.randomUUID();
+      let preSessionId: string | null = null;
+      let scrapeId: string | null = null;
+
+      try {
+        // Pre-create a standalone browser session and plant a window marker
+        // directly on it. Because the session is adopted (not created from
+        // scratch), the scrape replay never runs against it, so this marker
+        // must survive into the interact call.
+        const createResponse = await browserCreateRaw(
+          { ttl: 120, activityTtl: 120 },
+          identity,
+        );
+        expect(createResponse.statusCode).toBe(200);
+        expect(createResponse.body.success).toBe(true);
+        preSessionId = createResponse.body.id as string;
+        expect(typeof preSessionId).toBe("string");
+
+        const markResponse = await browserExecuteRaw(
+          preSessionId,
+          {
+            language: "node",
+            timeout: 30,
+            code: `await page.evaluate(value => { window.__fcAdoptMarker = value; }, ${JSON.stringify(
+              marker,
+            )});`,
+          },
+          identity,
+        );
+        expect(markResponse.statusCode).toBe(200);
+        expect(markResponse.body.success).toBe(true);
+
+        scrapeId = await startScrape(identity);
+
+        const interactResponse = await interactWithReplicaRetry(
+          scrapeId,
+          {
+            language: "node",
+            timeout: 60,
+            existingSessionId: preSessionId,
+            code: `console.log(await page.evaluate(() => window.__fcAdoptMarker ?? "missing-marker"));`,
+          },
+          identity,
+        );
+
+        expect(interactResponse.statusCode).toBe(200);
+        expect(interactResponse.body.success).toBe(true);
+        // Same session was adopted, not a new one.
+        expect(interactResponse.body.sessionId).toBe(preSessionId);
+        // And the state that was already on it is preserved.
+        expect(interactResponse.body.stdout).toContain(marker);
+      } finally {
+        // Deleting via the scrape tears down the adopted session (its
+        // scrape_id now points here); fall back to the standalone delete in
+        // case adoption never completed.
+        if (scrapeId) {
+          await scrapeStopInteractiveBrowserRaw(scrapeId, identity);
+        }
+        if (preSessionId) {
+          await browserDeleteRaw(preSessionId, identity);
+        }
+      }
+    },
+    scrapeTimeout * 2,
+  );
+
+  itIf(canRunAdopt)(
+    "returns 404 and creates no session for an unknown existingSessionId",
+    async () => {
+      const scrapeId = await startScrape(identity);
+      const unknownSessionId = crypto.randomUUID();
+
+      const interactResponse = await interactWithReplicaRetry(
+        scrapeId,
+        {
+          language: "node",
+          timeout: 60,
+          existingSessionId: unknownSessionId,
+          code: "console.log('should not run')",
+        },
+        identity,
+      );
+
+      expect(interactResponse.statusCode).toBe(404);
+      expect(interactResponse.body.success).toBe(false);
+      expect(interactResponse.body.sessionId).toBeUndefined();
+
+      // No replacement session was silently created for this scrape: the
+      // stop endpoint reports there is nothing bound to the scrape.
+      const stopResponse = await scrapeStopInteractiveBrowserRaw(
+        scrapeId,
+        identity,
+      );
+      expect(stopResponse.statusCode).toBe(404);
+      expect(stopResponse.body.success).toBe(false);
+    },
+    scrapeTimeout,
+  );
+
+  itIf(canRunAdopt)(
+    "returns 410 when the supplied session has been destroyed",
+    async () => {
+      const createResponse = await browserCreateRaw(
+        { ttl: 120, activityTtl: 120 },
+        identity,
+      );
+      expect(createResponse.statusCode).toBe(200);
+      expect(createResponse.body.success).toBe(true);
+      const preSessionId = createResponse.body.id as string;
+
+      // Destroy it before adopting.
+      const deleteResponse = await browserDeleteRaw(preSessionId, identity);
+      expect(deleteResponse.statusCode).toBe(200);
+
+      const scrapeId = await startScrape(identity);
+      const interactResponse = await interactWithReplicaRetry(
+        scrapeId,
+        {
+          language: "node",
+          timeout: 60,
+          existingSessionId: preSessionId,
+          code: "console.log('should not run')",
+        },
+        identity,
+      );
+
+      expect(interactResponse.statusCode).toBe(410);
+      expect(interactResponse.body.success).toBe(false);
+      expect(interactResponse.body.sessionId).toBeUndefined();
+
+      const stopResponse = await scrapeStopInteractiveBrowserRaw(
+        scrapeId,
+        identity,
+      );
+      expect(stopResponse.statusCode).toBe(404);
+    },
+    scrapeTimeout,
+  );
+
+  itIf(canRunAdopt && !!config.IDMUX_URL)(
+    "returns 403 when the supplied session belongs to another team",
+    async () => {
+      if (identity.teamId === otherIdentity.teamId) {
+        return;
+      }
+
+      let otherSessionId: string | null = null;
+      let scrapeId: string | null = null;
+
+      try {
+        // Session owned by otherIdentity's team.
+        const createResponse = await browserCreateRaw(
+          { ttl: 120, activityTtl: 120 },
+          otherIdentity,
+        );
+        expect(createResponse.statusCode).toBe(200);
+        expect(createResponse.body.success).toBe(true);
+        otherSessionId = createResponse.body.id as string;
+
+        scrapeId = await startScrape(identity);
+
+        const interactResponse = await interactWithReplicaRetry(
+          scrapeId,
+          {
+            language: "node",
+            timeout: 60,
+            existingSessionId: otherSessionId,
+            code: "console.log('should not run')",
+          },
+          identity,
+        );
+
+        expect(interactResponse.statusCode).toBe(403);
+        expect(interactResponse.body.success).toBe(false);
+        expect(interactResponse.body.error).toBe("Forbidden.");
+        expect(interactResponse.body.sessionId).toBeUndefined();
+
+        const stopResponse = await scrapeStopInteractiveBrowserRaw(
+          scrapeId,
+          identity,
+        );
+        expect(stopResponse.statusCode).toBe(404);
+      } finally {
+        if (otherSessionId) {
+          await browserDeleteRaw(otherSessionId, otherIdentity);
+        }
+      }
     },
     scrapeTimeout,
   );
