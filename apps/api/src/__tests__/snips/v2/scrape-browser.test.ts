@@ -836,6 +836,108 @@ describe("Scrape browser cross-runtime interact matrix", () => {
     scrapeTimeout * 2,
   );
 
+  // Deterministic regression guard for the prompt-path sync. The happy-path
+  // test above depends on the agent's tab churn happening to strand the python
+  // binding, which is probabilistic — so on its own it can pass even if the
+  // end-of-prompt-run sync were removed. Here we FORCE the broken state before
+  // the prompt run (same mechanism as break-and-heal), then run a prompt and
+  // assert python recovers WITHOUT the test running the sync script itself.
+  // Recovery can only come from `executePromptViaBrowserAgent`'s finally-block
+  // `syncPythonRuntimePage` call — so deleting that call makes this test fail.
+  itIf(canRunMatrix && (TEST_PRODUCTION || HAS_AI))(
+    "prompt run heals a python binding broken before the prompt (regression guard)",
+    async () => {
+      const breakTabId = crypto.randomUUID();
+      const breakUrl = `${TEST_SUITE_WEBSITE}?testId=${breakTabId}`;
+      const url = `${TEST_SUITE_WEBSITE}?testId=${crypto.randomUUID()}`;
+
+      const scrapeResponse = await scrapeRaw(
+        { url, origin: "website-replay-test", waitFor: 500 },
+        identity,
+      );
+      expect(scrapeResponse.statusCode).toBe(200);
+      expect(scrapeResponse.body.success).toBe(true);
+      const scrapeId = scrapeResponse.body.scrape_id as string;
+
+      try {
+        // Force the #3498 state deterministically: open a fresh tab and close
+        // the one every runtime is attached to. Python's binding is now stale
+        // regardless of how the creation-time race resolved.
+        const breakResponse = await interactWithReplicaRetry(
+          scrapeId,
+          {
+            language: "node",
+            timeout: 60,
+            code: [
+              `const fcBreakNext = await page.context().newPage();`,
+              `await fcBreakNext.goto(${JSON.stringify(breakUrl)}, { waitUntil: "domcontentloaded" });`,
+              `const fcBreakOld = page;`,
+              `page = fcBreakNext;`,
+              `await fcBreakOld.close();`,
+              `JSON.stringify({ brokenUrl: page.url() })`,
+            ].join("\n"),
+          },
+          identity,
+        );
+        expectExecSuccess(breakResponse);
+        expect(jsonPayload(breakResponse).brokenUrl).toContain(breakTabId);
+
+        // Confirm the break actually stranded python (negative control): a
+        // python exec here must fail before any prompt run repairs it.
+        const brokenProbe = await interactWithReplicaRetry(
+          scrapeId,
+          {
+            language: "python",
+            timeout: 60,
+            code: `print(await page.title())`,
+          },
+          identity,
+        );
+        expect(brokenProbe.statusCode).toBe(200);
+        expect(brokenProbe.body.success).toBe(false);
+        expect(brokenProbe.body.stderr).toMatch(
+          /TargetClosedError|has been closed/,
+        );
+
+        // Run a prompt. We do NOT run PYTHON_PAGE_SYNC_SCRIPT ourselves — the
+        // only thing that can re-attach python's binding is the sync inside
+        // the agent run's finally block.
+        const promptResponse = await interactWithReplicaRetry(
+          scrapeId,
+          {
+            prompt: "Report the exact title of the current page.",
+            timeout: 60,
+          },
+          identity,
+        );
+        expect(promptResponse.statusCode).toBe(200);
+        expect(promptResponse.body.success).toBe(true);
+
+        // Python must now work again — proof the finally-block sync fired.
+        const healedProbe = await interactWithReplicaRetry(
+          scrapeId,
+          {
+            language: "python",
+            timeout: 60,
+            code: [
+              `import json`,
+              `matrix_href = await page.evaluate("() => location.href")`,
+              `print(json.dumps({"href": matrix_href, "closed": page.is_closed()}))`,
+            ].join("\n"),
+          },
+          identity,
+        );
+        expectExecSuccess(healedProbe);
+        const healed = jsonPayload(healedProbe);
+        expect(healed.closed).toBe(false);
+        expect(healed.href).toContain(TEST_SUITE_WEBSITE);
+      } finally {
+        await scrapeStopInteractiveBrowserRaw(scrapeId, identity);
+      }
+    },
+    scrapeTimeout * 2,
+  );
+
   for (const failureCase of failureCases) {
     itIf(canRunMatrix)(
       `${failureCase.language}: failing code reports consistent failure fields and still stops cleanly`,
