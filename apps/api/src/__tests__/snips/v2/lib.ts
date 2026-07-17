@@ -348,6 +348,11 @@ export async function scrapeStopInteractiveBrowserRaw(
 
 export async function browserCreateRaw(
   body: {
+    url?: string;
+    code?: string;
+    prompt?: string;
+    language?: "python" | "node" | "bash";
+    timeout?: number;
     ttl?: number;
     activityTtl?: number;
     recordSession?: boolean;
@@ -381,6 +386,17 @@ export async function browserExecuteRaw(
 export async function browserDeleteRaw(sessionId: string, identity: Identity) {
   return await request(TEST_API_URL)
     .delete("/v2/interact/" + encodeURIComponent(sessionId))
+    .set("Authorization", `Bearer ${identity.apiKey}`)
+    .send();
+}
+
+export async function browserListRaw(
+  identity: Identity,
+  status?: "active" | "destroyed",
+) {
+  const query = status ? `?status=${status}` : "";
+  return await request(TEST_API_URL)
+    .get("/v2/interact" + query)
     .set("Authorization", `Bearer ${identity.apiKey}`)
     .send();
 }
