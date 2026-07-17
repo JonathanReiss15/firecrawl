@@ -82,7 +82,7 @@ def interact(
     """
     Interact with the scrape-bound browser session for a scrape job.
 
-    Either ``code`` or ``prompt`` must be provided.  When ``prompt`` is given
+    Exactly one of ``code`` or ``prompt`` must be provided (not both).  When ``prompt`` is given
     the server runs an AI agent that translates the natural-language instruction
     into browser actions.
 
@@ -104,6 +104,8 @@ def interact(
     has_prompt = prompt and prompt.strip()
     if not has_code and not has_prompt:
         raise ValueError("Either 'code' or 'prompt' must be provided")
+    if has_code and has_prompt:
+        raise ValueError("Provide exactly one of 'prompt' or 'code', not both")
 
     body: Dict[str, Any] = {
         "language": language,

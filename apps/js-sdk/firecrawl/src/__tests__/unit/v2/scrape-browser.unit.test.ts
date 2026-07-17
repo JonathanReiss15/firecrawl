@@ -67,6 +67,18 @@ describe("JS SDK v2 scrape-browser methods", () => {
     );
   });
 
+  test("interact throws when both code and prompt provided", async () => {
+    const post = jest.fn();
+    const http = { post } as any;
+    await expect(
+      interact(http, "job-123", {
+        code: "console.log('ok')",
+        prompt: "Click the login button",
+      }),
+    ).rejects.toThrow("Provide exactly one of 'prompt' or 'code', not both");
+    expect(post).not.toHaveBeenCalled();
+  });
+
   test("interact throws on non-200 response", async () => {
     const post = jest.fn(async () => ({
       status: 400,

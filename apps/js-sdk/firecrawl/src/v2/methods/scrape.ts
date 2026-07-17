@@ -60,6 +60,9 @@ export async function interact(
   if (!hasCode && !hasPrompt) {
     throw new Error("Either 'code' or 'prompt' must be provided");
   }
+  if (hasCode && hasPrompt) {
+    throw new Error("Provide exactly one of 'prompt' or 'code', not both");
+  }
 
   const body: Record<string, unknown> = {};
   if (hasCode) body.code = args.code;

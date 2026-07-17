@@ -249,7 +249,7 @@ class FirecrawlClient:
         """
         Interact with the browser session associated with a scrape job.
 
-        Either ``code`` or ``prompt`` must be provided.
+        Exactly one of ``code`` or ``prompt`` must be provided (not both).
 
         Args:
             job_id: Scrape job ID

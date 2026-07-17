@@ -316,7 +316,8 @@ export async function scrapeStatus(
 export async function scrapeInteractRaw(
   jobId: string,
   body: {
-    code: string;
+    code?: string;
+    prompt?: string;
     language?: "python" | "node" | "bash";
     timeout?: number;
     origin?: string;

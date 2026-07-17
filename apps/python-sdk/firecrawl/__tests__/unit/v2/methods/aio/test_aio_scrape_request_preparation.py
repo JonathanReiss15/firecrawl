@@ -165,6 +165,23 @@ class TestAsyncScrapeRequestPreparation:
             await interact(client, "job-123")
 
     @pytest.mark.asyncio
+    async def test_interact_rejects_both_code_and_prompt(self):
+        client = _FakeAsyncClient(
+            post_response=_FakeAsyncResponse(200, {"success": True}),
+            delete_response=_FakeAsyncResponse(200, {"success": True}),
+        )
+        with pytest.raises(
+            ValueError, match="Provide exactly one of 'prompt' or 'code', not both"
+        ):
+            await interact(
+                client,
+                "job-123",
+                "console.log('ok')",
+                prompt="Click the login button",
+            )
+        assert client.last_post is None
+
+    @pytest.mark.asyncio
     async def test_interact_raises_when_success_false(self):
         client = _FakeAsyncClient(
             post_response=_FakeAsyncResponse(

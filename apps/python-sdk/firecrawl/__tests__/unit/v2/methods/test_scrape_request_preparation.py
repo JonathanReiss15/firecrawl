@@ -215,6 +215,22 @@ class TestScrapeRequestPreparation:
         with pytest.raises(ValueError, match="Either 'code' or 'prompt' must be provided"):
             interact(client, "job-123")
 
+    def test_interact_rejects_both_code_and_prompt(self):
+        client = _FakeClient(
+            post_response=_FakeResponse(200, {"success": True}),
+            delete_response=_FakeResponse(200, {"success": True}),
+        )
+        with pytest.raises(
+            ValueError, match="Provide exactly one of 'prompt' or 'code', not both"
+        ):
+            interact(
+                client,
+                "job-123",
+                "console.log('ok')",
+                prompt="Click the login button",
+            )
+        assert client.last_post is None
+
     def test_interact_raises_when_success_false(self):
         client = _FakeClient(
             post_response=_FakeResponse(
