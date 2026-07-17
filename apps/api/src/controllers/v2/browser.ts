@@ -28,7 +28,8 @@ import {
   mirrorExternalSlotAcquire,
   mirrorExternalSlotRelease,
 } from "../../services/worker/nuq-router";
-import { RequestWithAuth } from "./types";
+import { RequestWithAuth, URL as URLSchema } from "./types";
+import { isIPPrivate } from "../../scraper/scrapeURL/engines/utils/safeFetch";
 import { billTeam } from "../../services/billing/credit_billing";
 import { enqueueBrowserSessionActivity } from "../../lib/browser-session-activity";
 import { logRequest } from "../../services/logging/log_job";
@@ -44,19 +45,41 @@ import { autumnService } from "../../services/autumn/autumn.service";
 // Zod schemas
 // ---------------------------------------------------------------------------
 
-const browserCreateRequestSchema = z.object({
-  ttl: z.number().min(30).max(3600).default(600),
-  activityTtl: z.number().min(10).max(3600).default(300),
-  streamWebView: z.boolean().default(true),
-  recordSession: z.boolean().default(true),
-  integration: integrationSchema.optional().transform(val => val || null),
-  profile: z
-    .object({
-      name: z.string().min(1).max(128),
-      saveChanges: z.boolean().default(true),
-    })
-    .optional(),
-});
+const browserCreateRequestSchema = z
+  .object({
+    // Optional starting URL. When provided, the freshly created session is
+    // navigated here before we return it, so callers can begin interacting
+    // without a preliminary /v2/scrape. Uses the same URL schema as /v2/scrape
+    // (protocol + format + checkUrl); private/internal targets are additionally
+    // rejected below via isIPPrivate before any session is created.
+    url: URLSchema.optional(),
+    // Optional initial execution. Supplying `prompt` OR `code` (never both) runs
+    // that work against the freshly created (and, if `url` given, navigated)
+    // session in the SAME request, then keeps the session alive — mirroring a
+    // create-then-execute call. Supplying neither is the plain create behavior.
+    code: z.string().min(1).max(100_000).optional(),
+    prompt: z.string().min(1).max(10_000).optional(),
+    language: z.enum(["python", "node", "bash"]).default("node"),
+    // Timeout for the initial execution (only used when prompt/code is present).
+    // Same bounds as /v2/interact/:sessionId/execute.
+    timeout: z.number().min(1).max(300).default(30),
+    ttl: z.number().min(30).max(3600).default(600),
+    activityTtl: z.number().min(10).max(3600).default(300),
+    streamWebView: z.boolean().default(true),
+    recordSession: z.boolean().default(true),
+    integration: integrationSchema.optional().transform(val => val || null),
+    profile: z
+      .object({
+        name: z.string().min(1).max(128),
+        saveChanges: z.boolean().default(true),
+      })
+      .optional(),
+  })
+  // At most one of prompt/code. Neither is valid (create-only / create+url);
+  // both is not — reuse the execute endpoint's message for parity.
+  .refine(data => !(data.code && data.prompt), {
+    message: "Provide exactly one of 'prompt' or 'code', not both.",
+  });
 
 type BrowserCreateRequest = z.infer<typeof browserCreateRequestSchema>;
 
@@ -67,6 +90,17 @@ interface BrowserCreateResponse {
   liveViewUrl?: string;
   interactiveLiveViewUrl?: string;
   expiresAt?: string;
+  // Present only when an initial prompt/code execution ran during create. These
+  // mirror the /v2/interact/:sessionId/execute response so a one-call run returns
+  // the same execution shape as create-then-execute. `success` above then also
+  // reflects the execution outcome (false on a non-zero exit / prompt failure,
+  // still HTTP 200 with the session retained).
+  output?: string;
+  stdout?: string;
+  result?: string;
+  stderr?: string;
+  exitCode?: number;
+  killed?: boolean;
   error?: string;
 }
 
@@ -229,6 +263,11 @@ export async function browserCreateController(
   req.body = browserCreateRequestSchema.parse(req.body);
 
   const {
+    url,
+    code,
+    prompt,
+    language,
+    timeout,
     ttl,
     activityTtl,
     streamWebView,
@@ -243,6 +282,36 @@ export async function browserCreateController(
       error:
         "Browser feature is not configured (BROWSER_SERVICE_URL is missing).",
     });
+  }
+
+  // Reject private/internal-network URLs (SSRF) BEFORE any browser session is
+  // created, so a blocked target never leaves a dangling session behind. The
+  // URL schema above already rejected malformed URLs and unsupported protocols;
+  // here we additionally block literal private IPs using the same isIPPrivate
+  // helper the scrape fetch dispatcher uses at connect time. (Hostnames that
+  // resolve to private IPs are still caught by that dispatcher during
+  // navigation, which tears the session down on failure — see below.)
+  if (url && config.ALLOW_LOCAL_WEBHOOKS !== true) {
+    let hostname: string;
+    try {
+      // Strip IPv6 brackets (new URL keeps them, e.g. "[::1]") so the literal
+      // address is what isIPPrivate/ipaddr.js sees.
+      hostname = new URL(url).hostname.replace(/^\[|\]$/g, "");
+    } catch {
+      return res.status(400).json({
+        success: false,
+        error: "Invalid URL.",
+      });
+    }
+    if (isIPPrivate(hostname)) {
+      logger.warn("Rejected browser session with private-network URL", {
+        hostname,
+      });
+      return res.status(400).json({
+        success: false,
+        error: "URL resolves to a private or internal network address.",
+      });
+    }
   }
 
   logger.info("Creating browser session", { ttl, activityTtl });
@@ -409,13 +478,199 @@ export async function browserCreateController(
     browserId: svcResponse.sessionId,
   });
 
-  return res.status(200).json({
-    success: true,
+  // Session identity fields shared by every create response, one-call or not.
+  const sessionFields = {
     id: sessionId,
     cdpUrl: svcResponse.cdpUrl,
     liveViewUrl: svcResponse.iframeUrl,
     interactiveLiveViewUrl: svcResponse.interactiveIframeUrl,
     expiresAt: svcResponse.expiresAt,
+  };
+
+  // If a starting URL was provided, navigate the fresh session to it before
+  // returning. This mirrors how createSessionForScrape primes a session with
+  // page.goto(). If navigation fails (including SSRF blocks surfaced by the
+  // scrape fetch dispatcher when a hostname resolves to a private IP), tear the
+  // session fully down so no half-initialized session is left dangling.
+  if (url) {
+    try {
+      const navResult = await browserServiceRequest<BrowserServiceExecResponse>(
+        "POST",
+        `/browsers/${svcResponse.sessionId}/exec`,
+        {
+          code: `await page.goto(${JSON.stringify(url)}, { waitUntil: "domcontentloaded" });`,
+          language: "node",
+          timeout: 30,
+          origin: "browser_create_navigate",
+        },
+      );
+
+      if (navResult.exitCode !== 0 || navResult.killed) {
+        throw new Error(
+          navResult.stderr?.trim() ||
+            navResult.stdout?.trim() ||
+            "Navigation exited with an error.",
+        );
+      }
+    } catch (err) {
+      logger.error("Failed to navigate browser session to starting URL", {
+        error: err,
+      });
+      await teardownBrowserSession(
+        sessionId,
+        svcResponse.sessionId,
+        req.auth.team_id,
+        logger,
+      );
+      return res.status(502).json({
+        success: false,
+        error: "Failed to navigate the browser session to the provided URL.",
+      });
+    }
+  }
+
+  // No initial execution requested: return the plain create response (plus the
+  // navigation side effect, if any). Backward compatible.
+  if (!prompt && !code) {
+    return res.status(200).json({
+      success: true,
+      ...sessionFields,
+    });
+  }
+
+  // Initial execution requested. Run it against the freshly created session
+  // using the same pattern as browserExecuteController, then KEEP the session
+  // alive (create-and-keep — matches create-then-execute). A run that executes
+  // but fails returns HTTP 200 with success:false and diagnostics, and the
+  // session stays alive so the caller can inspect/retry/stop it. Only a
+  // URL-navigation failure (above) tears the session down.
+  const zdrForced = getScrapeZDR(req.acuc?.flags) === "forced";
+  const traceIdentity = {
+    orgId: req.auth.org_id ?? undefined,
+  };
+
+  let execResult: BrowserServiceExecResponse | AgentResult;
+
+  if (prompt) {
+    logger.info("Starting initial agent loop from prompt", { prompt, timeout });
+
+    // Flag the session as prompt-using so delete-time billing bills at the
+    // interact rate (see browserDeleteController / webhook). Fire-and-forget.
+    markBrowserSessionUsedPrompt(sessionId).catch(() => {});
+
+    try {
+      execResult = await executePromptViaBrowserAgent(
+        prompt,
+        svcResponse.sessionId,
+        timeout,
+        logger,
+        {
+          sessionId,
+          scrapeId: "",
+          teamId: req.auth.team_id,
+          ...traceIdentity,
+          zeroDataRetention: zdrForced,
+        },
+      );
+    } catch (err) {
+      logger.error("Initial agent loop failed", { error: err });
+      return res.status(502).json({
+        success: false,
+        ...sessionFields,
+        error: "Browser agent failed to execute the task.",
+      });
+    }
+
+    enqueueBrowserSessionActivity({
+      team_id: req.auth.team_id,
+      session_id: sessionId,
+      source: "interact",
+      language: "bash",
+      timeout,
+      exit_code: execResult.exitCode ?? null,
+      killed: execResult.killed ?? false,
+    });
+  } else {
+    logger.info("Executing initial code in browser session", {
+      language,
+      timeout,
+    });
+
+    try {
+      execResult = await browserServiceRequest<BrowserServiceExecResponse>(
+        "POST",
+        `/browsers/${svcResponse.sessionId}/exec`,
+        { code, language, timeout, origin: "browser_create_execute" },
+      );
+    } catch (err) {
+      logger.error("Failed to execute initial code via browser service", {
+        error: err,
+      });
+      return res.status(502).json({
+        success: false,
+        ...sessionFields,
+        error: "Failed to execute code in browser session.",
+      });
+    }
+
+    enqueueBrowserSessionActivity({
+      team_id: req.auth.team_id,
+      session_id: sessionId,
+      source: "browser",
+      language,
+      timeout,
+      exit_code: execResult.exitCode ?? null,
+      killed: execResult.killed ?? false,
+    });
+  }
+
+  logger.debug("Initial execution result", {
+    exitCode: execResult.exitCode,
+    killed: execResult.killed,
+    stdoutLength: execResult.stdout?.length,
+    stderrLength: execResult.stderr?.length,
+  });
+
+  const hasError = execResult.exitCode !== 0 || execResult.killed;
+  const agentOutput = "output" in execResult ? execResult.output : undefined;
+
+  // Unified body: session identity PLUS the execution result fields, matching
+  // the /v2/interact/:sessionId/execute shape. success reflects the execution.
+  return res.status(200).json({
+    success: !hasError,
+    ...sessionFields,
+    ...(agentOutput ? { output: agentOutput } : {}),
+    stdout: execResult.stdout,
+    result: execResult.result,
+    stderr: execResult.stderr,
+    exitCode: execResult.exitCode,
+    killed: execResult.killed,
+    ...(hasError ? { error: execResult.stderr || "Execution failed" } : {}),
+  });
+}
+
+/**
+ * Fully tear down a persisted browser session that failed to initialize:
+ * release it in the browser service, mark it destroyed in Supabase, and drop
+ * its concurrency-limiter slot / cached count. Best-effort — every step
+ * swallows its own error so teardown never masks the original failure.
+ */
+async function teardownBrowserSession(
+  sessionId: string,
+  browserId: string,
+  teamId: string,
+  logger: typeof _logger,
+): Promise<void> {
+  await browserServiceRequest("DELETE", `/browsers/${browserId}`).catch(
+    () => {},
+  );
+  await claimBrowserSessionDestroyed(sessionId).catch(() => {});
+  invalidateActiveBrowserSessionCount(teamId).catch(() => {});
+  mirrorExternalSlotRelease(teamId, sessionId).catch(error => {
+    logger.error(
+      "Failed to remove concurrency limiter entry during session teardown",
+      { error, sessionId, teamId },
+    );
   });
 }
 
