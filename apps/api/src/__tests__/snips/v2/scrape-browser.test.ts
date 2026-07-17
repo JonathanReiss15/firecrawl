@@ -31,6 +31,7 @@ async function interactWithReplicaRetry(
     prompt?: string;
     language?: "python" | "node" | "bash";
     timeout?: number;
+    existingSessionId?: string;
   },
   identity: Identity,
   attempts: number = 5,
