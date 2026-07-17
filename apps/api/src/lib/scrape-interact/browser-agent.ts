@@ -8,6 +8,10 @@ import {
   browserServiceRequest,
   BrowserServiceExecResponse,
 } from "./browser-service-client";
+import {
+  NODE_TAB_SYNC_SCRIPT,
+  syncPythonRuntimePage,
+} from "./runtime-page-sync";
 import { config } from "../../config";
 import {
   generateText,
@@ -184,20 +188,16 @@ async function takeSnapshot(browserId: string): Promise<string> {
 /**
  * Keep a single foregrounded content tab, closing agent-browser's stray
  * about:blank tab (it safely falls back to the surviving tab).
+ *
+ * Uses the shared re-runnable IIFE script: the Node REPL keeps one global scope
+ * per session, so a script with top-level `const` declarations can only ever
+ * run once — every later invocation used to die with a redeclaration
+ * SyntaxError that the catch below silently swallowed.
  */
 async function syncTabs(browserId: string): Promise<void> {
   try {
     await browserServiceRequest("POST", `/browsers/${browserId}/exec`, {
-      code: [
-        `const ctx = page.context();`,
-        `const pages = ctx.pages();`,
-        `if (pages.length > 1) {`,
-        `  const target = pages.find(p => { const u = p.url(); return u && u !== 'about:blank'; }) || pages[pages.length - 1];`,
-        `  for (const p of pages) { if (p !== target) await p.close().catch(() => {}); }`,
-        `  page = target;`,
-        `}`,
-        `await page.bringToFront();`,
-      ].join("\n"),
+      code: NODE_TAB_SYNC_SCRIPT,
       language: "node",
       timeout: 5,
       origin: "tab_sync",
@@ -424,6 +424,16 @@ export async function executePromptViaBrowserAgent(
       exitCode: 1,
       killed: false,
     };
+  } finally {
+    // The agent's actions (clicks, navigations, agent-browser commands) can
+    // open or close tabs, and each per-action syncTabs above only repoints the
+    // Node REPL's `page`. If the caller follows this prompt run with a Python
+    // exec — a supported mix on one retained session — the Python REPL may
+    // still be bound to a tab that has since been closed, reproducing #3498
+    // mid-session. Re-attach it once here, after the run's final syncTabs, so
+    // a subsequent Python exec starts from the live content page. Runs once
+    // per prompt call (not per action) to bound added latency; best-effort.
+    await syncPythonRuntimePage(browserId, logger);
   }
 }
 
