@@ -364,7 +364,8 @@ export async function browserCreateRaw(
 export async function browserExecuteRaw(
   sessionId: string,
   body: {
-    code: string;
+    code?: string;
+    prompt?: string;
     language?: "python" | "node" | "bash";
     timeout?: number;
   },

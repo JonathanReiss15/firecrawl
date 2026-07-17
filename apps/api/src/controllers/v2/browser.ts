@@ -16,7 +16,13 @@ import {
   invalidateActiveBrowserSessionCount,
   didBrowserSessionUsePrompt,
   clearBrowserSessionPromptFlag,
+  markBrowserSessionUsedPrompt,
 } from "../../lib/browser-sessions";
+import {
+  executePromptViaBrowserAgent,
+  AgentResult,
+} from "../../lib/scrape-interact/browser-agent";
+import { getScrapeZDR } from "../../lib/zdr-helpers";
 import {
   getCombinedTeamActiveCount,
   mirrorExternalSlotAcquire,
@@ -64,17 +70,26 @@ interface BrowserCreateResponse {
   error?: string;
 }
 
-const browserExecuteRequestSchema = z.object({
-  code: z.string().min(1).max(100_000),
-  language: z.enum(["python", "node", "bash"]).default("node"),
-  timeout: z.number().min(1).max(300).default(30),
-  origin: z.string().optional(),
-});
+const browserExecuteRequestSchema = z
+  .object({
+    code: z.string().min(1).max(100_000).optional(),
+    prompt: z.string().min(1).max(10_000).optional(),
+    language: z.enum(["python", "node", "bash"]).default("node"),
+    timeout: z.number().min(1).max(300).default(30),
+    origin: z.string().optional(),
+  })
+  .refine(data => data.code || data.prompt, {
+    message: "Either 'code' or 'prompt' must be provided.",
+  })
+  .refine(data => !(data.code && data.prompt), {
+    message: "Provide exactly one of 'prompt' or 'code', not both.",
+  });
 
 type BrowserExecuteRequest = z.infer<typeof browserExecuteRequestSchema>;
 
 interface BrowserExecuteResponse {
   success: boolean;
+  output?: string;
   stdout?: string;
   result?: string;
   stderr?: string;
@@ -423,7 +438,7 @@ export async function browserExecuteController(
   req.body = browserExecuteRequestSchema.parse(req.body);
 
   const id = req.params.sessionId;
-  const { code, language, timeout, origin } = req.body;
+  const { code, prompt, language, timeout, origin } = req.body;
 
   const logger = _logger.child({
     sessionId: id,
@@ -459,21 +474,86 @@ export async function browserExecuteController(
   // Update activity timestamp (fire-and-forget)
   updateBrowserSessionActivity(id).catch(() => {});
 
-  logger.info("Executing code in browser session", { language, timeout });
+  // Skip LangSmith tracing for teams with forced zero-data-retention — the
+  // trace would otherwise ship the prompt, tool I/O, and page snapshots to a
+  // third party. Mirrors scrape-browser.ts.
+  const zdrForced = getScrapeZDR(req.acuc?.flags) === "forced";
 
-  // Execute code via the browser service
-  let execResult: BrowserServiceExecResponse;
-  try {
-    execResult = await browserServiceRequest<BrowserServiceExecResponse>(
-      "POST",
-      `/browsers/${session.browser_id}/exec`,
-      { code, language, timeout, origin },
-    );
-  } catch (err) {
-    logger.error("Failed to execute code via browser service", { error: err });
-    return res.status(502).json({
-      success: false,
-      error: "Failed to execute code in browser session.",
+  // Trace identity for a direct (session-started) execution. There is no
+  // originating scrape here, so we only carry the identity fields that apply —
+  // sessionId, teamId, orgId — and leave scrape-context fields unset.
+  const traceIdentity = {
+    orgId: req.auth.org_id ?? undefined,
+  };
+
+  let execResult: BrowserServiceExecResponse | AgentResult;
+
+  if (prompt) {
+    logger.info("Starting agent loop from prompt", { prompt, timeout });
+
+    // Flag the session as prompt-using so delete-time billing bills at the
+    // interact rate (see browserDeleteController / webhook). Fire-and-forget.
+    markBrowserSessionUsedPrompt(session.id).catch(() => {});
+
+    try {
+      execResult = await executePromptViaBrowserAgent(
+        prompt,
+        session.browser_id,
+        timeout,
+        logger,
+        {
+          sessionId: session.id,
+          scrapeId: "",
+          teamId: req.auth.team_id,
+          ...traceIdentity,
+          zeroDataRetention: zdrForced,
+        },
+      );
+    } catch (err) {
+      logger.error("Agent loop failed", { error: err });
+      return res.status(502).json({
+        success: false,
+        error: "Browser agent failed to execute the task.",
+      });
+    }
+
+    enqueueBrowserSessionActivity({
+      team_id: req.auth.team_id,
+      session_id: id,
+      source: "interact",
+      language: "bash",
+      timeout,
+      exit_code: execResult.exitCode ?? null,
+      killed: execResult.killed ?? false,
+    });
+  } else {
+    logger.info("Executing code in browser session", { language, timeout });
+
+    // Execute code via the browser service
+    try {
+      execResult = await browserServiceRequest<BrowserServiceExecResponse>(
+        "POST",
+        `/browsers/${session.browser_id}/exec`,
+        { code, language, timeout, origin },
+      );
+    } catch (err) {
+      logger.error("Failed to execute code via browser service", {
+        error: err,
+      });
+      return res.status(502).json({
+        success: false,
+        error: "Failed to execute code in browser session.",
+      });
+    }
+
+    enqueueBrowserSessionActivity({
+      team_id: req.auth.team_id,
+      session_id: id,
+      source: "browser",
+      language,
+      timeout,
+      exit_code: execResult.exitCode ?? null,
+      killed: execResult.killed ?? false,
     });
   }
 
@@ -484,20 +564,12 @@ export async function browserExecuteController(
     stderrLength: execResult.stderr?.length,
   });
 
-  enqueueBrowserSessionActivity({
-    team_id: req.auth.team_id,
-    session_id: id,
-    source: "browser",
-    language,
-    timeout,
-    exit_code: execResult.exitCode ?? null,
-    killed: execResult.killed ?? false,
-  });
-
   const hasError = execResult.exitCode !== 0 || execResult.killed;
+  const agentOutput = "output" in execResult ? execResult.output : undefined;
 
   return res.status(200).json({
     success: !hasError,
+    ...(agentOutput ? { output: agentOutput } : {}),
     stdout: execResult.stdout,
     result: execResult.result,
     stderr: execResult.stderr,
