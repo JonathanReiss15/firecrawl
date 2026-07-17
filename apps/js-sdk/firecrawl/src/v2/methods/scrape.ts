@@ -57,11 +57,19 @@ export async function interact(
   }
   const hasCode = args?.code && args.code.trim();
   const hasPrompt = args?.prompt && args.prompt.trim();
-  if (!hasCode && !hasPrompt) {
+  const recipe = args?.recipe;
+  const isPinnedRecipe = !!recipe && "recipeId" in recipe;
+  if (!hasCode && !hasPrompt && !isPinnedRecipe) {
     throw new Error("Either 'code' or 'prompt' must be provided");
   }
   if (hasCode && hasPrompt) {
     throw new Error("Provide exactly one of 'prompt' or 'code', not both");
+  }
+  if (recipe && hasCode) {
+    throw new Error("'recipe' cannot be combined with 'code'");
+  }
+  if (recipe && !isPinnedRecipe && !hasPrompt) {
+    throw new Error("recipe mode 'learn' requires a 'prompt'");
   }
 
   const body: Record<string, unknown> = {};
@@ -71,6 +79,7 @@ export async function interact(
   if (args.timeout != null) body.timeout = args.timeout;
   if (args.origin) body.origin = args.origin;
   if (args.existingSessionId) body.existingSessionId = args.existingSessionId;
+  if (recipe) body.recipe = recipe;
 
   try {
     const res = await http.post<ScrapeExecuteResponse>(
