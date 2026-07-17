@@ -205,6 +205,23 @@ print(run.stdout)
 firecrawl.stop_interaction(scrape_job_id)
 ```
 
+You can also attach a scrape to a browser session you already created, instead of letting the first `interact` call spin one up. Pass its id as `existing_session_id`:
+
+```python
+session = firecrawl.browser()
+
+run = firecrawl.interact(
+  scrape_job_id,
+  existing_session_id=session.id,
+  code="print(await page.title())",
+  language="python",
+  timeout=60,
+)
+print(run.stdout)
+```
+
+If the session doesn't exist, has already been destroyed, or belongs to another team, the call returns an error rather than silently creating a new session.
+
 {/* ### Extracting Structured Data from Websites
 
   To extract structured data from websites, use the `extract` method. It takes the URLs to extract data from, a prompt, and a schema as arguments. The schema is a Pydantic model that defines the structure of the extracted data.
