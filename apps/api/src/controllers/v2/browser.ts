@@ -516,6 +516,14 @@ export async function browserCreateController(
       logger.error("Failed to navigate browser session to starting URL", {
         error: err,
       });
+      // Tear the session down and intentionally waive billing for it. Unlike
+      // the scrape-bound path — which fails its init BEFORE persisting the
+      // session, so there's never a billable row — this path has already
+      // persisted the session by now. teardownBrowserSession claims it
+      // destroyed, which is also the billing guard the delete controller /
+      // webhook honor (they skip billing when the session was already
+      // claimed), so a session that never became usable is not charged. This
+      // is deliberate: the caller got nothing runnable back.
       await teardownBrowserSession(
         sessionId,
         svcResponse.sessionId,
@@ -654,6 +662,12 @@ export async function browserCreateController(
  * release it in the browser service, mark it destroyed in Supabase, and drop
  * its concurrency-limiter slot / cached count. Best-effort — every step
  * swallows its own error so teardown never masks the original failure.
+ *
+ * Note the billing consequence: claimBrowserSessionDestroyed here is the same
+ * claim the delete controller and destroyed-webhook use as their billing guard
+ * (they skip billing when the session was already claimed). Tearing down here
+ * therefore waives billing for the session — intended, since a session that
+ * failed to initialize never became usable.
  */
 async function teardownBrowserSession(
   sessionId: string,
