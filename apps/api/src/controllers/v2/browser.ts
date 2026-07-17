@@ -524,6 +524,16 @@ export async function browserCreateController(
       // webhook honor (they skip billing when the session was already
       // claimed), so a session that never became usable is not charged. This
       // is deliberate: the caller got nothing runnable back.
+      //
+      // Abuse note: because a failed nav is unbilled, it can't be used to run
+      // Firecrawl's browsers for free at scale. Reaching this point still costs
+      // the caller a request against the `browser` rate limit (2/min by default,
+      // per team — see rate-limiter.ts) and requires passing checkCreditsMiddleware
+      // plus the concurrency check above (shared pool, ~2 by default). So the
+      // unbilled failed-nav path is bounded to a couple of browser spin-ups per
+      // minute per key — not a DDoS vector — and the browser's own connect-time
+      // SSRF guard (safeFetch's isIPPrivate on the resolved socket) remains the
+      // authoritative block for private/internal targets a hostname resolves to.
       await teardownBrowserSession(
         sessionId,
         svcResponse.sessionId,
