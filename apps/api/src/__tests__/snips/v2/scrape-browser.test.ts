@@ -1,5 +1,6 @@
 import crypto from "crypto";
 import { config } from "../../../config";
+import { PYTHON_PAGE_SYNC_SCRIPT } from "../../../lib/scrape-interact/runtime-page-sync";
 import {
   ALLOW_TEST_SUITE_WEBSITE,
   HAS_FIRE_ENGINE,
@@ -559,43 +560,160 @@ describe("Scrape browser cross-runtime interact matrix", () => {
       const replayMarker = crypto.randomUUID();
       const runtimeMarker = crypto.randomUUID();
 
-      const { responses, stopResponse } = await runScrapeInteractLifecycle({
-        identity,
-        language: "python",
-        replayMarker,
-        codes: [
-          // The python REPL processes Playwright protocol events only while
-          // an exec runs, so page.url can lag; read location.href through a
-          // real protocol round-trip instead. A stale/closed attachment
-          // (issue #3498) fails here with TargetClosedError.
-          [
-            `import json`,
-            `matrix_href = await page.evaluate("() => location.href")`,
-            `matrix_title = await page.title()`,
-            `matrix_replay_marker = await page.evaluate("() => window.__fcMatrixReplayMarker || null")`,
-            `await page.evaluate("value => { window.__fcMatrixRuntimeMarker = value; }", ${JSON.stringify(runtimeMarker)})`,
-            `print(json.dumps({"href": matrix_href, "title": matrix_title, "replayMarker": matrix_replay_marker, "closed": page.is_closed()}))`,
-          ].join("\n"),
-          [
-            `import json`,
-            `matrix_state = await page.evaluate("() => ({ replayMarker: window.__fcMatrixReplayMarker || null, runtimeMarker: window.__fcMatrixRuntimeMarker || null })")`,
-            `print(json.dumps(matrix_state))`,
-          ].join("\n"),
-        ],
-      });
+      const { url, responses, stopResponse } = await runScrapeInteractLifecycle(
+        {
+          identity,
+          language: "python",
+          replayMarker,
+          codes: [
+            // The python REPL processes Playwright protocol events only while
+            // an exec runs, so page.url can lag; read location.href through a
+            // real protocol round-trip instead. This first exec is the exact
+            // invariant the creation-time page sync guarantees: the binding
+            // answers a protocol round-trip and is on the replayed target
+            // URL. A stale/closed attachment (issue #3498) fails here with
+            // TargetClosedError.
+            [
+              `import json`,
+              `matrix_href = await page.evaluate("() => location.href")`,
+              `matrix_title = await page.title()`,
+              `matrix_replay_marker = await page.evaluate("() => window.__fcMatrixReplayMarker || null")`,
+              `await page.evaluate("value => { window.__fcMatrixRuntimeMarker = value; }", ${JSON.stringify(runtimeMarker)})`,
+              `print(json.dumps({"href": matrix_href, "title": matrix_title, "replayMarker": matrix_replay_marker, "closed": page.is_closed()}))`,
+            ].join("\n"),
+            [
+              `import json`,
+              `matrix_state = await page.evaluate("() => ({ replayMarker: window.__fcMatrixReplayMarker || null, runtimeMarker: window.__fcMatrixRuntimeMarker || null })")`,
+              `print(json.dumps(matrix_state))`,
+            ].join("\n"),
+          ],
+        },
+      );
 
       expectStopSuccess(stopResponse);
 
       expectExecSuccess(responses[0]);
       const first = jsonPayload(responses[0]);
       expect(first.closed).toBe(false);
+      // The binding must sit on the exact replayed target URL (the unique
+      // testId query pins it to this test's page), not merely "some page".
       expect(first.href).toContain(TEST_SUITE_WEBSITE);
+      expect(first.href).toContain(url.split("?")[1]);
       expect(first.replayMarker).toBe(replayMarker);
 
       expectExecSuccess(responses[1]);
       const second = jsonPayload(responses[1]);
       expect(second.replayMarker).toBe(replayMarker);
       expect(second.runtimeMarker).toBe(runtimeMarker);
+    },
+    scrapeTimeout * 2,
+  );
+
+  itIf(canRunMatrix)(
+    "python: forced stale binding fails, page sync heals it (break-and-heal)",
+    async () => {
+      const breakTabId = crypto.randomUUID();
+      const breakUrl = `${TEST_SUITE_WEBSITE}?testId=${breakTabId}`;
+      const url = `${TEST_SUITE_WEBSITE}?testId=${crypto.randomUUID()}`;
+
+      const scrapeResponse = await scrapeRaw(
+        { url, origin: "website-replay-test" },
+        identity,
+      );
+      expect(scrapeResponse.statusCode).toBe(200);
+      expect(scrapeResponse.body.success).toBe(true);
+      expect(typeof scrapeResponse.body.scrape_id).toBe("string");
+      const scrapeId = scrapeResponse.body.scrape_id as string;
+
+      let stopResponse: Awaited<
+        ReturnType<typeof scrapeStopInteractiveBrowserRaw>
+      > | null = null;
+
+      try {
+        // Force the #3498 root-cause state deterministically: from node,
+        // open a fresh tab on a real URL and close the tab every runtime
+        // was attached to. The python REPL's binding is now guaranteed
+        // stale no matter how the session-creation race resolved.
+        const breakResponse = await interactWithReplicaRetry(
+          scrapeId,
+          {
+            language: "node",
+            timeout: 60,
+            code: [
+              `const fcBreakNext = await page.context().newPage();`,
+              `await fcBreakNext.goto(${JSON.stringify(breakUrl)}, { waitUntil: "domcontentloaded" });`,
+              `const fcBreakOld = page;`,
+              `page = fcBreakNext;`,
+              `await fcBreakOld.close();`,
+              `JSON.stringify({ brokenUrl: page.url() })`,
+            ].join("\n"),
+          },
+          identity,
+        );
+        expectExecSuccess(breakResponse);
+        expect(jsonPayload(breakResponse).brokenUrl).toContain(breakTabId);
+
+        // Negative control: the next python exec must fail with the exact
+        // TargetClosedError semantics reported in #3498. This proves the
+        // test can trigger the bug on demand.
+        const brokenProbe = await interactWithReplicaRetry(
+          scrapeId,
+          {
+            language: "python",
+            timeout: 60,
+            code: `print(await page.title())`,
+          },
+          identity,
+        );
+        expect(brokenProbe.statusCode).toBe(200);
+        expect(brokenProbe.body.success).toBe(false);
+        expect(typeof brokenProbe.body.exitCode).toBe("number");
+        expect(brokenProbe.body.exitCode).not.toBe(0);
+        expect(brokenProbe.body.killed).toBe(false);
+        expect(brokenProbe.body.stderr).toMatch(
+          /TargetClosedError|has been closed/,
+        );
+
+        // Heal: the same script the controller runs at session creation
+        // must re-attach the python binding to the surviving live tab.
+        const healResponse = await interactWithReplicaRetry(
+          scrapeId,
+          {
+            language: "python",
+            timeout: 60,
+            code: PYTHON_PAGE_SYNC_SCRIPT,
+          },
+          identity,
+        );
+        expectExecSuccess(healResponse);
+
+        // Post-heal: python round-trips again and sits on the live tab.
+        const healedProbe = await interactWithReplicaRetry(
+          scrapeId,
+          {
+            language: "python",
+            timeout: 60,
+            code: [
+              `import json`,
+              `matrix_healed_href = await page.evaluate("() => location.href")`,
+              `matrix_healed_title = await page.title()`,
+              `print(json.dumps({"href": matrix_healed_href, "title": matrix_healed_title, "closed": page.is_closed()}))`,
+            ].join("\n"),
+          },
+          identity,
+        );
+        expectExecSuccess(healedProbe);
+        const healed = jsonPayload(healedProbe);
+        expect(healed.closed).toBe(false);
+        expect(healed.href).toContain(breakTabId);
+      } finally {
+        stopResponse = await scrapeStopInteractiveBrowserRaw(
+          scrapeId,
+          identity,
+        );
+      }
+
+      expectStopSuccess(stopResponse);
     },
     scrapeTimeout * 2,
   );

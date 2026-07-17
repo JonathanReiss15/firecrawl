@@ -42,14 +42,19 @@ export const NODE_TAB_SYNC_SCRIPT = [
  *
  * The Python REPL only pumps Playwright protocol events while an exec is
  * running, so its wrappers can be stale (pages closed by the Node tab sync
- * still report `is_closed() == False`, and `page.url` can lag behind real
- * navigations). The script therefore probes candidates with real protocol
- * round-trips — a closed page raises, a live one answers — and prefers the
- * page that reports a non-blank `location.href`. Assignments persist in the
- * REPL globals, so the corrected binding sticks for all later Python execs.
+ * still report `is_closed() == False`, `page.url` can lag behind real
+ * navigations, and tabs opened by other runtimes since the last Python exec
+ * may not appear in `page.context.pages` yet). The script therefore yields
+ * to the event loop first so the connection reader can drain queued
+ * protocol messages, then probes candidates with real protocol round-trips
+ * — a closed page raises, a live one answers — and prefers the page that
+ * reports a non-blank `location.href`. Assignments persist in the REPL
+ * globals, so the corrected binding sticks for all later Python execs.
  * Runs are idempotent; Python has no redeclaration hazard.
  */
 export const PYTHON_PAGE_SYNC_SCRIPT = [
+  `import asyncio as _fc_sync_asyncio`,
+  `await _fc_sync_asyncio.sleep(0.25)`,
   `_fc_sync_target = None`,
   `try:`,
   `    _fc_sync_pages = list(page.context.pages)`,
